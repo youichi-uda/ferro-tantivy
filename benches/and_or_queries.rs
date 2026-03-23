@@ -127,59 +127,68 @@ fn main() {
     // Prepare corpora with varying selectivity. Build one index per corpus
     // and derive two views (single-field vs multi-field) from it.
     let scenarios = vec![
+        // (
+        //     "N=1M, p(a)=5%, p(b)=1%, p(c)=15%".to_string(),
+        //     1_000_000,
+        //     0.05,
+        //     0.01,
+        //     0.15,
+        // ),
+        // (
+        //     "N=1M, p(a)=1%, p(b)=1%, p(c)=15%".to_string(),
+        //     1_000_000,
+        //     0.01,
+        //     0.01,
+        //     0.15,
+        // ),
         (
-            "N=1M, p(a)=5%, p(b)=1%, p(c)=15%".to_string(),
+            "N=1M, p(a)=10%, p(b)=10%, p(c)=50%".to_string(),
             1_000_000,
-            0.05,
-            0.01,
-            0.15,
-        ),
-        (
-            "N=1M, p(a)=1%, p(b)=1%, p(c)=15%".to_string(),
-            1_000_000,
-            0.01,
-            0.01,
-            0.15,
+            0.10,
+            0.10,
+            0.50,
         ),
     ];
 
-    let queries = &["a", "+a +b", "+a +b +c", "a OR b", "a OR b OR c"];
+    // let queries = &["a", "+a +b", "+a +b +c", "a OR b", "a OR b OR c"];
+    // TODO FIXME
+    let queries = &["+a +b", "+a +b +c"];
 
     let mut runner = BenchRunner::new();
     for (label, n, pa, pb, pc) in scenarios {
         let (single_view, multi_view) = build_shared_indices(n, pa, pb, pc);
 
-        for (view_name, bench_index) in [("single_field", single_view), ("multi_field", multi_view)]
-        {
+        for (view_name, bench_index) in [("single_field", single_view)] { //, ("multi_field", multi_view)] {
             // Single-field group: default field is body only
             let mut group = runner.new_group();
             group.set_name(format!("{} — {}", view_name, label));
             for query_str in queries {
                 add_bench_task(&mut group, &bench_index, query_str, Count, "count");
-                add_bench_task(
-                    &mut group,
-                    &bench_index,
-                    query_str,
-                    TopDocs::with_limit(10).order_by_score(),
-                    "top10",
-                );
-                add_bench_task(
-                    &mut group,
-                    &bench_index,
-                    query_str,
-                    TopDocs::with_limit(10).order_by_fast_field::<u64>("score", Order::Asc),
-                    "top10_by_ff",
-                );
-                add_bench_task(
-                    &mut group,
-                    &bench_index,
-                    query_str,
-                    TopDocs::with_limit(10).order_by((
-                        SortByStaticFastValue::<u64>::for_field("score"),
-                        SortByStaticFastValue::<u64>::for_field("score2"),
-                    )),
-                    "top10_by_2ff",
-                );
+                // TODO FIXME
+                // add_bench_task(
+                //     &mut group,
+                //     &bench_index,
+                //     query_str,
+                //     TopDocs::with_limit(10).order_by_score(),
+                //     "top10",
+                // );
+                // add_bench_task(
+                //     &mut group,
+                //     &bench_index,
+                //     query_str,
+                //     TopDocs::with_limit(10).order_by_fast_field::<u64>("score", Order::Asc),
+                //     "top10_by_ff",
+                // );
+                // add_bench_task(
+                //     &mut group,
+                //     &bench_index,
+                //     query_str,
+                //     TopDocs::with_limit(10).order_by((
+                //         SortByStaticFastValue::<u64>::for_field("score"),
+                //         SortByStaticFastValue::<u64>::for_field("score2"),
+                //     )),
+                //     "top10_by_2ff",
+                // );
             }
             group.run();
         }

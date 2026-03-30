@@ -201,3 +201,7 @@ harness = false
 [[bench]]
 name = "regex_all_terms"
 harness = false
+
+[[bench]]
+name = "intersection_bench"
+harness = false

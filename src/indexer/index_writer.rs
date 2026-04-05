@@ -36,8 +36,9 @@ pub const MEMORY_BUDGET_NUM_BYTES_MAX: usize = u32::MAX as usize - MARGIN_IN_BYT
 pub const MAX_NUM_THREAD: usize = 8;
 
 // Add document will block if the number of docs waiting in the queue to be indexed
-// reaches `PIPELINE_MAX_SIZE_IN_DOCS`
-const PIPELINE_MAX_SIZE_IN_DOCS: usize = 10_000;
+// reaches `PIPELINE_MAX_SIZE_IN_DOCS`.
+// 100K allows 32 concurrent bulk batches of ~3K ops each without backpressure.
+const PIPELINE_MAX_SIZE_IN_DOCS: usize = 100_000;
 
 fn error_in_index_worker_thread(context: &str) -> TantivyError {
     TantivyError::ErrorInThread(format!(

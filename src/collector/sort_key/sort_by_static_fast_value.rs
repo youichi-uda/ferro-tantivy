@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use columnar::Column;
 
-use crate::collector::sort_key::NaturalComparator;
+use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::{DocId, Score, SegmentReader};
@@ -20,6 +20,11 @@ use crate::{DocId, Score, SegmentReader};
 pub struct SortByStaticFastValue<T: FastValue> {
     field: String,
     typ: PhantomData<T>,
+    /// Optional search_after cursor — docs at or before this value are skipped.
+    cursor_u64: Option<u64>,
+    /// True = ascending sort (skip docs with value <= cursor),
+    /// False = descending sort (skip docs with value >= cursor).
+    cursor_is_asc: bool,
 }
 
 impl<T: FastValue> SortByStaticFastValue<T> {
@@ -28,7 +33,18 @@ impl<T: FastValue> SortByStaticFastValue<T> {
         Self {
             field: column_name.to_string(),
             typ: PhantomData,
+            cursor_u64: None,
+            cursor_is_asc: true,
         }
+    }
+
+    /// Sets a search_after cursor. Documents whose sort value is at or before
+    /// the cursor are skipped during collection, eliminating the need for a
+    /// BooleanQuery intersection with a RangeQuery.
+    pub fn with_search_after(mut self, cursor_value: T, is_asc: bool) -> Self {
+        self.cursor_u64 = Some(cursor_value.to_u64());
+        self.cursor_is_asc = is_asc;
+        self
     }
 }
 
@@ -71,6 +87,8 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
         Ok(SortByFastValueSegmentSortKeyComputer {
             sort_column,
             typ: PhantomData,
+            cursor_u64: self.cursor_u64,
+            cursor_is_asc: self.cursor_is_asc,
         })
     }
 }
@@ -78,6 +96,8 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
 pub struct SortByFastValueSegmentSortKeyComputer<T> {
     sort_column: Column<u64>,
     typ: PhantomData<T>,
+    cursor_u64: Option<u64>,
+    cursor_is_asc: bool,
 }
 
 impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyComputer<T> {
@@ -88,6 +108,33 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
     #[inline(always)]
     fn segment_sort_key(&mut self, doc: DocId, _score: Score) -> Self::SegmentSortKey {
         self.sort_column.first(doc)
+    }
+
+    #[inline(always)]
+    fn compute_sort_key_and_collect<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        doc: DocId,
+        score: Score,
+        top_n_computer: &mut crate::collector::TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        let sort_key = self.segment_sort_key(doc, score);
+        // Skip docs at or before the search_after cursor — O(1) column check,
+        // avoids the need for BooleanQuery(base, RangeQuery) intersection.
+        if let Some(cursor) = self.cursor_u64 {
+            if let Some(val) = sort_key {
+                if self.cursor_is_asc {
+                    if val <= cursor {
+                        return;
+                    }
+                } else if val >= cursor {
+                    return;
+                }
+            } else {
+                // Null values: skip (null sorts last in both orders)
+                return;
+            }
+        }
+        top_n_computer.push(sort_key, doc);
     }
 
     fn convert_segment_sort_key(&self, sort_key: Self::SegmentSortKey) -> Self::SortKey {

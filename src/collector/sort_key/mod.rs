@@ -391,6 +391,141 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_search_after_cursor_f64() -> crate::Result<()> {
+        let index = make_index()?;
+
+        fn query(
+            index: &Index,
+            order: Order,
+            cursor: f64,
+        ) -> crate::Result<Vec<(Option<f64>, u64)>> {
+            let searcher = index.reader()?.searcher();
+            let ids = id_mapping(&searcher);
+
+            let is_asc = order.is_asc();
+            let sort_key = SortByStaticFastValue::<f64>::for_field("altitude")
+                .with_search_after(cursor, is_asc);
+            let top_collector = TopDocs::with_limit(10).order_by((sort_key, order));
+            Ok(searcher
+                .search(&AllQuery, &top_collector)?
+                .into_iter()
+                .map(|(altitude_opt, doc)| (altitude_opt, ids[&doc]))
+                .collect())
+        }
+
+        // Without cursor, ascending order would yield:
+        //   [(0.0, 3), (27.0, 1), (40.0, 2), (149.0, 0)]
+        // With cursor=27.0 ascending: skip docs whose value <= 27.0, so 0.0 and 27.0 drop.
+        assert_eq!(
+            query(&index, Order::Asc, 27.0)?,
+            vec![(Some(40.0), 2), (Some(149.0), 0)],
+        );
+
+        // With cursor=0.0 ascending: skip the first doc only.
+        assert_eq!(
+            query(&index, Order::Asc, 0.0)?,
+            vec![(Some(27.0), 1), (Some(40.0), 2), (Some(149.0), 0)],
+        );
+
+        // Without cursor, descending order would yield:
+        //   [(149.0, 0), (40.0, 2), (27.0, 1), (0.0, 3)]
+        // With cursor=40.0 descending: skip docs whose value >= 40.0, so 149.0 and 40.0 drop.
+        assert_eq!(
+            query(&index, Order::Desc, 40.0)?,
+            vec![(Some(27.0), 1), (Some(0.0), 3)],
+        );
+
+        // With cursor=149.0 descending: skip the first doc only.
+        assert_eq!(
+            query(&index, Order::Desc, 149.0)?,
+            vec![(Some(40.0), 2), (Some(27.0), 1), (Some(0.0), 3)],
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_after_cursor_u64() -> crate::Result<()> {
+        let index = make_index()?;
+
+        fn query(
+            index: &Index,
+            order: Order,
+            cursor: u64,
+        ) -> crate::Result<Vec<(Option<u64>, u64)>> {
+            let searcher = index.reader()?.searcher();
+            let ids = id_mapping(&searcher);
+
+            let is_asc = order.is_asc();
+            let sort_key = SortByStaticFastValue::<u64>::for_field("id")
+                .with_search_after(cursor, is_asc);
+            let top_collector = TopDocs::with_limit(10).order_by((sort_key, order));
+            Ok(searcher
+                .search(&AllQuery, &top_collector)?
+                .into_iter()
+                .map(|(id_opt, doc)| (id_opt, ids[&doc]))
+                .collect())
+        }
+
+        // Ascending: ids 0,1,2,3. cursor=1 should skip 0 and 1.
+        assert_eq!(
+            query(&index, Order::Asc, 1)?,
+            vec![(Some(2), 2), (Some(3), 3)],
+        );
+
+        // Descending: ids 3,2,1,0. cursor=2 should skip 3 and 2.
+        assert_eq!(
+            query(&index, Order::Desc, 2)?,
+            vec![(Some(1), 1), (Some(0), 0)],
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_after_cursor_pagination() -> crate::Result<()> {
+        // Use the search_after cursor to step through pages of size 1 in
+        // ascending altitude order, mirroring an Elasticsearch-style
+        // search_after pagination. Each page should yield the next sorted doc.
+        let index = make_index()?;
+        let searcher = index.reader()?.searcher();
+        let ids = id_mapping(&searcher);
+
+        // Full sorted order for reference: 0.0, 27.0, 40.0, 149.0
+        let expected_pages: Vec<(Option<f64>, u64)> = vec![
+            (Some(0.0), 3),
+            (Some(27.0), 1),
+            (Some(40.0), 2),
+            (Some(149.0), 0),
+        ];
+
+        // Page 0: no cursor.
+        let collector = TopDocs::with_limit(1)
+            .order_by((SortByStaticFastValue::<f64>::for_field("altitude"), Order::Asc));
+        let page0: Vec<(Option<f64>, DocAddress)> = searcher.search(&AllQuery, &collector)?;
+        assert_eq!(page0.len(), 1);
+        let (mut cursor_value, mut cursor_doc) = page0[0];
+        assert_eq!((cursor_value, ids[&cursor_doc]), expected_pages[0]);
+
+        // Subsequent pages each use the previous page's last value as cursor.
+        for expected in &expected_pages[1..] {
+            let cursor = cursor_value.expect("cursor value present");
+            let collector = TopDocs::with_limit(1).order_by((
+                SortByStaticFastValue::<f64>::for_field("altitude")
+                    .with_search_after(cursor, true),
+                Order::Asc,
+            ));
+            let page: Vec<(Option<f64>, DocAddress)> = searcher.search(&AllQuery, &collector)?;
+            assert_eq!(page.len(), 1, "expected one result for page after {cursor}");
+            cursor_value = page[0].0;
+            cursor_doc = page[0].1;
+            assert_eq!(&(cursor_value, ids[&cursor_doc]), expected);
+        }
+
+        Ok(())
+    }
+
     use proptest::prelude::*;
 
     proptest! {

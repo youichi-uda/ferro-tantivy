@@ -511,6 +511,19 @@ where
         self.comparator.compare(left, right)
     }
 
+    /// Delegate to inner computer so that custom `compute_sort_key_and_collect`
+    /// overrides (e.g. search_after cursor skipping) are preserved.
+    #[inline(always)]
+    fn compute_sort_key_and_collect<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        doc: DocId,
+        score: Score,
+        top_n_computer: &mut crate::collector::TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        self.segment_sort_key_computer
+            .compute_sort_key_and_collect(doc, score, top_n_computer);
+    }
+
     fn convert_segment_sort_key(&self, sort_key: Self::SegmentSortKey) -> Self::SortKey {
         self.segment_sort_key_computer
             .convert_segment_sort_key(sort_key)

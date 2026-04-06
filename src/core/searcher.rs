@@ -140,6 +140,7 @@ impl Searcher {
             return Vec::new();
         }
 
+        // Sort by (segment_ord, doc_id) and group by segment
         let mut indexed: Vec<(usize, DocAddress)> = doc_addresses
             .iter()
             .enumerate()
@@ -147,13 +148,25 @@ impl Searcher {
             .collect();
         indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
 
-        let mut results: Vec<Option<Vec<u8>>> = (0..doc_addresses.len()).map(|_| None).collect();
-        for (orig_idx, addr) in indexed {
-            let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
-            results[orig_idx] = store_reader
-                .get_field_bytes(addr.doc_id, target_field)
-                .ok()
-                .flatten();
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; doc_addresses.len()];
+
+        // Process per-segment groups using batch_get_field_bytes_grouped
+        // which decompresses each block only once for all docs in that block.
+        let mut seg_start = 0;
+        while seg_start < indexed.len() {
+            let seg_ord = indexed[seg_start].1.segment_ord;
+            let mut seg_end = seg_start + 1;
+            while seg_end < indexed.len() && indexed[seg_end].1.segment_ord == seg_ord {
+                seg_end += 1;
+            }
+            let group = &indexed[seg_start..seg_end];
+            let doc_ids: Vec<crate::DocId> = group.iter().map(|(_, a)| a.doc_id).collect();
+            let store_reader = &self.inner.store_readers[seg_ord as usize];
+            let mut batch = store_reader.batch_get_field_bytes_grouped(&doc_ids, target_field);
+            for (i, &(orig_idx, _)) in group.iter().enumerate() {
+                results[orig_idx] = batch[i].take();
+            }
+            seg_start = seg_end;
         }
         results
     }

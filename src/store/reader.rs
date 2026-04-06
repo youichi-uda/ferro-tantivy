@@ -15,7 +15,8 @@ use super::Decompressor;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
-use crate::schema::document::{BinaryDocumentDeserializer, DocumentDeserialize};
+use crate::schema::document::{BinaryDocumentDeserializer, DocumentDeserialize, extract_field_bytes_from_doc};
+use crate::schema::Field;
 use crate::space_usage::StoreSpaceUsage;
 use crate::store::index::Checkpoint;
 use crate::DocId;
@@ -243,6 +244,91 @@ impl StoreReader {
             BinaryDocumentDeserializer::from_reader(&mut doc_bytes, self.doc_store_version)
                 .map_err(crate::TantivyError::from)?;
         D::deserialize(deserializer).map_err(crate::TantivyError::from)
+    }
+
+    /// Extracts raw bytes of a single field from a stored document.
+    ///
+    /// Much faster than `get()` when only one field is needed, because
+    /// non-target fields are skipped without heap allocation.
+    /// Returns `None` if the field is not present in the document.
+    pub fn get_field_bytes(
+        &self,
+        doc_id: DocId,
+        target_field: Field,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        let mut doc_bytes = self.get_document_bytes(doc_id)?;
+        extract_field_bytes_from_doc(&mut doc_bytes, self.doc_store_version, target_field)
+            .map_err(crate::TantivyError::from)
+    }
+
+    /// Batch-extracts a single field from multiple documents, grouping by block.
+    ///
+    /// Much faster than calling `get_field_bytes` per doc because each block
+    /// is decompressed only once and all target docs are extracted in a single
+    /// pass. For 500 docs across 50 blocks: 50 decompressions + 500 field
+    /// extractions vs. 500 cache lookups + 500 skip_index seeks.
+    ///
+    /// `doc_ids` MUST be sorted ascending for correct block grouping.
+    pub fn batch_get_field_bytes_grouped(
+        &self,
+        doc_ids: &[DocId],
+        target_field: Field,
+    ) -> Vec<Option<Vec<u8>>> {
+        if doc_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; doc_ids.len()];
+        let mut checkpoints = self.block_checkpoints();
+        let mut current_cp: Option<Checkpoint> = checkpoints.next();
+        let mut current_block: Option<OwnedBytes> = None;
+
+        let mut idx = 0;
+        while idx < doc_ids.len() {
+            let doc_id = doc_ids[idx];
+
+            // Advance to the checkpoint covering this doc_id
+            while let Some(ref cp) = current_cp {
+                if doc_id < cp.doc_range.end {
+                    break;
+                }
+                current_cp = checkpoints.next();
+                current_block = None; // invalidate cached block
+            }
+            let Some(ref cp) = current_cp else { break };
+            if doc_id < cp.doc_range.start {
+                idx += 1;
+                continue;
+            }
+
+            // Decompress this block once
+            if current_block.is_none() {
+                current_block = self.read_block(cp).ok();
+            }
+            let Some(ref block) = current_block else {
+                idx += 1;
+                continue;
+            };
+
+            // Extract all docs from this block
+            while idx < doc_ids.len() && doc_ids[idx] < cp.doc_range.end {
+                let did = doc_ids[idx];
+                if did >= cp.doc_range.start {
+                    let doc_pos = did - cp.doc_range.start;
+                    if let Ok(range) = block_read_index(block, doc_pos) {
+                        let mut doc_bytes = block.slice(range);
+                        if let Ok(field_bytes) = extract_field_bytes_from_doc(
+                            &mut doc_bytes,
+                            self.doc_store_version,
+                            target_field,
+                        ) {
+                            results[idx] = field_bytes;
+                        }
+                    }
+                }
+                idx += 1;
+            }
+        }
+        results
     }
 
     /// Returns raw bytes of a given document.

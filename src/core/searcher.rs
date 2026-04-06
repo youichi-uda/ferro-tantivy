@@ -184,14 +184,6 @@ impl Searcher {
             bytes_cols.push(seg_reader.fast_fields().bytes(field_name).ok().flatten());
         }
 
-        // Sort by (segment_ord, doc_id) for cache locality
-        let mut indexed: Vec<(usize, DocAddress)> = doc_addresses
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (i, *a))
-            .collect();
-        indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
-
         let mut results: Vec<Option<Vec<u8>>> = vec![None; doc_addresses.len()];
 
         // Group by segment for batch SSTable streaming via sorted_ords_to_term_cb
@@ -199,12 +191,12 @@ impl Searcher {
             vec![Vec::new(); self.inner.segment_readers.len()];
         let mut docstore_fallback: Vec<(usize, DocAddress)> = Vec::new();
 
-        for &(orig_idx, addr) in &indexed {
+        for (orig_idx, addr) in doc_addresses.iter().enumerate() {
             let seg_ord = addr.segment_ord as usize;
             if bytes_cols[seg_ord].is_some() {
                 seg_groups[seg_ord].push((orig_idx, addr.doc_id));
-            } else if let Some(_field) = stored_field {
-                docstore_fallback.push((orig_idx, addr));
+            } else if stored_field.is_some() {
+                docstore_fallback.push((orig_idx, *addr));
             }
         }
 
@@ -227,17 +219,21 @@ impl Searcher {
             // Stream-decode all terms in one pass (no per-doc block restart)
             let mut pair_idx = 0;
             let ords_iter = ord_pairs.iter().map(|&(_, ord)| ord);
-            let _ = col.dictionary().sorted_ords_to_term_cb(ords_iter, |bytes| {
+            if let Err(e) = col.dictionary().sorted_ords_to_term_cb(ords_iter, |bytes| {
                 if pair_idx < ord_pairs.len() {
                     let orig_idx = ord_pairs[pair_idx].0;
                     results[orig_idx] = Some(bytes.to_vec());
                     pair_idx += 1;
                 }
                 Ok(())
-            });
+            }) {
+                log::warn!("SSTable read error in batch_fast_field_bytes: {e}");
+            }
         }
 
         // Fallback: DocStore single-field extraction for segments without BytesColumn
+        // Sort by (segment_ord, doc_id) for block cache locality
+        docstore_fallback.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
         for (orig_idx, addr) in docstore_fallback {
             if let Some(field) = stored_field {
                 let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
@@ -259,6 +255,7 @@ impl Searcher {
         &self,
         doc_addresses: &[DocAddress],
         field_name: &str,
+        stored_field: Option<crate::schema::Field>,
     ) -> Vec<Option<String>> {
         if doc_addresses.is_empty() {
             return Vec::new();
@@ -271,22 +268,18 @@ impl Searcher {
             str_cols.push(seg_reader.fast_fields().str(field_name).ok().flatten());
         }
 
-        let mut indexed: Vec<(usize, DocAddress)> = doc_addresses
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (i, *a))
-            .collect();
-        indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
-
         let mut results: Vec<Option<String>> = vec![None; doc_addresses.len()];
 
         // Group by segment for batch SSTable streaming
         let mut seg_groups: Vec<Vec<(usize, u32)>> =
             vec![Vec::new(); self.inner.segment_readers.len()];
-        for &(orig_idx, addr) in &indexed {
+        let mut docstore_fallback: Vec<(usize, DocAddress)> = Vec::new();
+        for (orig_idx, addr) in doc_addresses.iter().enumerate() {
             let seg_ord = addr.segment_ord as usize;
             if str_cols[seg_ord].is_some() {
                 seg_groups[seg_ord].push((orig_idx, addr.doc_id));
+            } else if stored_field.is_some() {
+                docstore_fallback.push((orig_idx, *addr));
             }
         }
 
@@ -306,15 +299,31 @@ impl Searcher {
 
             let mut pair_idx = 0;
             let ords_iter = ord_pairs.iter().map(|&(_, ord)| ord);
-            let _ = col.dictionary().sorted_ords_to_term_cb(ords_iter, |bytes| {
+            if let Err(e) = col.dictionary().sorted_ords_to_term_cb(ords_iter, |bytes| {
                 if pair_idx < ord_pairs.len() {
                     let orig_idx = ord_pairs[pair_idx].0;
-                    results[orig_idx] =
-                        Some(String::from_utf8_lossy(bytes).into_owned());
+                    // SSTable data is valid UTF-8 for StrColumn; zero-copy via from_utf8
+                    results[orig_idx] = Some(
+                        String::from_utf8(bytes.to_vec())
+                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+                    );
                     pair_idx += 1;
                 }
                 Ok(())
-            });
+            }) {
+                log::warn!("SSTable read error in batch_fast_field_str: {e}");
+            }
+        }
+
+        // Fallback: DocStore for segments without StrColumn (old indices)
+        docstore_fallback.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
+        for (orig_idx, addr) in docstore_fallback {
+            if let Some(field) = stored_field {
+                let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
+                if let Ok(Some(bytes)) = store_reader.get_field_bytes(addr.doc_id, field) {
+                    results[orig_idx] = String::from_utf8(bytes).ok();
+                }
+            }
         }
 
         results

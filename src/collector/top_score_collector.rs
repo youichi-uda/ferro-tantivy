@@ -318,18 +318,18 @@ impl TopDocs {
     /// - Base query runs at full speed
     ///
     /// The cursor value is in the original type space (e.g., `i64` for I64 fields).
-    /// `is_asc` should be `true` for ascending sort, `false` for descending.
+    /// The `is_asc` direction is derived from `order` automatically.
     pub fn order_by_fast_field_with_cursor<TFastValue>(
         self,
         fast_field: impl ToString,
         order: Order,
         cursor: TFastValue,
-        is_asc: bool,
     ) -> impl Collector<Fruit = Vec<(Option<TFastValue>, DocAddress)>>
     where
         TFastValue: FastValue,
         ComparatorEnum: Comparator<Option<TFastValue>>,
     {
+        let is_asc = matches!(order, Order::Asc);
         let skc = SortByStaticFastValue::<TFastValue>::for_field(fast_field)
             .with_search_after(cursor, is_asc);
         self.order_by((skc, order))

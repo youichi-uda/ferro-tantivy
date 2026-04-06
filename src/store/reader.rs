@@ -277,6 +277,10 @@ impl StoreReader {
         if doc_ids.is_empty() {
             return Vec::new();
         }
+        debug_assert!(
+            doc_ids.windows(2).all(|w| w[0] <= w[1]),
+            "batch_get_field_bytes_grouped: doc_ids must be sorted ascending"
+        );
         let mut results: Vec<Option<Vec<u8>>> = vec![None; doc_ids.len()];
         let mut checkpoints = self.block_checkpoints();
         let mut current_cp: Option<Checkpoint> = checkpoints.next();
@@ -304,10 +308,15 @@ impl StoreReader {
             if current_block.is_none() {
                 current_block = self.read_block(cp).ok();
             }
-            let Some(ref block) = current_block else {
-                idx += 1;
+            if current_block.is_none() {
+                // Block decompression failed — skip ALL doc_ids in this block
+                while idx < doc_ids.len() && doc_ids[idx] < cp.doc_range.end {
+                    idx += 1;
+                }
+                current_cp = checkpoints.next();
                 continue;
-            };
+            }
+            let block = current_block.as_ref().unwrap();
 
             // Extract all docs from this block
             while idx < doc_ids.len() && doc_ids[idx] < cp.doc_range.end {

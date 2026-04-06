@@ -90,6 +90,185 @@ impl Searcher {
         store_reader.get(doc_address.doc_id)
     }
 
+    /// Fetches multiple documents in batch, optimizing block decompression.
+    ///
+    /// Documents are grouped by segment and sorted by doc_id within each segment
+    /// to maximize DocStore block cache hits. The returned `Vec` preserves the
+    /// same order as the input `doc_addresses` slice.
+    ///
+    /// Documents that fail to deserialize are returned as `None`.
+    pub fn docs_batch<D: DocumentDeserialize>(
+        &self,
+        doc_addresses: &[DocAddress],
+    ) -> Vec<Option<D>> {
+        if doc_addresses.is_empty() {
+            return Vec::new();
+        }
+
+        // Build (original_index, address) pairs and sort by (segment_ord, doc_id)
+        // so that docs in the same compressed block are fetched consecutively.
+        let mut indexed: Vec<(usize, DocAddress)> = doc_addresses
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, *a))
+            .collect();
+        indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
+
+        // Fetch in sorted order, placing results back at original indices.
+        let mut results: Vec<Option<D>> = (0..doc_addresses.len()).map(|_| None).collect();
+        for (orig_idx, addr) in indexed {
+            let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
+            results[orig_idx] = store_reader.get::<D>(addr.doc_id).ok();
+        }
+        results
+    }
+
+    /// Batch-extracts raw bytes of a single field from multiple stored documents.
+    ///
+    /// Documents are sorted by (segment_ord, doc_id) internally to maximize
+    /// DocStore block cache hits. The returned `Vec` preserves the same order
+    /// as the input `doc_addresses` slice.
+    ///
+    /// Much faster than `docs_batch()` when only one field is needed, because
+    /// non-target fields are skipped without heap allocation during extraction.
+    pub fn batch_get_field_bytes(
+        &self,
+        doc_addresses: &[DocAddress],
+        target_field: crate::schema::Field,
+    ) -> Vec<Option<Vec<u8>>> {
+        if doc_addresses.is_empty() {
+            return Vec::new();
+        }
+
+        let mut indexed: Vec<(usize, DocAddress)> = doc_addresses
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, *a))
+            .collect();
+        indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
+
+        let mut results: Vec<Option<Vec<u8>>> = (0..doc_addresses.len()).map(|_| None).collect();
+        for (orig_idx, addr) in indexed {
+            let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
+            results[orig_idx] = store_reader
+                .get_field_bytes(addr.doc_id, target_field)
+                .ok()
+                .flatten();
+        }
+        results
+    }
+
+    /// Batch-reads raw bytes of a **bytes** fast field, falling back to DocStore
+    /// for segments that lack the columnar column.
+    ///
+    /// This is the preferred way to read `_source` or other large bytes fields:
+    /// - New segments (with `set_fast()`): O(1) mmap via `BytesColumn`
+    /// - Old segments (stored only): single-field DocStore extraction
+    ///
+    /// Documents are sorted by (segment_ord, doc_id) internally.
+    /// The returned `Vec` preserves the input order.
+    pub fn batch_fast_field_bytes(
+        &self,
+        doc_addresses: &[DocAddress],
+        field_name: &str,
+        stored_field: Option<crate::schema::Field>,
+    ) -> Vec<Option<Vec<u8>>> {
+        if doc_addresses.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-cache BytesColumn per segment
+        let mut bytes_cols: Vec<Option<columnar::BytesColumn>> =
+            Vec::with_capacity(self.inner.segment_readers.len());
+        for seg_reader in &self.inner.segment_readers {
+            bytes_cols.push(seg_reader.fast_fields().bytes(field_name).ok().flatten());
+        }
+
+        // Sort by (segment_ord, doc_id) for cache locality
+        let mut indexed: Vec<(usize, DocAddress)> = doc_addresses
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, *a))
+            .collect();
+        indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
+
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; doc_addresses.len()];
+        let mut buf = Vec::new();
+        for (orig_idx, addr) in indexed {
+            let seg_ord = addr.segment_ord as usize;
+            // Try BytesColumn first (O(1) mmap)
+            if let Some(ref col) = bytes_cols[seg_ord] {
+                buf.clear();
+                let got = col
+                    .term_ords(addr.doc_id)
+                    .next()
+                    .and_then(|ord| col.ord_to_bytes(ord, &mut buf).ok())
+                    .unwrap_or(false);
+                if got {
+                    results[orig_idx] = Some(std::mem::take(&mut buf));
+                    continue;
+                }
+            }
+            // Fallback: DocStore single-field extraction
+            if let Some(field) = stored_field {
+                let store_reader = &self.inner.store_readers[seg_ord];
+                results[orig_idx] = store_reader
+                    .get_field_bytes(addr.doc_id, field)
+                    .ok()
+                    .flatten();
+            }
+        }
+        results
+    }
+
+    /// Batch-reads string values from a **str** fast field, falling back to
+    /// DocStore for segments that lack the columnar column.
+    ///
+    /// Ideal for `_id` and other keyword fields marked as FAST.
+    pub fn batch_fast_field_str(
+        &self,
+        doc_addresses: &[DocAddress],
+        field_name: &str,
+    ) -> Vec<Option<String>> {
+        if doc_addresses.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-cache StrColumn per segment
+        let mut str_cols: Vec<Option<columnar::StrColumn>> =
+            Vec::with_capacity(self.inner.segment_readers.len());
+        for seg_reader in &self.inner.segment_readers {
+            str_cols.push(seg_reader.fast_fields().str(field_name).ok().flatten());
+        }
+
+        let mut indexed: Vec<(usize, DocAddress)> = doc_addresses
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i, *a))
+            .collect();
+        indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
+
+        let mut results: Vec<Option<String>> = vec![None; doc_addresses.len()];
+        let mut buf = String::new();
+        for (orig_idx, addr) in indexed {
+            let seg_ord = addr.segment_ord as usize;
+            if let Some(ref col) = str_cols[seg_ord] {
+                buf.clear();
+                let got = col
+                    .term_ords(addr.doc_id)
+                    .next()
+                    .and_then(|ord| col.ord_to_str(ord, &mut buf).ok())
+                    .unwrap_or(false);
+                if got {
+                    results[orig_idx] = Some(std::mem::take(&mut buf));
+                    continue;
+                }
+            }
+            // No DocStore fallback for str — fast field is required
+        }
+        results
+    }
+
     /// The cache stats for the underlying store reader.
     ///
     /// Aggregates the sum for each segment store reader.

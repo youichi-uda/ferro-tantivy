@@ -308,6 +308,33 @@ impl TopDocs {
         self.order_by((SortByStaticFastValue::for_field(fast_field), order))
     }
 
+    /// Like `order_by_fast_field`, but with a `search_after` cursor.
+    ///
+    /// Documents whose sort value is at or before the cursor are skipped
+    /// during collection. This is much faster than using a `BooleanQuery`
+    /// intersection with a `RangeQuery` because:
+    /// - No posting list intersection
+    /// - Single column check per doc (O(1))
+    /// - Base query runs at full speed
+    ///
+    /// The cursor value is in the original type space (e.g., `i64` for I64 fields).
+    /// `is_asc` should be `true` for ascending sort, `false` for descending.
+    pub fn order_by_fast_field_with_cursor<TFastValue>(
+        self,
+        fast_field: impl ToString,
+        order: Order,
+        cursor: TFastValue,
+        is_asc: bool,
+    ) -> impl Collector<Fruit = Vec<(Option<TFastValue>, DocAddress)>>
+    where
+        TFastValue: FastValue,
+        ComparatorEnum: Comparator<Option<TFastValue>>,
+    {
+        let skc = SortByStaticFastValue::<TFastValue>::for_field(fast_field)
+            .with_search_after(cursor, is_asc);
+        self.order_by((skc, order))
+    }
+
     /// Like `order_by_fast_field`, but for a `String` fast field.
     pub fn order_by_string_fast_field(
         self,

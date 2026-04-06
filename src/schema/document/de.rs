@@ -25,6 +25,359 @@ use crate::schema::{Facet, Field};
 use crate::store::DocStoreVersion;
 use crate::tokenizer::PreTokenizedString;
 
+/// Skip a binary-serialized value in the reader without allocating.
+///
+/// The type code byte must already have been read; this function reads
+/// past the value payload so the reader cursor advances to the next field.
+fn skip_binary_value_after_type_code<R: Read>(
+    reader: &mut R,
+    type_code: u8,
+    doc_store_version: DocStoreVersion,
+) -> Result<(), DeserializeError> {
+    match type_code {
+        type_codes::NULL_CODE => { /* 0 bytes */ }
+        type_codes::BOOL_CODE => {
+            let mut buf = [0u8; 1];
+            reader.read_exact(&mut buf).map_err(DeserializeError::from)?;
+        }
+        type_codes::U64_CODE | type_codes::I64_CODE | type_codes::F64_CODE | type_codes::DATE_CODE => {
+            let mut buf = [0u8; 8];
+            reader.read_exact(&mut buf).map_err(DeserializeError::from)?;
+        }
+        type_codes::IP_CODE => {
+            let mut buf = [0u8; 16];
+            reader.read_exact(&mut buf).map_err(DeserializeError::from)?;
+        }
+        type_codes::TEXT_CODE | type_codes::BYTES_CODE | type_codes::HIERARCHICAL_FACET_CODE => {
+            // VInt(len) + len bytes
+            let len = <VInt as BinarySerializable>::deserialize(reader)?.val() as usize;
+            skip_bytes(reader, len)?;
+        }
+        type_codes::EXT_CODE => {
+            let ext_code = <u8 as BinarySerializable>::deserialize(reader)?;
+            match ext_code {
+                type_codes::TOK_STR_EXT_CODE => {
+                    // PreTokenizedString is serialized as a JSON string
+                    let len = <VInt as BinarySerializable>::deserialize(reader)?.val() as usize;
+                    skip_bytes(reader, len)?;
+                }
+                _ => {
+                    return Err(DeserializeError::from(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unknown ext type code {ext_code} during skip"),
+                    )));
+                }
+            }
+        }
+        type_codes::ARRAY_CODE => {
+            let count = <VInt as BinarySerializable>::deserialize(reader)?.val() as usize;
+            for _ in 0..count {
+                let tc = <u8 as BinarySerializable>::deserialize(reader)?;
+                skip_binary_value_after_type_code(reader, tc, doc_store_version)?;
+            }
+        }
+        type_codes::OBJECT_CODE => {
+            // Object: VInt(num_entries) followed by num_entries × (key_value, value)
+            // where each is a type-tagged value
+            let count = <VInt as BinarySerializable>::deserialize(reader)?.val() as usize;
+            for _ in 0..count {
+                // key
+                let tc = <u8 as BinarySerializable>::deserialize(reader)?;
+                skip_binary_value_after_type_code(reader, tc, doc_store_version)?;
+                // value
+                let tc = <u8 as BinarySerializable>::deserialize(reader)?;
+                skip_binary_value_after_type_code(reader, tc, doc_store_version)?;
+            }
+        }
+        #[allow(deprecated)]
+        type_codes::JSON_OBJ_CODE => {
+            // Legacy JSON object — must parse with serde to skip
+            let mut de = serde_json::Deserializer::from_reader(reader);
+            let _: serde_json::Value = serde::Deserialize::deserialize(&mut de)
+                .map_err(|e| DeserializeError::Custom(e.to_string()))?;
+        }
+        _ => {
+            return Err(DeserializeError::from(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unknown type code {type_code} during skip"),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Skip `n` bytes from a reader.
+#[inline]
+fn skip_bytes<R: Read>(reader: &mut R, n: usize) -> Result<(), DeserializeError> {
+    // For small skips, read into stack buffer. For large, use io::copy.
+    if n <= 256 {
+        let mut buf = [0u8; 256];
+        reader.read_exact(&mut buf[..n]).map_err(DeserializeError::from)?;
+    } else {
+        let copied = io::copy(&mut reader.take(n as u64), &mut io::sink())
+            .map_err(DeserializeError::from)?;
+        if (copied as usize) < n {
+            return Err(DeserializeError::from(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("expected to skip {n} bytes but only {copied} available"),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Extract raw bytes of a single field from serialized document bytes.
+///
+/// Scans the binary doc format looking for `target_field`.
+/// Returns `Some(bytes)` with the field's raw value payload (for BYTES_CODE: the raw bytes,
+/// for TEXT_CODE: the UTF-8 bytes, for others: the binary representation).
+/// Returns `None` if the field is not found.
+///
+/// This is much faster than full `DocumentDeserialize` when only one field is needed,
+/// because non-target fields are skipped without any heap allocation.
+pub(crate) fn extract_field_bytes_from_doc<R: Read>(
+    reader: &mut R,
+    doc_store_version: DocStoreVersion,
+    target_field: Field,
+) -> Result<Option<Vec<u8>>, DeserializeError> {
+    let num_fields = <VInt as BinarySerializable>::deserialize(reader)?.val() as usize;
+
+    for _ in 0..num_fields {
+        let field = Field::deserialize(reader).map_err(DeserializeError::from)?;
+        let type_code = <u8 as BinarySerializable>::deserialize(reader)?;
+
+        if field == target_field {
+            // Found our target — extract the value
+            match type_code {
+                type_codes::BYTES_CODE => {
+                    let bytes = <Vec<u8> as BinarySerializable>::deserialize(reader)
+                        .map_err(DeserializeError::from)?;
+                    return Ok(Some(bytes));
+                }
+                type_codes::TEXT_CODE => {
+                    let s = <String as BinarySerializable>::deserialize(reader)
+                        .map_err(DeserializeError::from)?;
+                    return Ok(Some(s.into_bytes()));
+                }
+                _ => {
+                    // For other types, skip and continue (target field has unexpected type)
+                    skip_binary_value_after_type_code(reader, type_code, doc_store_version)?;
+                }
+            }
+        } else {
+            skip_binary_value_after_type_code(reader, type_code, doc_store_version)?;
+        }
+    }
+    Ok(None)
+}
+
+/// Zero-copy variant of [`extract_field_bytes_from_doc`].
+///
+/// Instead of allocating a `Vec<u8>`, returns the byte range within `data`
+/// that contains the field's raw payload. The caller can sub-slice the
+/// underlying `OwnedBytes` block to obtain a zero-copy reference.
+///
+/// Returns `Ok(Some(start..end))` for BYTES_CODE/TEXT_CODE fields,
+/// `Ok(None)` if the target field is not found.
+pub(crate) fn extract_field_bytes_range_from_doc(
+    data: &[u8],
+    doc_store_version: DocStoreVersion,
+    target_field: Field,
+) -> Result<Option<std::ops::Range<usize>>, DeserializeError> {
+    let mut cursor = 0usize;
+
+    // Read VInt (num_fields)
+    let (num_fields, consumed) = read_vint_from_slice(&data[cursor..])?;
+    cursor += consumed;
+
+    for _ in 0..num_fields {
+        // Field ID (u32 le)
+        if cursor + 4 > data.len() {
+            return Err(DeserializeError::from(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected eof reading field id",
+            )));
+        }
+        let field_val = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+        let field = Field::from_field_id(field_val);
+        cursor += 4;
+
+        // type code (u8)
+        if cursor >= data.len() {
+            return Err(DeserializeError::from(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected eof reading type code",
+            )));
+        }
+        let type_code = data[cursor];
+        cursor += 1;
+
+        if field == target_field {
+            match type_code {
+                type_codes::BYTES_CODE | type_codes::TEXT_CODE => {
+                    let (len, consumed) = read_vint_from_slice(&data[cursor..])?;
+                    cursor += consumed;
+                    let len = len as usize;
+                    if cursor + len > data.len() {
+                        return Err(DeserializeError::from(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected eof reading field bytes",
+                        )));
+                    }
+                    return Ok(Some(cursor..cursor + len));
+                }
+                _ => {
+                    cursor = skip_value_in_slice(data, cursor, type_code, doc_store_version)?;
+                }
+            }
+        } else {
+            cursor = skip_value_in_slice(data, cursor, type_code, doc_store_version)?;
+        }
+    }
+    Ok(None)
+}
+
+/// Read a VInt from a byte slice, returning (value, bytes_consumed).
+///
+/// Tantivy VInt convention: continuation bytes have MSB CLEAR (< 128),
+/// the last (stop) byte has MSB SET (>= 128). This is inverted from
+/// the protobuf convention.
+#[inline]
+fn read_vint_from_slice(data: &[u8]) -> Result<(u64, usize), DeserializeError> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    for (i, &byte) in data.iter().enumerate() {
+        result |= ((byte % 128) as u64) << shift;
+        if byte >= 128 {
+            // Stop bit — this is the last byte
+            return Ok((result, i + 1));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(DeserializeError::from(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "VInt overflow",
+            )));
+        }
+    }
+    Err(DeserializeError::from(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "unexpected eof reading VInt",
+    )))
+}
+
+/// Skip a binary value in a byte slice, returning the new cursor position.
+fn skip_value_in_slice(
+    data: &[u8],
+    mut cursor: usize,
+    type_code: u8,
+    doc_store_version: DocStoreVersion,
+) -> Result<usize, DeserializeError> {
+    match type_code {
+        type_codes::NULL_CODE => {}
+        type_codes::BOOL_CODE => {
+            cursor += 1;
+        }
+        type_codes::U64_CODE | type_codes::I64_CODE | type_codes::F64_CODE | type_codes::DATE_CODE => {
+            cursor += 8;
+        }
+        type_codes::IP_CODE => {
+            cursor += 16;
+        }
+        type_codes::TEXT_CODE | type_codes::BYTES_CODE | type_codes::HIERARCHICAL_FACET_CODE => {
+            let (len, consumed) = read_vint_from_slice(&data[cursor..])?;
+            cursor += consumed + len as usize;
+        }
+        type_codes::EXT_CODE => {
+            if cursor >= data.len() {
+                return Err(DeserializeError::from(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected eof reading ext code",
+                )));
+            }
+            let ext_code = data[cursor];
+            cursor += 1;
+            match ext_code {
+                type_codes::TOK_STR_EXT_CODE => {
+                    let (len, consumed) = read_vint_from_slice(&data[cursor..])?;
+                    cursor += consumed + len as usize;
+                }
+                _ => {
+                    return Err(DeserializeError::from(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Unknown ext type code {ext_code} during skip"),
+                    )));
+                }
+            }
+        }
+        type_codes::ARRAY_CODE => {
+            let (count, consumed) = read_vint_from_slice(&data[cursor..])?;
+            cursor += consumed;
+            for _ in 0..count as usize {
+                if cursor >= data.len() {
+                    return Err(DeserializeError::from(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected eof in array",
+                    )));
+                }
+                let tc = data[cursor];
+                cursor += 1;
+                cursor = skip_value_in_slice(data, cursor, tc, doc_store_version)?;
+            }
+        }
+        type_codes::OBJECT_CODE => {
+            let (count, consumed) = read_vint_from_slice(&data[cursor..])?;
+            cursor += consumed;
+            for _ in 0..count as usize {
+                // key
+                if cursor >= data.len() {
+                    return Err(DeserializeError::from(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected eof in object",
+                    )));
+                }
+                let tc = data[cursor];
+                cursor += 1;
+                cursor = skip_value_in_slice(data, cursor, tc, doc_store_version)?;
+                // value
+                if cursor >= data.len() {
+                    return Err(DeserializeError::from(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected eof in object",
+                    )));
+                }
+                let tc = data[cursor];
+                cursor += 1;
+                cursor = skip_value_in_slice(data, cursor, tc, doc_store_version)?;
+            }
+        }
+        #[allow(deprecated)]
+        type_codes::JSON_OBJ_CODE => {
+            // Legacy JSON object — parse to find end
+            let mut reader = &data[cursor..];
+            let mut de = serde_json::Deserializer::from_reader(&mut reader);
+            let _: serde_json::Value = serde::Deserialize::deserialize(&mut de)
+                .map_err(|e| DeserializeError::Custom(e.to_string()))?;
+            // Calculate how many bytes were consumed
+            let remaining = reader.len();
+            cursor = data.len() - remaining;
+        }
+        _ => {
+            return Err(DeserializeError::from(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unknown type code {type_code} during skip"),
+            )));
+        }
+    }
+    if cursor > data.len() {
+        return Err(DeserializeError::from(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "cursor exceeded data length",
+        )));
+    }
+    Ok(cursor)
+}
+
 #[derive(Debug, thiserror::Error, Clone)]
 /// An error which occurs while attempting to deserialize a given value
 /// by using the provided value visitor.

@@ -136,6 +136,22 @@ impl Searcher {
         doc_addresses: &[DocAddress],
         target_field: crate::schema::Field,
     ) -> Vec<Option<Vec<u8>>> {
+        self.batch_get_field_owned_bytes(doc_addresses, target_field)
+            .into_iter()
+            .map(|opt| opt.map(|ob| ob.to_vec()))
+            .collect()
+    }
+
+    /// Zero-copy variant of [`batch_get_field_bytes`].
+    ///
+    /// Returns `OwnedBytes` sub-slices of decompressed DocStore blocks,
+    /// avoiding per-document `Vec<u8>` allocation entirely. Each returned
+    /// `OwnedBytes` shares the Arc-backed decompressed block memory.
+    pub fn batch_get_field_owned_bytes(
+        &self,
+        doc_addresses: &[DocAddress],
+        target_field: crate::schema::Field,
+    ) -> Vec<Option<common::OwnedBytes>> {
         if doc_addresses.is_empty() {
             return Vec::new();
         }
@@ -148,10 +164,9 @@ impl Searcher {
             .collect();
         indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
 
-        let mut results: Vec<Option<Vec<u8>>> = vec![None; doc_addresses.len()];
+        let mut results: Vec<Option<common::OwnedBytes>> = vec![None; doc_addresses.len()];
 
-        // Process per-segment groups using batch_get_field_bytes_grouped
-        // which decompresses each block only once for all docs in that block.
+        // Process per-segment groups using zero-copy batch extraction
         let mut seg_start = 0;
         while seg_start < indexed.len() {
             let seg_ord = indexed[seg_start].1.segment_ord;
@@ -162,7 +177,7 @@ impl Searcher {
             let group = &indexed[seg_start..seg_end];
             let doc_ids: Vec<crate::DocId> = group.iter().map(|(_, a)| a.doc_id).collect();
             let store_reader = &self.inner.store_readers[seg_ord as usize];
-            let mut batch = store_reader.batch_get_field_bytes_grouped(&doc_ids, target_field);
+            let mut batch = store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
             for (i, &(orig_idx, _)) in group.iter().enumerate() {
                 results[orig_idx] = batch[i].take();
             }

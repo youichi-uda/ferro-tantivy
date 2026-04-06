@@ -15,7 +15,7 @@ use super::Decompressor;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
-use crate::schema::document::{BinaryDocumentDeserializer, DocumentDeserialize, extract_field_bytes_from_doc};
+use crate::schema::document::{BinaryDocumentDeserializer, DocumentDeserialize, extract_field_bytes_from_doc, extract_field_bytes_range_from_doc};
 use crate::schema::Field;
 use crate::space_usage::StoreSpaceUsage;
 use crate::store::index::Checkpoint;
@@ -274,14 +274,34 @@ impl StoreReader {
         doc_ids: &[DocId],
         target_field: Field,
     ) -> Vec<Option<Vec<u8>>> {
+        // Delegate to zero-copy path and convert to Vec<u8>
+        self.batch_get_field_owned_bytes_grouped(doc_ids, target_field)
+            .into_iter()
+            .map(|opt| opt.map(|ob| ob.to_vec()))
+            .collect()
+    }
+
+    /// Zero-copy variant of [`batch_get_field_bytes_grouped`].
+    ///
+    /// Returns `OwnedBytes` sub-slices of decompressed DocStore blocks,
+    /// avoiding per-document `Vec<u8>` allocation. Each returned `OwnedBytes`
+    /// shares the Arc-backed decompressed block with other documents from the
+    /// same block.
+    ///
+    /// `doc_ids` MUST be sorted ascending for correct block grouping.
+    pub fn batch_get_field_owned_bytes_grouped(
+        &self,
+        doc_ids: &[DocId],
+        target_field: Field,
+    ) -> Vec<Option<OwnedBytes>> {
         if doc_ids.is_empty() {
             return Vec::new();
         }
         debug_assert!(
             doc_ids.windows(2).all(|w| w[0] <= w[1]),
-            "batch_get_field_bytes_grouped: doc_ids must be sorted ascending"
+            "batch_get_field_owned_bytes_grouped: doc_ids must be sorted ascending"
         );
-        let mut results: Vec<Option<Vec<u8>>> = vec![None; doc_ids.len()];
+        let mut results: Vec<Option<OwnedBytes>> = vec![None; doc_ids.len()];
         let mut checkpoints = self.block_checkpoints();
         let mut current_cp: Option<Checkpoint> = checkpoints.next();
         let mut current_block: Option<OwnedBytes> = None;
@@ -318,19 +338,22 @@ impl StoreReader {
             }
             let block = current_block.as_ref().unwrap();
 
-            // Extract all docs from this block
+            // Extract all docs from this block using zero-copy range lookup
             while idx < doc_ids.len() && doc_ids[idx] < cp.doc_range.end {
                 let did = doc_ids[idx];
                 if did >= cp.doc_range.start {
                     let doc_pos = did - cp.doc_range.start;
-                    if let Ok(range) = block_read_index(block, doc_pos) {
-                        let mut doc_bytes = block.slice(range);
-                        if let Ok(field_bytes) = extract_field_bytes_from_doc(
-                            &mut doc_bytes,
+                    if let Ok(doc_range) = block_read_index(block, doc_pos) {
+                        let doc_slice = &block[doc_range.clone()];
+                        if let Ok(Some(field_range)) = extract_field_bytes_range_from_doc(
+                            doc_slice,
                             self.doc_store_version,
                             target_field,
                         ) {
-                            results[idx] = field_bytes;
+                            // Convert doc-relative range to block-absolute range
+                            let abs_start = doc_range.start + field_range.start;
+                            let abs_end = doc_range.start + field_range.end;
+                            results[idx] = Some(block.slice(abs_start..abs_end));
                         }
                     }
                 }

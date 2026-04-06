@@ -245,6 +245,7 @@ mod tests {
 
     use super::{DeleteOperation, DeleteQueue};
     use crate::index::SegmentReader;
+    use crate::indexer::operation::DeleteTarget;
     use crate::query::{Explanation, Scorer, Weight};
     use crate::{DocId, Score};
 
@@ -265,7 +266,7 @@ mod tests {
 
         let make_op = |i: usize| DeleteOperation {
             opstamp: i as u64,
-            target: Box::new(DummyWeight),
+            target: DeleteTarget::Weight(Box::new(DummyWeight)),
         };
 
         delete_queue.push(make_op(1));

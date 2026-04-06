@@ -3,14 +3,22 @@ use crate::schema::document::Document;
 use crate::schema::{TantivyDocument, Term};
 use crate::Opstamp;
 
+/// Target for a delete operation.
+pub enum DeleteTarget {
+    /// Delete by term and build the actual weight lazily when applying deletes.
+    Term(Term),
+    /// Delete by an arbitrary compiled query weight.
+    Weight(Box<dyn Weight>),
+}
+
 /// Timestamped Delete operation.
 pub struct DeleteOperation {
     /// Operation stamp.
     /// It is used to check whether the delete operation
     /// applies to an added document operation.
     pub opstamp: Opstamp,
-    /// Weight is used to define the set of documents to be deleted.
-    pub target: Box<dyn Weight>,
+    /// Target used to define the set of documents to be deleted.
+    pub target: DeleteTarget,
 }
 
 /// Timestamped Add operation.

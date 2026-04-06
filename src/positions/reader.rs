@@ -116,14 +116,18 @@ impl PositionReader {
             let delta_to_anchor_offset = offset - self.anchor_offset;
             let num_blocks_to_skip =
                 (delta_to_anchor_offset / (COMPRESSION_BLOCK_SIZE as u64)) as usize;
-            self.advance_num_blocks(num_blocks_to_skip);
+            if num_blocks_to_skip > 0 {
+                self.advance_num_blocks(num_blocks_to_skip);
+            }
             self.load_block(0);
         } else {
             // The request offset is within the loaded block.
             // We still need to advance anchor_offset to our current block.
             let num_blocks_to_skip =
                 ((self.block_offset - self.anchor_offset) / COMPRESSION_BLOCK_SIZE as u64) as usize;
-            self.advance_num_blocks(num_blocks_to_skip);
+            if num_blocks_to_skip > 0 {
+                self.advance_num_blocks(num_blocks_to_skip);
+            }
         }
 
         // At this point, the block containing offset is loaded, and anchor has

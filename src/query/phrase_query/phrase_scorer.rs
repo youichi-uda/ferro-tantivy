@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use crate::docset::{DocSet, SeekDangerResult, TERMINATED};
 use crate::fieldnorm::FieldNormReader;
@@ -22,6 +23,11 @@ impl<TPostings: Postings> PostingsWithOffset<TPostings> {
 
     pub fn positions(&mut self, output: &mut Vec<u32>) {
         self.postings.positions_with_offset(self.offset, output)
+    }
+
+    #[inline]
+    pub fn term_freq(&self) -> u32 {
+        self.postings.term_freq()
     }
 }
 
@@ -49,6 +55,8 @@ pub struct PhraseScorer<TPostings: Postings> {
     left_positions: Vec<u32>,
     right_positions: Vec<u32>,
     phrase_count: u32,
+    bm25_weight: Option<Score>,
+    bm25_cache: Option<Arc<[Score; 256]>>,
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
@@ -58,7 +66,19 @@ pub struct PhraseScorer<TPostings: Postings> {
 }
 
 /// Returns true if and only if the two sorted arrays contain a common element
+#[inline]
 fn intersection_exists(left: &[u32], right: &[u32]) -> bool {
+    // Fast path: single-element arrays (very common for short fields like title)
+    if left.len() == 1 && right.len() == 1 {
+        return left[0] == right[0];
+    }
+    // Fast path: one side has a single element — use binary search on the longer side
+    if left.len() == 1 {
+        return right.binary_search(&left[0]).is_ok();
+    }
+    if right.len() == 1 {
+        return left.binary_search(&right[0]).is_ok();
+    }
     let mut left_index = 0;
     let mut right_index = 0;
     while left_index < left.len() && right_index < right.len() {
@@ -79,7 +99,26 @@ fn intersection_exists(left: &[u32], right: &[u32]) -> bool {
     false
 }
 
+/// Count intersections when one side has a single element.
+/// Uses binary search on the other sorted array: O(log n) instead of O(n).
+#[inline]
+fn intersection_count_single(needle: u32, haystack: &[u32]) -> u32 {
+    if haystack.binary_search(&needle).is_ok() {
+        1
+    } else {
+        0
+    }
+}
+
+#[inline]
 pub(crate) fn intersection_count(left: &[u32], right: &[u32]) -> usize {
+    // When one side is much shorter, use binary search for each element: O(k log n) vs O(n+m)
+    if left.len() * 4 < right.len() {
+        return intersection_count_gallop(left, right);
+    }
+    if right.len() * 4 < left.len() {
+        return intersection_count_gallop(right, left);
+    }
     let mut left_index = 0;
     let mut right_index = 0;
     let mut count = 0;
@@ -97,6 +136,27 @@ pub(crate) fn intersection_count(left: &[u32], right: &[u32]) -> usize {
             }
             Ordering::Greater => {
                 right_index += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Count intersections using galloping search: for each element in `short`,
+/// binary search in `long`. O(k log n) where k = short.len(), n = long.len().
+/// Optimal when k << n.
+#[inline]
+fn intersection_count_gallop(short: &[u32], long: &[u32]) -> usize {
+    let mut count = 0;
+    let mut search_start = 0;
+    for &val in short {
+        match long[search_start..].binary_search(&val) {
+            Ok(pos) => {
+                count += 1;
+                search_start += pos + 1;
+            }
+            Err(pos) => {
+                search_start += pos;
             }
         }
     }
@@ -190,6 +250,7 @@ fn intersection_count_with_slop(
     count
 }
 
+#[inline]
 fn intersection_exists_with_slop(
     left_positions: &[u32],
     right_positions: &[u32],
@@ -383,12 +444,18 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             })
             .collect::<Vec<_>>();
         let intersection_docset = Intersection::new(postings_with_offsets, num_docs);
+        let bm25_weight = similarity_weight_opt.as_ref().map(Bm25Weight::weight);
+        let bm25_cache = similarity_weight_opt
+            .as_ref()
+            .map(|similarity_weight| Arc::clone(similarity_weight.cache()));
         let mut scorer = PhraseScorer {
             intersection_docset,
             num_terms: num_docsets,
             left_positions: Vec::with_capacity(100),
             right_positions: Vec::with_capacity(100),
             phrase_count: 0u32,
+            bm25_weight,
+            bm25_cache,
             similarity_weight_opt,
             fieldnorm_reader,
             slop,
@@ -411,9 +478,66 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         &self.left_positions
     }
 
+    /// Compute the minimum term frequency across all terms for the current doc.
+    /// This is an upper bound on phrase_count since the phrase can't appear more
+    /// times than the rarest term.
+    #[inline]
+    fn min_term_freq(&mut self) -> u32 {
+        let mut min_tf = self
+            .intersection_docset
+            .docset_mut_specialized(0)
+            .term_freq();
+        for i in 1..self.num_terms {
+            min_tf = min_tf.min(
+                self.intersection_docset
+                    .docset_mut_specialized(i)
+                    .term_freq(),
+            );
+        }
+        min_tf
+    }
+
+    /// Two-phase advance: skip position decoding for docs whose upper-bound
+    /// BM25 score (using min(tf) as phrase count ceiling) cannot beat `threshold`.
+    ///
+    /// Returns the next doc that either matches the phrase and is competitive,
+    /// or TERMINATED.
+    pub(crate) fn advance_two_phase(&mut self, threshold: Score) -> DocId {
+        let Some(bm25_weight) = self.bm25_weight else {
+            return self.advance();
+        };
+        // Clone the Arc once (cheap refcount bump) to avoid borrowing self
+        // across the mutable calls to min_term_freq() / phrase_match().
+        let bm25_cache = Arc::clone(self.bm25_cache.as_ref().unwrap());
+        loop {
+            let doc = self.intersection_docset.advance();
+            if doc == TERMINATED {
+                return TERMINATED;
+            }
+            let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(doc);
+            let cache_norm = bm25_cache[fieldnorm_id as usize];
+            let min_tf = self.min_term_freq();
+            let min_tf_f = min_tf as Score;
+            let upper_score = bm25_weight * min_tf_f / (min_tf_f + cache_norm);
+            if upper_score <= threshold {
+                continue;
+            }
+            if self.phrase_match() {
+                return doc;
+            }
+        }
+    }
+
     fn phrase_match(&mut self) -> bool {
         if self.similarity_weight_opt.is_some() {
-            let count = self.compute_phrase_count();
+            // Fast path: 2-term phrases without slop (the most common case).
+            // Fuse position decoding + counting into a single operation to avoid
+            // the overhead of separate compute_phrase_match() + intersection_count().
+            let count = if self.num_terms == 2 && !self.has_slop() {
+                self.compute_phrase_count_two_terms()
+            } else {
+                self.compute_phrase_count()
+            };
             self.phrase_count = count;
             count > 0u32
         } else {
@@ -422,6 +546,11 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn phrase_exists(&mut self) -> bool {
+        // Fast path: 2-term phrases without slop.
+        // Decode positions and check existence in one step.
+        if self.num_terms == 2 && !self.has_slop() {
+            return self.phrase_exists_two_terms();
+        }
         self.compute_phrase_match();
         if self.has_slop() {
             intersection_exists_with_slop(
@@ -432,6 +561,70 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         } else {
             intersection_exists(&self.left_positions, &self.right_positions[..])
         }
+    }
+
+    /// Decode positions for both terms of a 2-term phrase into
+    /// `self.left_positions` and `self.right_positions`.
+    #[inline]
+    fn decode_two_term_positions(&mut self) {
+        let (left_postings, right_postings) = self.intersection_docset.left_and_right_mut();
+        left_postings.positions(&mut self.left_positions);
+        right_postings.positions(&mut self.right_positions);
+    }
+
+    /// Returns the term frequencies of both terms for a 2-term phrase.
+    #[inline]
+    fn two_term_freqs(&mut self) -> (u32, u32) {
+        let (left_postings, right_postings) = self.intersection_docset.left_and_right_mut();
+        (left_postings.term_freq(), right_postings.term_freq())
+    }
+
+    /// Fused decode + count for 2-term phrases without slop.
+    /// Avoids the overhead of the generic `compute_phrase_match()` + separate
+    /// `intersection_count()`.
+    /// Special-cases tf=1 with binary search (O(log n)) and tf=1×1 with a
+    /// single equality check.
+    #[inline]
+    fn compute_phrase_count_two_terms(&mut self) -> u32 {
+        let (left_tf, right_tf) = self.two_term_freqs();
+        self.decode_two_term_positions();
+
+        if left_tf == 1 && right_tf == 1 {
+            return u32::from(self.left_positions[0] == self.right_positions[0]);
+        }
+        if left_tf == 1 {
+            return intersection_count_single(self.left_positions[0], &self.right_positions);
+        }
+        if right_tf == 1 {
+            return intersection_count_single(self.right_positions[0], &self.left_positions);
+        }
+        intersection_count(&self.left_positions, &self.right_positions) as u32
+    }
+
+    /// Fused decode + exists check for 2-term phrases without slop.
+    /// Special-cases tf=1 with binary search and tf=1×1 with a single equality
+    /// check.
+    #[inline]
+    fn phrase_exists_two_terms(&mut self) -> bool {
+        let (left_tf, right_tf) = self.two_term_freqs();
+        self.decode_two_term_positions();
+
+        if left_tf == 1 && right_tf == 1 {
+            return self.left_positions[0] == self.right_positions[0];
+        }
+        if left_tf == 1 {
+            return self
+                .right_positions
+                .binary_search(&self.left_positions[0])
+                .is_ok();
+        }
+        if right_tf == 1 {
+            return self
+                .left_positions
+                .binary_search(&self.right_positions[0])
+                .is_ok();
+        }
+        intersection_exists(&self.left_positions, &self.right_positions)
     }
 
     fn compute_phrase_count(&mut self) -> u32 {
@@ -702,6 +895,52 @@ mod tests {
             1,
             2,
         );
+    }
+
+    #[test]
+    fn test_intersection_exists_single_element() {
+        // Both single
+        assert!(intersection_exists(&[5], &[5]));
+        assert!(!intersection_exists(&[5], &[6]));
+        // Left single, right multiple
+        assert!(intersection_exists(&[5], &[1, 3, 5, 9]));
+        assert!(!intersection_exists(&[4], &[1, 3, 5, 9]));
+        // Right single, left multiple
+        assert!(intersection_exists(&[1, 3, 5, 9], &[5]));
+        assert!(!intersection_exists(&[1, 3, 5, 9], &[4]));
+        // Empty
+        assert!(!intersection_exists(&[], &[1]));
+        assert!(!intersection_exists(&[1], &[]));
+        assert!(!intersection_exists(&[], &[]));
+    }
+
+    #[test]
+    fn test_intersection_count_single() {
+        assert_eq!(intersection_count_single(5, &[1, 3, 5, 9]), 1);
+        assert_eq!(intersection_count_single(4, &[1, 3, 5, 9]), 0);
+        assert_eq!(intersection_count_single(5, &[5]), 1);
+        assert_eq!(intersection_count_single(5, &[]), 0);
+    }
+
+    #[test]
+    fn test_intersection_count_gallop() {
+        // Short << long: triggers galloping
+        assert_eq!(intersection_count(&[5], &[1, 2, 3, 4, 5, 6, 7, 8]), 1);
+        assert_eq!(intersection_count(&[4], &[1, 2, 3, 4, 5, 6, 7, 8]), 1);
+        assert_eq!(intersection_count(&[9], &[1, 2, 3, 4, 5, 6, 7, 8]), 0);
+        // Multiple short elements
+        assert_eq!(
+            intersection_count(&[2, 7], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            2
+        );
+        assert_eq!(
+            intersection_count(&[2, 11], &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            1
+        );
+        // Empty short
+        assert_eq!(intersection_count(&[], &[1, 2, 3, 4, 5]), 0);
+        // Symmetric: long << short
+        assert_eq!(intersection_count(&[1, 2, 3, 4, 5, 6, 7, 8], &[5]), 1);
     }
 }
 

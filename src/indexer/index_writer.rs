@@ -16,7 +16,7 @@ use crate::index::{Index, Segment, SegmentComponent, SegmentId, SegmentMeta, Seg
 use crate::indexer::delete_queue::{DeleteCursor, DeleteQueue};
 use crate::indexer::doc_opstamp_mapping::DocToOpstampMapping;
 use crate::indexer::index_writer_status::IndexWriterStatus;
-use crate::indexer::operation::DeleteOperation;
+use crate::indexer::operation::{DeleteOperation, DeleteTarget};
 use crate::indexer::stamper::Stamper;
 use crate::indexer::{MergePolicy, SegmentEntry, SegmentWriter};
 use crate::query::{EnableScoring, Query, TermQuery};
@@ -108,19 +108,37 @@ fn compute_deleted_bitset(
 
         // A delete operation should only affect
         // document that were inserted before it.
-        delete_op
-            .target
-            .for_each_no_score(segment_reader, &mut |docs_matching_delete_query| {
+        delete_target_for_each_no_score(
+            &delete_op.target,
+            segment_reader,
+            &mut |docs_matching_delete_query| {
                 for doc_matching_delete_query in docs_matching_delete_query.iter().cloned() {
                     if doc_opstamps.is_deleted(doc_matching_delete_query, delete_op.opstamp) {
                         alive_bitset.remove(doc_matching_delete_query);
                         might_have_changed = true;
                     }
                 }
-            })?;
+            },
+        )?;
         delete_cursor.advance();
     }
     Ok(might_have_changed)
+}
+
+fn delete_target_for_each_no_score(
+    target: &DeleteTarget,
+    segment_reader: &SegmentReader,
+    callback: &mut dyn FnMut(&[u32]),
+) -> crate::Result<()> {
+    match target {
+        DeleteTarget::Term(term) => {
+            let query = TermQuery::new(term.clone(), IndexRecordOption::Basic);
+            let weight =
+                query.weight(EnableScoring::disabled_from_schema(segment_reader.schema()))?;
+            weight.for_each_no_score(segment_reader, callback)
+        }
+        DeleteTarget::Weight(weight) => weight.for_each_no_score(segment_reader, callback),
+    }
 }
 
 /// Advance delete for the given segment up to the target opstamp.
@@ -701,7 +719,7 @@ impl<D: Document> IndexWriter<D> {
         let opstamp = self.stamper.stamp();
         let delete_operation = DeleteOperation {
             opstamp,
-            target: weight,
+            target: DeleteTarget::Weight(weight),
         };
         self.delete_queue.push(delete_operation);
         Ok(opstamp)
@@ -777,12 +795,9 @@ impl<D: Document> IndexWriter<D> {
         for (user_op, opstamp) in user_operations_it.zip(stamps) {
             match user_op {
                 UserOperation::Delete(term) => {
-                    let query = TermQuery::new(term, IndexRecordOption::Basic);
-                    let weight =
-                        query.weight(EnableScoring::disabled_from_schema(&self.index.schema()))?;
                     let delete_operation = DeleteOperation {
                         opstamp,
-                        target: weight,
+                        target: DeleteTarget::Term(term),
                     };
                     self.delete_queue.push(delete_operation);
                 }

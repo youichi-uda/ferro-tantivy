@@ -17,6 +17,11 @@ pub struct SegmentPostings {
     pub(crate) block_cursor: BlockSegmentPostings,
     cur: usize,
     position_reader: Option<PositionReader>,
+    /// Cached cumulative frequency sum up to (but not including) `cum_freq_cur`.
+    /// This avoids recomputing `freqs()[..cur].iter().sum()` on every position read.
+    cum_freq_sum: u64,
+    /// The cursor index up to which `cum_freq_sum` has been computed.
+    cum_freq_cur: usize,
 }
 
 impl SegmentPostings {
@@ -26,6 +31,8 @@ impl SegmentPostings {
             block_cursor: BlockSegmentPostings::empty(),
             cur: 0,
             position_reader: None,
+            cum_freq_sum: 0,
+            cum_freq_cur: 0,
         }
     }
 
@@ -149,6 +156,8 @@ impl SegmentPostings {
             block_cursor: segment_block_postings,
             cur: 0, // cursor within the block
             position_reader,
+            cum_freq_sum: 0,
+            cum_freq_cur: 0,
         }
     }
 }
@@ -161,6 +170,8 @@ impl DocSet for SegmentPostings {
         debug_assert!(self.block_cursor.block_is_loaded());
         if self.cur == COMPRESSION_BLOCK_SIZE - 1 {
             self.cur = 0;
+            self.cum_freq_sum = 0;
+            self.cum_freq_cur = 0;
             self.block_cursor.advance();
         } else {
             self.cur += 1;
@@ -182,9 +193,15 @@ impl DocSet for SegmentPostings {
             return self.doc();
         }
 
+        let old_cur = self.cur;
         // Delegate block-local search to BlockSegmentPostings::seek, which returns
         // the in-block index of the first doc >= target.
         self.cur = self.block_cursor.seek(target);
+        // If seek moved to a different block, reset cumulative frequency cache.
+        if self.cur < old_cur {
+            self.cum_freq_sum = 0;
+            self.cum_freq_cur = 0;
+        }
         let doc = self.doc();
         debug_assert!(doc >= target);
         doc
@@ -231,19 +248,39 @@ impl Postings for SegmentPostings {
 
     fn append_positions_with_offset(&mut self, offset: u32, output: &mut Vec<u32>) {
         let term_freq = self.term_freq();
+        let cur = self.cur;
         let prev_len = output.len();
         if let Some(position_reader) = self.position_reader.as_mut() {
             debug_assert!(
                 !self.block_cursor.freqs().is_empty(),
                 "No positions available"
             );
-            let read_offset = self.block_cursor.position_offset()
-                + (self.block_cursor.freqs()[..self.cur]
-                    .iter()
-                    .cloned()
-                    .sum::<u32>() as u64);
-            // TODO: instead of zeroing the output, we could use MaybeUninit or similar.
-            output.resize(prev_len + term_freq as usize, 0u32);
+            // Use the cached cumulative frequency sum instead of recomputing from scratch.
+            // This turns O(cur) work per position read into O(cur - cum_freq_cur) amortized.
+            let cum_freq_cur = self.cum_freq_cur;
+            let freq_sum = if cum_freq_cur <= cur {
+                let freqs = self.block_cursor.freqs();
+                let additional: u64 = freqs[cum_freq_cur..cur].iter().map(|&f| f as u64).sum();
+                self.cum_freq_sum + additional
+            } else {
+                // cum_freq_cur > cur means the cache is from a previous block position
+                // that was beyond our current cursor (shouldn't normally happen, but be safe).
+                let freqs = self.block_cursor.freqs();
+                freqs[..cur].iter().map(|&f| f as u64).sum()
+            };
+            // Update the cache to include cur (so next call for cur+1 only sums 1 element).
+            self.cum_freq_sum = freq_sum + term_freq as u64;
+            self.cum_freq_cur = cur + 1;
+
+            let read_offset = self.block_cursor.position_offset() + freq_sum;
+            // SAFETY: position_reader.read() will write exactly `term_freq` elements
+            // starting at `prev_len`, fully initializing the extended region.
+            // We use reserve + set_len instead of resize to avoid zeroing memory
+            // that will be immediately overwritten.
+            output.reserve(term_freq as usize);
+            unsafe {
+                output.set_len(prev_len + term_freq as usize);
+            }
             position_reader.read(read_offset, &mut output[prev_len..]);
             let mut cum = offset;
             for output_mut in output[prev_len..].iter_mut() {

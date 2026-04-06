@@ -192,6 +192,18 @@ impl Bm25Weight {
         term_freq / (term_freq + norm)
     }
 
+    /// Returns the precomputed weight (idf * (1 + k1)).
+    #[inline]
+    pub(crate) fn weight(&self) -> Score {
+        self.weight
+    }
+
+    /// Returns the cached BM25 normalization table.
+    #[inline]
+    pub(crate) fn cache(&self) -> &Arc<[Score; 256]> {
+        &self.cache
+    }
+
     /// Produce an [Explanation] of a BM25 score.
     pub fn explain(&self, fieldnorm_id: u8, term_freq: u32) -> Explanation {
         // The explain format is directly copied from Lucene's.

@@ -103,6 +103,14 @@ impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
 }
 
 impl<TDocSet: DocSet> Intersection<TDocSet, TDocSet> {
+    /// Returns mutable references to the two specialized docsets.
+    #[inline]
+    pub(crate) fn left_and_right_mut(&mut self) -> (&mut TDocSet, &mut TDocSet) {
+        (&mut self.left, &mut self.right)
+    }
+
+    /// Returns a mutable reference to one specialized docset by ordinal.
+    #[inline]
     pub(crate) fn docset_mut_specialized(&mut self, ord: usize) -> &mut TDocSet {
         match ord {
             0 => &mut self.left,

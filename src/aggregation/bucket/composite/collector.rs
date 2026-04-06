@@ -155,14 +155,26 @@ impl SegmentAggregationCollector for SegmentCompositeCollector {
         let mem_pre = self.get_memory_consumption();
         let composite_agg_data = agg_data.take_composite_req_data(self.accessor_idx);
 
+        // Pre-cache source orders to avoid per-value enum dispatch
+        let source_orders: SmallVec<[Order; 8]> = composite_agg_data
+            .req
+            .sources
+            .iter()
+            .map(|s| s.order())
+            .collect();
+
+        // Reuse SmallVec across docs (clear instead of re-allocate)
+        let mut sub_level_values = SmallVec::new();
         for doc in docs {
+            sub_level_values.clear();
             let mut visitor = CompositeKeyVisitor {
                 doc_id: *doc,
                 composite_agg_data: &composite_agg_data,
                 buckets: &mut self.parent_buckets[parent_bucket_id as usize],
                 sub_agg: &mut self.sub_agg,
                 bucket_id_provider: &mut self.bucket_id_provider,
-                sub_level_values: SmallVec::new(),
+                sub_level_values: &mut sub_level_values,
+                source_orders: &source_orders,
             };
             visitor.visit(0, true)?;
         }
@@ -490,7 +502,9 @@ struct CompositeKeyVisitor<'a> {
     buckets: &'a mut DynArrayHeapMap<InternalValueRepr, CompositeBucketCollector>,
     sub_agg: &'a mut Option<CachedSubAggs<HighCardSubAggCache>>,
     bucket_id_provider: &'a mut BucketIdProvider,
-    sub_level_values: SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>,
+    sub_level_values: &'a mut SmallVec<[InternalValueRepr; MAX_DYN_ARRAY_SIZE]>,
+    /// Pre-cached source orders (avoids per-value enum dispatch on source.order())
+    source_orders: &'a [Order],
 }
 
 impl CompositeKeyVisitor<'_> {
@@ -532,8 +546,9 @@ impl CompositeKeyVisitor<'_> {
                         let matches_after_key_type =
                             accessor_idx == current_level_accessors.after_key_accessor_idx;
 
+                        let order = self.source_orders[source_idx];
                         if matches_after_key_type && is_on_after_key {
-                            let should_skip = match current_level_source.order() {
+                            let should_skip = match order {
                                 Order::Asc => current_level_accessors.after_key.gt(value),
                                 Order::Desc => current_level_accessors.after_key.lt(value),
                             };
@@ -544,7 +559,7 @@ impl CompositeKeyVisitor<'_> {
                         self.sub_level_values.push(InternalValueRepr::new_term(
                             value,
                             accessor_idx as u8,
-                            current_level_source.order(),
+                            order,
                         ));
                         let still_on_after_key = matches_after_key_type
                             && current_level_accessors.after_key.equals(value);
@@ -567,7 +582,7 @@ impl CompositeKeyVisitor<'_> {
                         let bucket_index = (float_value / source.interval).floor() as i64;
                         let bucket_value = i64::to_u64(bucket_index);
                         if is_on_after_key {
-                            let should_skip = match current_level_source.order() {
+                            let should_skip = match self.source_orders[source_idx] {
                                 Order::Asc => current_level_accessors.after_key.gt(bucket_value),
                                 Order::Desc => current_level_accessors.after_key.lt(bucket_value),
                             };
@@ -577,7 +592,7 @@ impl CompositeKeyVisitor<'_> {
                         }
                         self.sub_level_values.push(InternalValueRepr::new_histogram(
                             bucket_value,
-                            current_level_source.order(),
+                            self.source_orders[source_idx],
                         ));
                         let still_on_after_key =
                             current_level_accessors.after_key.equals(bucket_value);
@@ -613,7 +628,7 @@ impl CompositeKeyVisitor<'_> {
                         };
                         let bucket_value = i64::to_u64(bucket_index);
                         if is_on_after_key {
-                            let should_skip = match current_level_source.order() {
+                            let should_skip = match self.source_orders[source_idx] {
                                 Order::Asc => current_level_accessors.after_key.gt(bucket_value),
                                 Order::Desc => current_level_accessors.after_key.lt(bucket_value),
                             };
@@ -623,7 +638,7 @@ impl CompositeKeyVisitor<'_> {
                         }
                         self.sub_level_values.push(InternalValueRepr::new_histogram(
                             bucket_value,
-                            current_level_source.order(),
+                            self.source_orders[source_idx],
                         ));
                         let still_on_after_key =
                             current_level_accessors.after_key.equals(bucket_value);
@@ -638,7 +653,7 @@ impl CompositeKeyVisitor<'_> {
                 return Ok(());
             }
             self.sub_level_values.push(InternalValueRepr::new_missing(
-                current_level_source.order(),
+                self.source_orders[source_idx],
                 current_level_source.missing_order(),
             ));
             self.visit(

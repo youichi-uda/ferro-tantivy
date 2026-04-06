@@ -161,11 +161,11 @@ impl Searcher {
     /// Batch-reads raw bytes of a **bytes** fast field, falling back to DocStore
     /// for segments that lack the columnar column.
     ///
-    /// This is the preferred way to read `_source` or other large bytes fields:
-    /// - New segments (with `set_fast()`): O(1) mmap via `BytesColumn`
-    /// - Old segments (stored only): single-field DocStore extraction
+    /// Best for fields with repeated or small values where SSTable dictionary
+    /// encoding is efficient. For large unique blobs (e.g. `_source`), prefer
+    /// [`batch_get_field_bytes`] which uses DocStore directly — doc_id-ordered
+    /// blocks with LRU cache are faster than content-sorted SSTable ordinals.
     ///
-    /// Documents are sorted by (segment_ord, doc_id) internally.
     /// The returned `Vec` preserves the input order.
     pub fn batch_fast_field_bytes(
         &self,

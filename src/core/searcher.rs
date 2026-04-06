@@ -193,31 +193,61 @@ impl Searcher {
         indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
 
         let mut results: Vec<Option<Vec<u8>>> = vec![None; doc_addresses.len()];
-        let mut buf = Vec::new();
-        for (orig_idx, addr) in indexed {
+
+        // Group by segment for batch SSTable streaming via sorted_ords_to_term_cb
+        let mut seg_groups: Vec<Vec<(usize, u32)>> =
+            vec![Vec::new(); self.inner.segment_readers.len()];
+        let mut docstore_fallback: Vec<(usize, DocAddress)> = Vec::new();
+
+        for &(orig_idx, addr) in &indexed {
             let seg_ord = addr.segment_ord as usize;
-            // Try BytesColumn first (O(1) mmap)
-            if let Some(ref col) = bytes_cols[seg_ord] {
-                buf.clear();
-                let got = col
-                    .term_ords(addr.doc_id)
-                    .next()
-                    .and_then(|ord| col.ord_to_bytes(ord, &mut buf).ok())
-                    .unwrap_or(false);
-                if got {
-                    results[orig_idx] = Some(std::mem::take(&mut buf));
-                    continue;
-                }
+            if bytes_cols[seg_ord].is_some() {
+                seg_groups[seg_ord].push((orig_idx, addr.doc_id));
+            } else if let Some(_field) = stored_field {
+                docstore_fallback.push((orig_idx, addr));
             }
-            // Fallback: DocStore single-field extraction
+        }
+
+        // Fast path: batch read via sorted_ords_to_term_cb (streaming SSTable scan)
+        for (seg_ord, group) in seg_groups.iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let col = bytes_cols[seg_ord].as_ref().unwrap();
+
+            // Collect (orig_idx, term_ord) pairs, sorted by term_ord for streaming
+            let mut ord_pairs: Vec<(usize, u64)> = group
+                .iter()
+                .filter_map(|&(orig_idx, doc_id)| {
+                    col.term_ords(doc_id).next().map(|ord| (orig_idx, ord))
+                })
+                .collect();
+            ord_pairs.sort_unstable_by_key(|&(_, ord)| ord);
+
+            // Stream-decode all terms in one pass (no per-doc block restart)
+            let mut pair_idx = 0;
+            let ords_iter = ord_pairs.iter().map(|&(_, ord)| ord);
+            let _ = col.dictionary().sorted_ords_to_term_cb(ords_iter, |bytes| {
+                if pair_idx < ord_pairs.len() {
+                    let orig_idx = ord_pairs[pair_idx].0;
+                    results[orig_idx] = Some(bytes.to_vec());
+                    pair_idx += 1;
+                }
+                Ok(())
+            });
+        }
+
+        // Fallback: DocStore single-field extraction for segments without BytesColumn
+        for (orig_idx, addr) in docstore_fallback {
             if let Some(field) = stored_field {
-                let store_reader = &self.inner.store_readers[seg_ord];
+                let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
                 results[orig_idx] = store_reader
                     .get_field_bytes(addr.doc_id, field)
                     .ok()
                     .flatten();
             }
         }
+
         results
     }
 
@@ -249,23 +279,44 @@ impl Searcher {
         indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
 
         let mut results: Vec<Option<String>> = vec![None; doc_addresses.len()];
-        let mut buf = String::new();
-        for (orig_idx, addr) in indexed {
+
+        // Group by segment for batch SSTable streaming
+        let mut seg_groups: Vec<Vec<(usize, u32)>> =
+            vec![Vec::new(); self.inner.segment_readers.len()];
+        for &(orig_idx, addr) in &indexed {
             let seg_ord = addr.segment_ord as usize;
-            if let Some(ref col) = str_cols[seg_ord] {
-                buf.clear();
-                let got = col
-                    .term_ords(addr.doc_id)
-                    .next()
-                    .and_then(|ord| col.ord_to_str(ord, &mut buf).ok())
-                    .unwrap_or(false);
-                if got {
-                    results[orig_idx] = Some(std::mem::take(&mut buf));
-                    continue;
-                }
+            if str_cols[seg_ord].is_some() {
+                seg_groups[seg_ord].push((orig_idx, addr.doc_id));
             }
-            // No DocStore fallback for str — fast field is required
         }
+
+        for (seg_ord, group) in seg_groups.iter().enumerate() {
+            if group.is_empty() {
+                continue;
+            }
+            let col = str_cols[seg_ord].as_ref().unwrap();
+
+            let mut ord_pairs: Vec<(usize, u64)> = group
+                .iter()
+                .filter_map(|&(orig_idx, doc_id)| {
+                    col.term_ords(doc_id).next().map(|ord| (orig_idx, ord))
+                })
+                .collect();
+            ord_pairs.sort_unstable_by_key(|&(_, ord)| ord);
+
+            let mut pair_idx = 0;
+            let ords_iter = ord_pairs.iter().map(|&(_, ord)| ord);
+            let _ = col.dictionary().sorted_ords_to_term_cb(ords_iter, |bytes| {
+                if pair_idx < ord_pairs.len() {
+                    let orig_idx = ord_pairs[pair_idx].0;
+                    results[orig_idx] =
+                        Some(String::from_utf8_lossy(bytes).into_owned());
+                    pair_idx += 1;
+                }
+                Ok(())
+            });
+        }
+
         results
     }
 

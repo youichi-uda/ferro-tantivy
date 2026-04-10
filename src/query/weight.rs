@@ -130,4 +130,24 @@ pub trait Weight: Send + Sync + 'static {
         for_each_pruning_scorer(scorer.as_mut(), threshold, callback);
         Ok(())
     }
+
+    /// Returns a scorer optimized for use inside a conjunction (Must query).
+    /// Default falls back to `scorer()`.
+    fn scorer_for_conjunction(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> crate::Result<Box<dyn Scorer>> {
+        self.scorer(reader, boost)
+    }
+
+    /// Recursively collects all underlying TermScorers from this weight.
+    /// Returns an empty vec by default.
+    fn collect_term_scorers(
+        &self,
+        _reader: &SegmentReader,
+        _boost: Score,
+    ) -> Vec<Box<dyn Scorer>> {
+        vec![]
+    }
 }

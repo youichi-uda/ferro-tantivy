@@ -286,6 +286,36 @@ impl BitSet {
         self.len += u64::from(self.tinysets[higher as usize].insert_mut(lower));
     }
 
+    /// Batch-insert a slice of doc IDs into the BitSet.
+    ///
+    /// This is significantly faster than calling `insert()` in a loop because
+    /// it accumulates bits for the same bucket (64-doc range) and writes once
+    /// per bucket transition. Postings blocks are sorted, so consecutive docs
+    /// frequently share a bucket.
+    #[inline]
+    pub fn insert_docs_batch(&mut self, docs: &[u32]) {
+        if docs.is_empty() {
+            return;
+        }
+        let tinysets = &mut self.tinysets;
+        let mut i = 0;
+        while i < docs.len() {
+            let bucket = docs[i] >> 6; // docs[i] / 64
+            let mut mask = 1u64 << (docs[i] & 63); // docs[i] % 64
+            i += 1;
+            // Accumulate bits for the same bucket
+            while i < docs.len() && (docs[i] >> 6) == bucket {
+                mask |= 1u64 << (docs[i] & 63);
+                i += 1;
+            }
+            let ts = &mut tinysets[bucket as usize];
+            let old = ts.0;
+            ts.0 |= mask;
+            // Count newly set bits
+            self.len += (ts.0 ^ old).count_ones() as u64;
+        }
+    }
+
     /// Inserts an element in the `BitSet`
     #[inline]
     pub fn remove(&mut self, el: u32) {
@@ -690,6 +720,50 @@ mod tests {
         assert_eq!(bitset.len(), 1);
         bitset.remove(103u32);
         assert_eq!(bitset.len(), 0);
+    }
+
+    #[test]
+    fn test_bitset_insert_docs_batch() {
+        // Basic batch insert
+        let mut bitset = BitSet::with_max_value(1_000);
+        bitset.insert_docs_batch(&[3, 5, 67, 68, 128, 999]);
+        assert_eq!(bitset.len(), 6);
+        assert!(bitset.contains(3));
+        assert!(bitset.contains(5));
+        assert!(bitset.contains(67));
+        assert!(bitset.contains(68));
+        assert!(bitset.contains(128));
+        assert!(bitset.contains(999));
+        assert!(!bitset.contains(4));
+        assert!(!bitset.contains(69));
+
+        // Same bucket (0..63)
+        let mut bitset2 = BitSet::with_max_value(100);
+        bitset2.insert_docs_batch(&[0, 1, 2, 3, 62, 63]);
+        assert_eq!(bitset2.len(), 6);
+
+        // Empty slice
+        let mut bitset3 = BitSet::with_max_value(100);
+        bitset3.insert_docs_batch(&[]);
+        assert_eq!(bitset3.len(), 0);
+
+        // Duplicates in batch
+        let mut bitset4 = BitSet::with_max_value(100);
+        bitset4.insert_docs_batch(&[5, 5, 5, 10, 10]);
+        assert_eq!(bitset4.len(), 2);
+
+        // Equivalence with individual inserts
+        let docs: Vec<u32> = sample(500, 0.1);
+        let mut bitset_batch = BitSet::with_max_value(500);
+        bitset_batch.insert_docs_batch(&docs);
+        let mut bitset_single = BitSet::with_max_value(500);
+        for &d in &docs {
+            bitset_single.insert(d);
+        }
+        assert_eq!(bitset_batch.len(), bitset_single.len());
+        for el in 0..500 {
+            assert_eq!(bitset_batch.contains(el), bitset_single.contains(el));
+        }
     }
 
     pub fn sample_with_seed(n: u32, ratio: f64, seed_val: u8) -> Vec<u32> {

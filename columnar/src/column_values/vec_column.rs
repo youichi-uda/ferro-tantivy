@@ -6,9 +6,12 @@ use crate::ColumnValues;
 
 /// VecColumn provides `Column` over a `Vec<T>`.
 pub struct VecColumn<T = u64> {
-    pub(crate) values: Vec<T>,
-    pub(crate) min_value: T,
-    pub(crate) max_value: T,
+    /// The underlying values.
+    pub values: Vec<T>,
+    /// Minimum value in the column.
+    pub min_value: T,
+    /// Maximum value in the column.
+    pub max_value: T,
 }
 
 impl<T: Copy + PartialOrd + Send + Sync + Debug + 'static> ColumnValues<T> for VecColumn<T> {

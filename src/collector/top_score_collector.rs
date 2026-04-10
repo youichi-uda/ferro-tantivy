@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::Collector;
 use crate::collector::sort_key::{
     Comparator, ComparatorEnum, NaturalComparator, ReverseComparator, SortBySimilarityScore,
-    SortByStaticFastValue, SortByString,
+    SortByStaticFastValue, SortByStaticFastValueWithCursor, SortByString,
 };
 use crate::collector::sort_key_top_collector::TopBySortKeyCollector;
 use crate::collector::top_collector::ComparableDoc;
@@ -308,17 +308,14 @@ impl TopDocs {
         self.order_by((SortByStaticFastValue::for_field(fast_field), order))
     }
 
-    /// Like `order_by_fast_field`, but with a `search_after` cursor.
+    /// Like [`order_by_fast_field`](TopDocs::order_by_fast_field), but with a cursor value for
+    /// `search_after` pagination.
     ///
-    /// Documents whose sort value is at or before the cursor are skipped
-    /// during collection. This is much faster than using a `BooleanQuery`
-    /// intersection with a `RangeQuery` because:
-    /// - No posting list intersection
-    /// - Single column check per doc (O(1))
-    /// - Base query runs at full speed
+    /// Documents whose sort field value does not pass the cursor threshold are excluded:
+    /// - `Order::Desc`: only documents with value **strictly less than** the cursor are collected.
+    /// - `Order::Asc`: only documents with value **strictly greater than** the cursor are collected.
     ///
-    /// The cursor value is in the original type space (e.g., `i64` for I64 fields).
-    /// The `is_asc` direction is derived from `order` automatically.
+    /// This is used to implement Elasticsearch-compatible `search_after` functionality.
     pub fn order_by_fast_field_with_cursor<TFastValue>(
         self,
         fast_field: impl ToString,
@@ -329,10 +326,10 @@ impl TopDocs {
         TFastValue: FastValue,
         ComparatorEnum: Comparator<Option<TFastValue>>,
     {
-        let is_asc = matches!(order, Order::Asc);
-        let skc = SortByStaticFastValue::<TFastValue>::for_field(fast_field)
-            .with_search_after(cursor, is_asc);
-        self.order_by((skc, order))
+        self.order_by((
+            SortByStaticFastValueWithCursor::new(fast_field, order, cursor),
+            order,
+        ))
     }
 
     /// Like `order_by_fast_field`, but for a `String` fast field.

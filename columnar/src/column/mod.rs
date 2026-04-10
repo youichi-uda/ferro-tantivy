@@ -16,6 +16,7 @@ pub use serialize::{
 
 use crate::column_index::{ColumnIndex, Set};
 use crate::column_values::monotonic_mapping::StrictlyMonotonicMappingToInternal;
+use crate::column_values::VecColumn;
 use crate::column_values::{ColumnValues, monotonic_map_column};
 use crate::{Cardinality, DocId, EmptyColumnValues, MonotonicallyMappableToU64, RowId};
 
@@ -165,6 +166,24 @@ impl<T: PartialOrd + Copy + Debug + Send + Sync + 'static> Column<T> {
             column: self,
             default_value,
         })
+    }
+}
+
+impl<T: PartialOrd + Copy + Debug + Default + Send + Sync + 'static> Column<T> {
+    /// Pre-decodes all values into a `VecColumn` for zero-copy access.
+    ///
+    /// This trades memory for speed: subsequent reads hit a contiguous Vec
+    /// rather than going through bitpacking/codec decode paths.
+    pub fn warm(&self) -> Column<T> {
+        let num_vals = self.values.num_vals();
+        let mut vals = vec![T::default(); num_vals as usize];
+        if num_vals > 0 {
+            self.values.get_range(0, &mut vals);
+        }
+        Column {
+            index: self.index.clone(),
+            values: Arc::new(VecColumn::from(vals)),
+        }
     }
 }
 

@@ -99,9 +99,7 @@ where
                 if docs.is_empty() {
                     break;
                 }
-                for &doc in docs {
-                    doc_bitset.insert(doc);
-                }
+                doc_bitset.insert_docs_batch(docs);
                 block_segment_postings.advance();
             }
         }

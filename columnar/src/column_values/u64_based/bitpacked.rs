@@ -66,6 +66,48 @@ impl ColumnValues for BitpackedReader {
         self.stats.num_rows
     }
 
+    fn get_range(&self, start: u64, output: &mut [u64]) {
+        if output.is_empty() {
+            return;
+        }
+        // Use SIMD batch decode via get_batch_u32s when bit_width <= 32.
+        if self.bit_unpacker.bit_width() <= 32 {
+            let mut batch = vec![0u32; output.len()];
+            self.bit_unpacker
+                .get_batch_u32s(start as u32, &self.data, &mut batch);
+            let min_value = self.stats.min_value;
+            let gcd = self.stats.gcd.get();
+            for (out, &raw) in output.iter_mut().zip(batch.iter()) {
+                *out = min_value + gcd * (raw as u64);
+            }
+        } else {
+            for (i, out) in output.iter_mut().enumerate() {
+                *out = self.get_val((start as u32) + (i as u32));
+            }
+        }
+    }
+
+    fn get_vals(&self, indexes: &[u32], output: &mut [u64]) {
+        assert_eq!(indexes.len(), output.len());
+        if output.is_empty() {
+            return;
+        }
+        // Check if indexes are sequential — if so, use batch decode.
+        let is_sequential = indexes.len() > 1
+            && indexes
+                .windows(2)
+                .all(|w| w[1] == w[0] + 1);
+        if is_sequential && self.bit_unpacker.bit_width() <= 32 {
+            self.get_range(indexes[0] as u64, output);
+        } else {
+            let min_value = self.stats.min_value;
+            let gcd = self.stats.gcd.get();
+            for (out, &idx) in output.iter_mut().zip(indexes.iter()) {
+                *out = min_value + gcd * self.bit_unpacker.get(idx, &self.data);
+            }
+        }
+    }
+
     fn get_row_ids_for_value_range(
         &self,
         range: RangeInclusive<u64>,

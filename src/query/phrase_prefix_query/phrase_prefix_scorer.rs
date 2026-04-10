@@ -158,9 +158,13 @@ impl<TPostings: Postings> PhrasePrefixScorer<TPostings> {
     }
 
     fn matches_prefix(&mut self) -> bool {
-        let mut count = 0;
         let current_doc = self.doc();
         let pos_matching = self.phrase_scorer.get_intersection();
+        if pos_matching.is_empty() {
+            self.phrase_count = 0;
+            return false;
+        }
+        let mut count = 0;
         for suffix in &mut self.suffixes {
             if suffix.doc() > current_doc {
                 continue;

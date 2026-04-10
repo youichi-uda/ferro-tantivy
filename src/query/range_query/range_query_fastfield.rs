@@ -65,9 +65,9 @@ impl Weight for FastFieldRangeWeight {
         let schema = reader.schema();
         let field_type = schema.get_field_entry(term.field()).field_type();
         if term.typ() != field_type.value_type() {
-            // Type mismatch between query term and field — return empty scorer
-            // instead of panicking. This can happen when ES-compat layer sends
-            // a float range on an integer field.
+            // Type mismatch: the caller built a range term with the wrong type
+            // (e.g., F64 term on an I64 field). Return empty results — no
+            // documents can match when the types are incompatible.
             return Ok(Box::new(crate::query::EmptyScorer));
         }
         let field_name = term.get_full_path(reader.schema());

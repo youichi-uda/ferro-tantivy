@@ -6,8 +6,11 @@ use crate::ColumnValues;
 
 /// VecColumn provides `Column` over a `Vec<T>`.
 pub struct VecColumn<T = u64> {
+    /// The underlying values.
     pub values: Vec<T>,
+    /// Minimum value in the column.
     pub min_value: T,
+    /// Maximum value in the column.
     pub max_value: T,
 }
 

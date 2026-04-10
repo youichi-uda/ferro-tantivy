@@ -64,13 +64,12 @@ impl Weight for FastFieldRangeWeight {
             .expect("At least one bound must be set");
         let schema = reader.schema();
         let field_type = schema.get_field_entry(term.field()).field_type();
-        assert_eq!(
-            term.typ(),
-            field_type.value_type(),
-            "Field is of type {:?}, but got term of type {:?}",
-            field_type,
-            term.typ()
-        );
+        if term.typ() != field_type.value_type() {
+            // Type mismatch between query term and field — return empty scorer
+            // instead of panicking. This can happen when ES-compat layer sends
+            // a float range on an integer field.
+            return Ok(Box::new(crate::query::EmptyScorer));
+        }
         let field_name = term.get_full_path(reader.schema());
 
         let get_value_bytes = |term: &Term| term.value().value_bytes_payload();

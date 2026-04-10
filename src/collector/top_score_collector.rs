@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::Collector;
 use crate::collector::sort_key::{
     Comparator, ComparatorEnum, NaturalComparator, ReverseComparator, SortBySimilarityScore,
-    SortByStaticFastValue, SortByString,
+    SortByStaticFastValue, SortByStaticFastValueWithCursor, SortByString,
 };
 use crate::collector::sort_key_top_collector::TopBySortKeyCollector;
 use crate::collector::top_collector::ComparableDoc;
@@ -306,6 +306,30 @@ impl TopDocs {
         ComparatorEnum: Comparator<Option<TFastValue>>,
     {
         self.order_by((SortByStaticFastValue::for_field(fast_field), order))
+    }
+
+    /// Like [`order_by_fast_field`](TopDocs::order_by_fast_field), but with a cursor value for
+    /// `search_after` pagination.
+    ///
+    /// Documents whose sort field value does not pass the cursor threshold are excluded:
+    /// - `Order::Desc`: only documents with value **strictly less than** the cursor are collected.
+    /// - `Order::Asc`: only documents with value **strictly greater than** the cursor are collected.
+    ///
+    /// This is used to implement Elasticsearch-compatible `search_after` functionality.
+    pub fn order_by_fast_field_with_cursor<TFastValue>(
+        self,
+        fast_field: impl ToString,
+        order: Order,
+        cursor: TFastValue,
+    ) -> impl Collector<Fruit = Vec<(Option<TFastValue>, DocAddress)>>
+    where
+        TFastValue: FastValue,
+        ComparatorEnum: Comparator<Option<TFastValue>>,
+    {
+        self.order_by((
+            SortByStaticFastValueWithCursor::new(fast_field, order, cursor),
+            order,
+        ))
     }
 
     /// Like `order_by_fast_field`, but for a `String` fast field.

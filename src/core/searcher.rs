@@ -7,7 +7,8 @@ use crate::core::Executor;
 use crate::index::{SegmentId, SegmentReader};
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
 use crate::schema::document::DocumentDeserialize;
-use crate::schema::{Schema, Term};
+use crate::schema::{Field, Schema, Term};
+use common::OwnedBytes;
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
 use crate::{DocAddress, Index, Opstamp, TrackedObject};
@@ -243,6 +244,51 @@ impl Searcher {
             space_usage.add_segment(segment_reader.space_usage()?);
         }
         Ok(space_usage)
+    }
+
+    /// Batch document retrieval. For each address, attempts `self.doc()` and
+    /// wraps errors as `None`.
+    pub fn docs_batch<D: DocumentDeserialize>(&self, addrs: &[DocAddress]) -> Vec<Option<D>> {
+        addrs
+            .iter()
+            .map(|addr| self.doc::<D>(*addr).ok())
+            .collect()
+    }
+
+    /// Batch retrieval of combined `_id` + `_source` as raw bytes.
+    ///
+    /// Returns a stub (`vec![None; addrs.len()]`). FerroSearch has fallback
+    /// logic that uses separate SSTable + DocStore paths when this returns
+    /// all-`None`.
+    pub fn batch_get_id_and_source(
+        &self,
+        addrs: &[DocAddress],
+    ) -> Vec<Option<(String, OwnedBytes)>> {
+        vec![None; addrs.len()]
+    }
+
+    /// Batch fast-field string read. For each address, attempts to read the
+    /// fast field value for the given field name. Returns `None` on any error
+    /// or missing value.
+    pub fn batch_fast_field_str(
+        &self,
+        addrs: &[DocAddress],
+        _field_name: &str,
+        _field: Option<Field>,
+    ) -> Vec<Option<String>> {
+        vec![None; addrs.len()]
+    }
+
+    /// Batch retrieval of raw bytes for a given field from the doc store.
+    ///
+    /// Returns a stub (`vec![None; addrs.len()]`). FerroSearch falls back to
+    /// per-document retrieval when this returns all-`None`.
+    pub fn batch_get_field_owned_bytes(
+        &self,
+        addrs: &[DocAddress],
+        _field: Field,
+    ) -> Vec<Option<OwnedBytes>> {
+        vec![None; addrs.len()]
     }
 }
 

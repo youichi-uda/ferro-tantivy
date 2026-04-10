@@ -11,6 +11,7 @@ mod empty_query;
 mod exclude;
 mod exist_query;
 mod explanation;
+pub mod fast_field_range_weight;
 mod fuzzy_query;
 mod intersection;
 mod more_like_this;
@@ -25,6 +26,7 @@ mod scorer;
 mod set_query;
 mod size_hint;
 mod term_query;
+pub mod top_k_cache;
 mod union;
 mod weight;
 

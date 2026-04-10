@@ -1,10 +1,15 @@
+mod block_max_conjunction;
 mod block_wand;
+pub mod block_wand_scorer;
 mod boolean_query;
 mod boolean_weight;
+mod max_score_block_wand;
 
+pub(crate) use self::block_max_conjunction::block_max_conjunction;
 pub(crate) use self::block_wand::{block_wand, block_wand_single_scorer};
 pub use self::boolean_query::BooleanQuery;
 pub use self::boolean_weight::BooleanWeight;
+pub(crate) use self::max_score_block_wand::max_score_bulk_scorer;
 
 #[cfg(test)]
 mod tests {

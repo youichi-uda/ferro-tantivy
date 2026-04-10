@@ -122,6 +122,8 @@ stopwords = []
 lz4-compression = ["lz4_flex"]
 zstd-compression = ["zstd"]
 
+# enable lz4-compression in columnar (and sstable)
+columnar-lz4-compression = ["columnar/lz4-compression"]
 # enable zstd-compression in columnar (and sstable)
 columnar-zstd-compression = ["columnar/zstd-compression"]
 

@@ -88,10 +88,6 @@ impl TermScorer {
         self.similarity_weight.explain(fieldnorm_id, term_freq)
     }
 
-    pub fn max_score(&self) -> Score {
-        self.similarity_weight.max_score()
-    }
-
     pub fn last_doc_in_block(&self) -> DocId {
         self.postings.block_cursor.skip_reader().last_doc_in_block()
     }
@@ -125,6 +121,36 @@ impl Scorer for TermScorer {
         let fieldnorm_id = self.fieldnorm_id();
         let term_freq = self.term_freq();
         self.similarity_weight.score(fieldnorm_id, term_freq)
+    }
+
+    #[inline]
+    fn block_max_score(&mut self) -> Score {
+        self.postings
+            .block_cursor
+            .block_max_score(&self.fieldnorm_reader, &self.similarity_weight)
+    }
+
+    #[inline]
+    fn shallow_seek(&mut self, target: DocId) -> DocId {
+        self.postings.block_cursor.seek_block(target);
+        self.postings.block_cursor.skip_reader().last_doc_in_block()
+    }
+
+    #[inline]
+    fn last_doc_in_block(&self) -> DocId {
+        self.postings.block_cursor.skip_reader().last_doc_in_block()
+    }
+
+    #[inline]
+    fn max_score(&self) -> Score {
+        self.similarity_weight.max_score()
+    }
+
+    fn get_max_score(&self, _up_to: DocId) -> Score {
+        // Conservative: return global max_score.
+        // A more precise implementation would walk blocks, but for
+        // block-max WAND the per-block score is what matters.
+        self.similarity_weight.max_score()
     }
 }
 

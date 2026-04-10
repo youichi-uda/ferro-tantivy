@@ -235,9 +235,7 @@ impl Weight for InvertedIndexRangeWeight {
                 if docs.is_empty() {
                     break;
                 }
-                for &doc in block_segment_postings.docs() {
-                    doc_bitset.insert(doc);
-                }
+                doc_bitset.insert_docs_batch(docs);
                 block_segment_postings.advance();
             }
         }

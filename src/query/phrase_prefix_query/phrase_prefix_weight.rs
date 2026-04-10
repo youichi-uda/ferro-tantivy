@@ -86,21 +86,13 @@ impl PhrasePrefixWeight {
         let mut stream = stream.into_stream()?;
 
         let mut suffixes = Vec::with_capacity(self.max_expansions as usize);
-        let mut new_term = self.prefix.1.clone();
         while stream.advance() && (suffixes.len() as u32) < self.max_expansions {
-            new_term.clear_with_type(new_term.typ());
-            new_term.append_bytes(stream.key());
-            if reader.has_deletes() {
-                if let Some(postings) =
-                    inv_index.read_postings(&new_term, IndexRecordOption::WithFreqsAndPositions)?
-                {
-                    suffixes.push(postings);
-                }
-            } else if let Some(postings) =
-                inv_index.read_postings(&new_term, IndexRecordOption::WithFreqsAndPositions)?
-            {
-                suffixes.push(postings);
-            }
+            let term_info = stream.value().clone();
+            let postings = inv_index.read_postings_from_terminfo(
+                &term_info,
+                IndexRecordOption::WithFreqsAndPositions,
+            )?;
+            suffixes.push(postings);
         }
 
         Ok(Some(PhrasePrefixScorer::new(

@@ -1,11 +1,15 @@
+#[allow(dead_code)]
 mod block_max_conjunction;
+#[allow(dead_code)]
 mod block_wand;
 pub mod block_wand_scorer;
 mod boolean_query;
 mod boolean_weight;
 mod max_score_block_wand;
 
+#[allow(unused_imports)]
 pub(crate) use self::block_max_conjunction::block_max_conjunction;
+#[allow(unused_imports)]
 pub(crate) use self::block_wand::{block_wand, block_wand_single_scorer};
 pub use self::boolean_query::BooleanQuery;
 pub use self::boolean_weight::BooleanWeight;

@@ -222,50 +222,45 @@ pub fn max_score_bulk_scorer(
                 doc = entries[eidx].scorer.advance();
             }
         } else {
-            // Multiple essential scorers — find docs present in at least the
-            // first essential scorer and accumulate scores.
-            let first_essential_idx = partition_order[0];
-            let mut doc = entries[first_essential_idx].scorer.doc();
-
-            while doc != TERMINATED && doc <= window_end {
-                let mut score = entries[first_essential_idx].scorer.score();
-                let mut sum_of_other_max = 0.0f32;
-
-                // Accumulate max possible scores from other essential + non-essential.
-                for &oidx in &partition_order[1..] {
-                    sum_of_other_max += entries[oidx].max_window_score;
+            // Multiple essential scorers — iterate the union of all essential
+            // scorers (find min doc across all essentials at each step).
+            loop {
+                // Find the minimum doc across all essential scorers.
+                let mut doc = TERMINATED;
+                for i in 0..num_essential {
+                    let eidx = partition_order[i];
+                    let d = entries[eidx].scorer.doc();
+                    if d < doc {
+                        doc = d;
+                    }
                 }
 
-                // Check each other essential scorer.
-                let mut skip = false;
-                for i in 1..num_essential {
+                if doc == TERMINATED || doc > window_end {
+                    break;
+                }
+
+                // Score: sum from all essential scorers that are on this doc.
+                let mut score: Score = 0.0;
+                let mut sum_of_other_max: Score = 0.0;
+
+                // First compute total max_window_score for non-essential scorers.
+                for &neidx in &partition_order[num_essential..] {
+                    sum_of_other_max += entries[neidx].max_window_score;
+                }
+
+                // Score from essential scorers on this doc.
+                for i in 0..num_essential {
                     let eidx = partition_order[i];
-                    sum_of_other_max -= entries[eidx].max_window_score;
-
-                    // Early termination: if score + remaining max can't beat threshold, skip.
-                    if score + sum_of_other_max + entries[eidx].max_window_score <= threshold {
-                        skip = true;
-                        break;
-                    }
-
                     let e = &mut entries[eidx];
-                    if e.scorer.doc() < doc {
-                        e.scorer.seek(doc);
-                    }
                     if e.scorer.doc() == doc {
                         score += e.scorer.score();
                     }
                 }
 
-                if !skip {
+                // Early termination check.
+                if score + sum_of_other_max > threshold {
                     // Add non-essential contributions.
                     for &neidx in &partition_order[num_essential..] {
-                        sum_of_other_max -= entries[neidx].max_window_score;
-
-                        if score + sum_of_other_max + entries[neidx].max_window_score <= threshold {
-                            break;
-                        }
-
                         let ne = &mut entries[neidx];
                         if ne.scorer.doc() < doc {
                             ne.scorer.seek(doc);
@@ -280,7 +275,13 @@ pub fn max_score_bulk_scorer(
                     }
                 }
 
-                doc = entries[first_essential_idx].scorer.advance();
+                // Advance all essential scorers that are on the current doc.
+                for i in 0..num_essential {
+                    let eidx = partition_order[i];
+                    if entries[eidx].scorer.doc() == doc {
+                        entries[eidx].scorer.advance();
+                    }
+                }
             }
         }
 

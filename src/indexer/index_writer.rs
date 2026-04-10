@@ -669,6 +669,14 @@ impl<D: Document> IndexWriter<D> {
         &self.segment_updater
     }
 
+    /// Blocks until all in-flight background merge operations have completed.
+    /// Unlike `wait_merging_threads` this does NOT consume `self`.
+    pub fn wait_merging_operations(&self) -> crate::Result<()> {
+        self.segment_updater
+            .wait_merging_thread()
+            .map_err(|_| error_in_index_worker_thread("Failed to join merging thread."))
+    }
+
     /// Delete all documents containing a given term.
     ///
     /// Delete operation only affects documents that

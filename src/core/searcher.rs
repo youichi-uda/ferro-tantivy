@@ -157,7 +157,29 @@ impl Searcher {
             return Vec::new();
         }
 
-        // Sort by (segment_ord, doc_id) and group by segment
+        let num_segments = self.inner.store_readers.len();
+
+        // Single-segment fast path: skip sort + group overhead.
+        // After forcemerge, all docs are in segment 0.
+        if num_segments == 1 {
+            let store_reader = &self.inner.store_readers[0];
+            // Sort doc_ids for sequential block access, but track original indices
+            let mut indexed: Vec<(usize, crate::DocId)> = doc_addresses
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (i, a.doc_id))
+                .collect();
+            indexed.sort_unstable_by_key(|(_, doc_id)| *doc_id);
+            let doc_ids: Vec<crate::DocId> = indexed.iter().map(|(_, d)| *d).collect();
+            let mut batch = store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
+            let mut results: Vec<Option<common::OwnedBytes>> = vec![None; doc_addresses.len()];
+            for (i, &(orig_idx, _)) in indexed.iter().enumerate() {
+                results[orig_idx] = batch[i].take();
+            }
+            return results;
+        }
+
+        // Multi-segment: sort by (segment_ord, doc_id) and group by segment
         let mut indexed: Vec<(usize, DocAddress)> = doc_addresses
             .iter()
             .enumerate()
@@ -167,7 +189,6 @@ impl Searcher {
 
         let mut results: Vec<Option<common::OwnedBytes>> = vec![None; doc_addresses.len()];
 
-        // Process per-segment groups using zero-copy batch extraction
         let mut seg_start = 0;
         while seg_start < indexed.len() {
             let seg_ord = indexed[seg_start].1.segment_ord;

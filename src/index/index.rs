@@ -639,6 +639,41 @@ impl Index {
         self.schema.clone()
     }
 
+    /// Rewrites `meta.json` on disk with a new (superset) schema while
+    /// preserving the current segment list, opstamp, settings, and payload.
+    ///
+    /// **FerroSearch extension.** This exists to support additive schema
+    /// evolution (dynamic mapping): new fields can be appended to the schema
+    /// without rebuilding existing segments. Old segments simply do not
+    /// contain the new fields — reads for those fields on old docs return
+    /// "missing", which matches Elasticsearch's semantics for docs written
+    /// before the field existed.
+    ///
+    /// The caller is responsible for:
+    ///   - Making sure the new schema is a **superset** of the existing one
+    ///     (same field names/types for all pre-existing fields; only additions
+    ///     are safe). Removing or re-typing fields will corrupt reads.
+    ///   - Draining / committing any in-flight writes and dropping the
+    ///     existing `IndexWriter` before calling, then re-opening the `Index`
+    ///     so subsequent writers use the new schema. This method does not
+    ///     acquire the writer lock.
+    ///
+    /// After a successful call, re-open the directory with
+    /// [`Index::open`] to get an `Index` whose in-memory schema matches the
+    /// newly persisted one.
+    pub fn rewrite_schema_on_disk(&self, new_schema: Schema) -> crate::Result<()> {
+        let current = self.load_metas()?;
+        let new_meta = IndexMeta {
+            index_settings: current.index_settings,
+            segments: current.segments,
+            schema: new_schema,
+            opstamp: current.opstamp,
+            payload: current.payload,
+        };
+        save_metas(&new_meta, self.directory())?;
+        Ok(())
+    }
+
     /// Returns the list of segments that are searchable
     pub fn searchable_segments(&self) -> crate::Result<Vec<Segment>> {
         Ok(self

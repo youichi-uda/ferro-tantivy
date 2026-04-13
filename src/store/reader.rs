@@ -15,7 +15,10 @@ use super::Decompressor;
 use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
-use crate::schema::document::{BinaryDocumentDeserializer, DocumentDeserialize, extract_field_bytes_from_doc, extract_field_bytes_range_from_doc};
+use crate::schema::document::{
+    extract_field_bytes_from_doc, extract_field_bytes_range_from_doc, BinaryDocumentDeserializer,
+    DocumentDeserialize,
+};
 use crate::schema::Field;
 use crate::space_usage::StoreSpaceUsage;
 use crate::store::index::Checkpoint;
@@ -78,11 +81,23 @@ struct BlockCache {
 }
 
 impl BlockCache {
+    /// Lock the inner cache, recovering from a poisoned mutex.
+    ///
+    /// The LRU block cache only stores decompressed block bytes; a panic in
+    /// another thread while holding the lock cannot corrupt its invariants, so
+    /// recovering via `into_inner()` is safe and strictly better than killing
+    /// every subsequent reader with `unwrap()`.
+    fn lock_cache<'a>(
+        cache: &'a Mutex<LruCache<usize, Block>>,
+    ) -> std::sync::MutexGuard<'a, LruCache<usize, Block>> {
+        cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn get_from_cache(&self, pos: usize) -> Option<Block> {
         if let Some(block) = self
             .cache
             .as_ref()
-            .and_then(|cache| cache.lock().unwrap().get(&pos).cloned())
+            .and_then(|cache| Self::lock_cache(cache).get(&pos).cloned())
         {
             self.cache_hits.fetch_add(1, Ordering::SeqCst);
             return Some(block);
@@ -93,7 +108,7 @@ impl BlockCache {
 
     fn put_into_cache(&self, pos: usize, data: Block) {
         if let Some(cache) = self.cache.as_ref() {
-            cache.lock().unwrap().put(pos, data);
+            Self::lock_cache(cache).put(pos, data);
         }
     }
 
@@ -108,14 +123,14 @@ impl BlockCache {
     fn len(&self) -> usize {
         self.cache
             .as_ref()
-            .map_or(0, |cache| cache.lock().unwrap().len())
+            .map_or(0, |cache| Self::lock_cache(cache).len())
     }
 
     #[cfg(test)]
     fn peek_lru(&self) -> Option<usize> {
         self.cache
             .as_ref()
-            .and_then(|cache| cache.lock().unwrap().peek_lru().map(|(&k, _)| k))
+            .and_then(|cache| Self::lock_cache(cache).peek_lru().map(|(&k, _)| k))
     }
 }
 
@@ -620,5 +635,44 @@ mod tests {
         assert_eq!(store.cache.peek_lru(), Some(232206));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_block_cache_recovers_from_poisoned_mutex() {
+        // A panic inside a thread that held the cache lock poisons the Mutex.
+        // The BlockCache must recover gracefully instead of panicking every
+        // subsequent reader with `unwrap()` on a PoisonError.
+        use std::sync::Arc;
+
+        let cache = Arc::new(BlockCache {
+            cache: Some(Mutex::new(LruCache::new(
+                NonZeroUsize::new(4).unwrap(),
+            ))),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+        });
+
+        // Seed one entry so get_from_cache has something to find.
+        cache.put_into_cache(42, OwnedBytes::new(b"hello".to_vec()));
+
+        // Poison the mutex by panicking while holding it.
+        let poisoner = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                let inner = cache.cache.as_ref().unwrap();
+                let _guard = inner.lock().unwrap();
+                panic!("intentional poison");
+            })
+        };
+        assert!(poisoner.join().is_err());
+        assert!(cache.cache.as_ref().unwrap().is_poisoned());
+
+        // All accessor methods must keep working on a poisoned mutex.
+        assert_eq!(cache.len(), 1);
+        let block = cache.get_from_cache(42).expect("entry still present");
+        assert_eq!(block.as_slice(), b"hello");
+        cache.put_into_cache(7, OwnedBytes::new(b"world".to_vec()));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.stats().num_entries, 2);
     }
 }

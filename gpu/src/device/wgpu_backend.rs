@@ -26,6 +26,13 @@ pub struct WgpuDevice {
     pipelines: Mutex<HashMap<u64, wgpu::ComputePipeline>>,
     bind_group_layouts: Mutex<HashMap<u64, Vec<wgpu::BindGroupLayout>>>,
     bind_groups: Mutex<HashMap<u64, WgpuBindGroupData>>,
+    /// Serializes encoder creation, submission, and poll() for a single
+    /// dispatch. wgpu's `Queue::submit` is internally thread-safe, but callers
+    /// of `dispatch()` expect read-after-write ordering across threads; without
+    /// this lock two concurrent dispatches can interleave their encoder builds
+    /// and submit in a non-deterministic order, making later `read_buffer()`
+    /// calls race against still-in-flight work.
+    dispatch_lock: Mutex<()>,
 }
 
 struct WgpuBindGroupData {
@@ -104,6 +111,7 @@ impl WgpuDevice {
             pipelines: Mutex::new(HashMap::new()),
             bind_group_layouts: Mutex::new(HashMap::new()),
             bind_groups: Mutex::new(HashMap::new()),
+            dispatch_lock: Mutex::new(()),
         })
     }
 }
@@ -171,6 +179,12 @@ impl GpuDevice for WgpuDevice {
     }
 
     fn read_buffer(&self, buffer: &GpuBufferRaw, offset: u64, size: u64) -> GpuResult<Vec<u8>> {
+        // Serialize against concurrent dispatch()/read_buffer() calls on the
+        // same device so that read-after-write semantics hold for callers.
+        let _dispatch_guard = self
+            .dispatch_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Create a staging buffer for readback
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback-staging"),
@@ -271,6 +285,13 @@ impl GpuDevice for WgpuDevice {
         bind_groups: &[GpuBindGroupRaw],
         workgroups: (u32, u32, u32),
     ) -> GpuResult<()> {
+        // Serialize the full encoder-build/submit/poll sequence so concurrent
+        // dispatches on the same device execute in a well-defined order. The
+        // guard is held for the entire function body.
+        let _dispatch_guard = self
+            .dispatch_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let pipelines = self
             .pipelines
             .lock()

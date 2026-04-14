@@ -96,6 +96,20 @@ cd tantivy
 cargo test
 ```
 
+### Formatting
+
+`rustfmt.toml` uses nightly-only options (`wrap_comments`, `imports_granularity`,
+`group_imports`, `format_strings`, `normalize_comments`, `where_single_line`,
+`comment_width`). Stable rustfmt silently ignores every one of them and will
+produce drift against the canonical formatting. Always format with nightly:
+
+```bash
+rustup toolchain install nightly --component rustfmt   # one-time setup
+cargo +nightly fmt --all
+```
+
+CI enforces this via `cargo +nightly fmt --all -- --check`.
+
 ## Companies Using Tantivy
 
 <p align="left">

@@ -1,3 +1,24 @@
+# NOTE: This configuration requires NIGHTLY rustfmt.
+#
+# Every option below is gated behind `unstable_features` and is silently
+# ignored by stable rustfmt. Running `cargo fmt` on stable will appear to
+# succeed but will produce drift against the canonical nightly-formatted
+# tree (see DIRTY_TREE_AUDIT.md, 2026-04-14 for an example of 20 files
+# silently drifting under stable fmt).
+#
+# Always format with:
+#     cargo +nightly fmt --all
+#
+# CI (.github/workflows/test.yml) enforces this via `cargo +nightly fmt
+# --all -- --check`. If you do not have nightly installed:
+#     rustup toolchain install nightly --component rustfmt
+#
+# `unstable_features = true` below makes the nightly requirement explicit
+# and causes stable rustfmt to emit a visible warning instead of silently
+# ignoring every setting in this file.
+
+unstable_features = true
+
 comment_width = 120
 format_strings = true
 group_imports = "StdExternalCrate"

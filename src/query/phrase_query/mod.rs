@@ -396,4 +396,99 @@ pub(crate) mod tests {
         assert_eq!(&matching_docs(r#"arr.text:"elliot smith""#), &[2]);
         Ok(())
     }
+
+    fn run_ordered_query(
+        index: &Index,
+        terms: Vec<&str>,
+        slop: u32,
+        ordered: bool,
+    ) -> Vec<DocId> {
+        let text_field = index.schema().get_field("text").unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let terms: Vec<Term> = terms
+            .iter()
+            .map(|t| Term::from_field_text(text_field, t))
+            .collect();
+        let mut phrase_query = PhraseQuery::new(terms);
+        phrase_query.set_slop(slop);
+        phrase_query.set_ordered(ordered);
+        searcher
+            .search(&phrase_query, &TEST_COLLECTOR_WITHOUT_SCORE)
+            .unwrap()
+            .docs()
+            .iter()
+            .map(|d| d.doc_id)
+            .collect()
+    }
+
+    #[test]
+    pub fn test_phrase_query_ordered_default_is_false() {
+        // Default (ordered = false): with a slop of 2, "blue ocean" matches
+        // both in-order and reversed occurrences within the slop budget.
+        let index = create_index(&["blue ocean", "ocean blue", "red ocean blue"]).unwrap();
+        let mut docs = run_ordered_query(&index, vec!["blue", "ocean"], 2, false);
+        docs.sort();
+        assert_eq!(docs, vec![0, 1, 2]);
+    }
+
+    #[test]
+    pub fn test_phrase_query_ordered_two_terms_rejects_reverse() {
+        // ordered = true: only documents where "blue" appears before "ocean"
+        // (within slop) are matched. "ocean blue" must NOT match.
+        let index = create_index(&["blue ocean", "ocean blue", "blue red ocean"]).unwrap();
+        let mut docs = run_ordered_query(&index, vec!["blue", "ocean"], 2, true);
+        docs.sort();
+        assert_eq!(docs, vec![0, 2]);
+    }
+
+    #[test]
+    pub fn test_phrase_query_ordered_three_terms_rejects_reverse() {
+        // 3-term ordered phrase with slop. Goes through the
+        // intersection_count_with_carrying_slop_ordered path.
+        let index = create_index(&[
+            "a b c",       // in order, exact
+            "a x b x c",   // in order, slop = 2
+            "c b a",       // reversed
+            "a c b",       // partial reorder
+            "b a c",       // partial reorder
+        ])
+        .unwrap();
+        let mut docs = run_ordered_query(&index, vec!["a", "b", "c"], 2, true);
+        docs.sort();
+        assert_eq!(docs, vec![0, 1]);
+    }
+
+    #[test]
+    pub fn test_phrase_query_ordered_unordered_includes_reverse() {
+        // Same corpus / slop as the previous test but with ordered = false:
+        // reversed and partially reordered docs that fit the slop budget
+        // should now match.
+        let index = create_index(&["a b c", "a x b x c", "c b a", "a c b", "b a c"]).unwrap();
+        let docs = run_ordered_query(&index, vec!["a", "b", "c"], 2, false);
+        assert!(docs.len() > 2, "expected reverse hits, got {docs:?}");
+    }
+
+    #[test]
+    pub fn test_phrase_query_ordered_respects_slop() {
+        // ordered = true must still respect the slop budget: a gap larger
+        // than `slop` is rejected even though the terms are in order.
+        let index = create_index(&["blue red green ocean", "blue ocean"]).unwrap();
+        // "blue ... ocean" with 2 intervening terms needs slop >= 2.
+        let docs = run_ordered_query(&index, vec!["blue", "ocean"], 1, true);
+        assert_eq!(docs, vec![1]);
+        let mut docs2 = run_ordered_query(&index, vec!["blue", "ocean"], 2, true);
+        docs2.sort();
+        assert_eq!(docs2, vec![0, 1]);
+    }
+
+    #[test]
+    pub fn test_phrase_query_ordered_no_slop_is_noop() {
+        // With slop = 0, the default exact phrase already enforces document
+        // order, so set_ordered(true) is a no-op (same matches as ordered=false).
+        let index = create_index(&["blue ocean", "ocean blue"]).unwrap();
+        let unordered = run_ordered_query(&index, vec!["blue", "ocean"], 0, false);
+        let ordered = run_ordered_query(&index, vec!["blue", "ocean"], 0, true);
+        assert_eq!(unordered, vec![0]);
+        assert_eq!(ordered, vec![0]);
+    }
 }

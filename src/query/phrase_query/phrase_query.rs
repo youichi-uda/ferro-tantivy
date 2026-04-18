@@ -24,6 +24,7 @@ pub struct PhraseQuery {
     field: Field,
     phrase_terms: Vec<(usize, Term)>,
     slop: u32,
+    ordered: bool,
 }
 
 impl PhraseQuery {
@@ -60,7 +61,31 @@ impl PhraseQuery {
             field,
             phrase_terms: terms,
             slop,
+            ordered: false,
         }
+    }
+
+    /// Enables ordered matching.
+    ///
+    /// By default, `PhraseQuery` with a non-zero `slop` allows the terms to
+    /// appear in any order within the slop budget (transposition costs 2
+    /// against the slop budget — see [`Self::set_slop`]).
+    ///
+    /// When `ordered` is set to `true`, the query additionally requires the
+    /// terms to appear in the order given to [`Self::new`] /
+    /// [`Self::new_with_offset`]. Reversed occurrences are rejected even if
+    /// their distance is within `slop`. This corresponds to span-near /
+    /// interval-style "in-order" semantics.
+    ///
+    /// `ordered` has no effect when `slop == 0`, since the default exact
+    /// phrase matching already enforces document order.
+    pub fn set_ordered(&mut self, ordered: bool) {
+        self.ordered = ordered;
+    }
+
+    /// Whether ordered matching is enabled. See [`Self::set_ordered`].
+    pub fn is_ordered(&self) -> bool {
+        self.ordered
     }
 
     /// Slop allowed for the phrase.
@@ -127,6 +152,9 @@ impl PhraseQuery {
         let mut weight = PhraseWeight::new(self.phrase_terms.clone(), bm25_weight_opt);
         if self.slop > 0 {
             weight.slop(self.slop);
+        }
+        if self.ordered {
+            weight.set_ordered(true);
         }
         Ok(weight)
     }

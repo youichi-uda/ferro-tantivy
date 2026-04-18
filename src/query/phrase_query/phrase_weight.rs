@@ -12,6 +12,7 @@ pub struct PhraseWeight {
     phrase_terms: Vec<(usize, Term)>,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
+    ordered: bool,
 }
 
 impl PhraseWeight {
@@ -26,7 +27,13 @@ impl PhraseWeight {
             phrase_terms,
             similarity_weight_opt,
             slop,
+            ordered: false,
         }
+    }
+
+    /// Enable ordered matching.
+    pub fn set_ordered(&mut self, ordered: bool) {
+        self.ordered = ordered;
     }
 
     fn fieldnorm_reader(&self, reader: &SegmentReader) -> crate::Result<FieldNormReader> {
@@ -60,11 +67,12 @@ impl PhraseWeight {
                 return Ok(None);
             }
         }
-        Ok(Some(PhraseScorer::new(
+        Ok(Some(PhraseScorer::new_with_ordered(
             term_postings_list,
             similarity_weight_opt,
             fieldnorm_reader,
             self.slop,
+            self.ordered,
         )))
     }
 

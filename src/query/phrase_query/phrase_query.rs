@@ -24,6 +24,7 @@ pub struct PhraseQuery {
     field: Field,
     phrase_terms: Vec<(usize, Term)>,
     slop: u32,
+    ordered: bool,
 }
 
 impl PhraseQuery {
@@ -60,7 +61,28 @@ impl PhraseQuery {
             field,
             phrase_terms: terms,
             slop,
+            ordered: false,
         }
+    }
+
+    /// Enable ordered matching.
+    ///
+    /// When `ordered` is true, `PhraseQuery` requires the terms to appear in
+    /// the specified order within the bounded slop window. Terms that appear
+    /// in reverse order do NOT match, even if their distance is within
+    /// `slop`.
+    ///
+    /// This is used by Elasticsearch `intervals` queries (`ordered: true`,
+    /// `before`/`after` filters) where order is semantically significant.
+    /// Regular ES `match_phrase` queries remain unordered (using slop-based
+    /// transposition).
+    pub fn set_ordered(&mut self, ordered: bool) {
+        self.ordered = ordered;
+    }
+
+    /// Whether ordered matching is enabled.
+    pub fn is_ordered(&self) -> bool {
+        self.ordered
     }
 
     /// Slop allowed for the phrase.
@@ -127,6 +149,9 @@ impl PhraseQuery {
         let mut weight = PhraseWeight::new(self.phrase_terms.clone(), bm25_weight_opt);
         if self.slop > 0 {
             weight.slop(self.slop);
+        }
+        if self.ordered {
+            weight.set_ordered(true);
         }
         Ok(weight)
     }

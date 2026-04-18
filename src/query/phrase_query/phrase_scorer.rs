@@ -29,6 +29,20 @@ impl<TPostings: Postings> PostingsWithOffset<TPostings> {
     pub fn term_freq(&self) -> u32 {
         self.postings.term_freq()
     }
+
+    /// Returns the position-shift offset used to normalise this term's
+    /// positions into the common phrase space.
+    ///
+    /// For a phrase `[(offset_0, t_0), (offset_1, t_1), ...]` with
+    /// `max_offset = max(offset_i)`, this value is `max_offset - offset_i`.
+    /// The term with the lowest phrase offset therefore has the HIGHEST
+    /// `position_shift()`, and the term with the highest phrase offset has a
+    /// shift of zero. This lets ordered matching recover the original term
+    /// order even after `Intersection::new` reorders docsets by cost.
+    #[inline]
+    pub fn position_shift(&self) -> u32 {
+        self.offset
+    }
 }
 
 impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
@@ -60,6 +74,7 @@ pub struct PhraseScorer<TPostings: Postings> {
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
     slop: u32,
+    ordered: bool,
     left_slops: Vec<u8>,
     positions_buffer: Vec<u32>,
     slops_buffer: Vec<u8>,
@@ -250,6 +265,202 @@ fn intersection_count_with_slop(
     count
 }
 
+/// Ordered slop variant: requires `right_pos >= left_pos` (so the later term
+/// appears at or after the earlier term in shifted coordinates).
+///
+/// In shifted coordinates (positions shifted by `max_offset - term_offset`),
+/// an in-order exact phrase has `left_pos == right_pos`, an in-order phrase
+/// with gaps has `left_pos < right_pos`, and a reversed phrase has
+/// `left_pos > right_pos`. This function matches only the first two cases.
+#[inline]
+fn intersection_count_with_slop_ordered(
+    left_positions: &mut Vec<u32>,
+    right_positions: &[u32],
+    slop: u32,
+    update_left: bool,
+) -> usize {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut count = 0;
+    let left_len = left_positions.len();
+    let right_len = right_positions.len();
+    while left_index < left_len && right_index < right_len {
+        let left_val = left_positions[left_index];
+        let right_val = right_positions[right_index];
+
+        // Ordered: require right_val >= left_val (in shifted coordinates).
+        if right_val >= left_val && right_val - left_val <= slop {
+            // Find the tightest left for this right.
+            while left_index + 1 < left_len {
+                let next_left_val = left_positions[left_index + 1];
+                if next_left_val > right_val {
+                    break;
+                }
+                left_index += 1;
+            }
+            if update_left {
+                left_positions[count] = right_val;
+            }
+            count += 1;
+            left_index += 1;
+            right_index += 1;
+        } else if left_val < right_val {
+            // right is ahead but too far — advance left to try to catch up.
+            left_index += 1;
+        } else {
+            // right_val < left_val: unordered case, advance right to find one
+            // that's at or after left.
+            right_index += 1;
+        }
+    }
+    if update_left {
+        left_positions.truncate(count);
+    }
+    count
+}
+
+#[inline]
+fn intersection_exists_with_slop_ordered(
+    left_positions: &[u32],
+    right_positions: &[u32],
+    slop: u32,
+) -> bool {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let left_len = left_positions.len();
+    let right_len = right_positions.len();
+    while left_index < left_len && right_index < right_len {
+        let left_val = left_positions[left_index];
+        let right_val = right_positions[right_index];
+        if right_val >= left_val && right_val - left_val <= slop {
+            return true;
+        } else if left_val < right_val {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+    }
+    false
+}
+
+/// Ordered variant of `intersection_count_with_carrying_slop`.
+///
+/// Requires `right_val >= left_val` (in shifted coordinates) in addition to
+/// the total-slop budget check. Used for 3+ term ordered phrase queries.
+#[inline]
+fn intersection_count_with_carrying_slop_ordered(
+    left_positions: &mut Vec<u32>,
+    left_slops: &mut Vec<u8>,
+    right_positions: &[u32],
+    max_slop: u32,
+    update_left: bool,
+    positions_buffer: &mut Vec<u32>,
+    slops_buffer: &mut Vec<u8>,
+) -> u32 {
+    let mut left_index = 0;
+    let mut right_index = 0;
+    let mut count = 0;
+
+    if left_positions.is_empty() || right_positions.is_empty() {
+        if update_left {
+            left_positions.clear();
+            left_slops.clear();
+        }
+        return 0;
+    }
+
+    let add_val = |val: (u8, u32), new_left: &mut Vec<u32>, new_slops: &mut Vec<u8>| {
+        if update_left {
+            let pos_exists = new_left.last().map(|v| *v == val.1).unwrap_or(false);
+            if pos_exists {
+                let last_slop = new_slops.last_mut().unwrap();
+                *last_slop = (*last_slop).min(val.0);
+            } else {
+                new_left.push(val.1);
+                new_slops.push(val.0);
+            }
+        }
+    };
+    loop {
+        let left_val = left_positions[left_index];
+        let slop_so_far = left_slops.get(left_index).cloned().unwrap_or(0);
+        let right_val = right_positions[right_index];
+
+        // Ordered: require right_val >= left_val (in shifted coords).
+        let ordered_ok = right_val >= left_val;
+        let gap = if ordered_ok { right_val - left_val } else { u32::MAX };
+        let distance = slop_so_far as u32 + gap;
+        if ordered_ok && distance <= max_slop {
+            // For ordered, smaller/larger assignment: always left <= right.
+            let (smaller_val, larger_val, mut smaller_val_idx, smaller_val_positions) =
+                (left_val, right_val, left_index, left_positions.as_slice());
+
+            let mut new_slop = distance;
+            add_val(
+                (new_slop as u8, smaller_val),
+                positions_buffer,
+                slops_buffer,
+            );
+            while smaller_val_idx + 1 < smaller_val_positions.len() {
+                let next_val = smaller_val_positions[smaller_val_idx + 1];
+                if next_val > larger_val {
+                    break;
+                }
+                let distance = larger_val - next_val;
+
+                smaller_val_idx += 1;
+                new_slop = slop_so_far as u32 + distance;
+                add_val((new_slop as u8, next_val), positions_buffer, slops_buffer);
+            }
+
+            add_val((new_slop as u8, larger_val), positions_buffer, slops_buffer);
+            count += 1;
+            left_index += 1;
+            right_index += 1;
+        } else if left_val < right_val {
+            left_index += 1;
+        } else {
+            right_index += 1;
+        }
+
+        if left_index >= left_positions.len() || right_index >= right_positions.len() {
+            if left_index >= left_positions.len() {
+                let left_val = *left_positions.last().unwrap();
+                let slop_so_far: u8 = *left_slops.last().unwrap_or(&0);
+                for right_val in &right_positions[right_index..] {
+                    if *right_val >= left_val {
+                        let new_slop = (*right_val - left_val) + slop_so_far as u32;
+                        if new_slop <= max_slop {
+                            add_val((new_slop as u8, *right_val), positions_buffer, slops_buffer);
+                        }
+                    }
+                }
+            } else {
+                let right_val = *right_positions.last().unwrap();
+                for left_idx in left_index..left_positions.len() {
+                    let left_val = left_positions[left_idx];
+                    let slop_so_far = *left_slops.get(left_idx).unwrap_or(&0);
+                    if right_val >= left_val {
+                        let new_slop = (right_val - left_val) + slop_so_far as u32;
+                        if new_slop <= max_slop {
+                            add_val((new_slop as u8, left_val), positions_buffer, slops_buffer);
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if update_left {
+        std::mem::swap(left_positions, positions_buffer);
+        std::mem::swap(left_slops, slops_buffer);
+        positions_buffer.clear();
+        slops_buffer.clear();
+    }
+    count
+}
+
 #[inline]
 fn intersection_exists_with_slop(
     left_positions: &[u32],
@@ -422,12 +633,47 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         )
     }
 
+    pub fn new_with_ordered(
+        term_postings: Vec<(usize, TPostings)>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+        slop: u32,
+        ordered: bool,
+    ) -> PhraseScorer<TPostings> {
+        Self::new_with_offset_and_ordered(
+            term_postings,
+            similarity_weight_opt,
+            fieldnorm_reader,
+            slop,
+            0,
+            ordered,
+        )
+    }
+
     pub(crate) fn new_with_offset(
         term_postings_with_offset: Vec<(usize, TPostings)>,
         similarity_weight_opt: Option<Bm25Weight>,
         fieldnorm_reader: FieldNormReader,
         slop: u32,
         offset: usize,
+    ) -> PhraseScorer<TPostings> {
+        Self::new_with_offset_and_ordered(
+            term_postings_with_offset,
+            similarity_weight_opt,
+            fieldnorm_reader,
+            slop,
+            offset,
+            false,
+        )
+    }
+
+    pub(crate) fn new_with_offset_and_ordered(
+        term_postings_with_offset: Vec<(usize, TPostings)>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+        slop: u32,
+        offset: usize,
+        ordered: bool,
     ) -> PhraseScorer<TPostings> {
         let num_docs = fieldnorm_reader.num_docs();
         let max_offset = term_postings_with_offset
@@ -459,6 +705,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             similarity_weight_opt,
             fieldnorm_reader,
             slop,
+            ordered,
             left_slops: Vec::with_capacity(100),
             slops_buffer: Vec::with_capacity(100),
             positions_buffer: Vec::with_capacity(100),
@@ -533,7 +780,7 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             // Fast path: 2-term phrases without slop (the most common case).
             // Fuse position decoding + counting into a single operation to avoid
             // the overhead of separate compute_phrase_match() + intersection_count().
-            let count = if self.num_terms == 2 && !self.has_slop() {
+            let count = if self.num_terms == 2 && !self.has_slop() && !self.ordered {
                 self.compute_phrase_count_two_terms()
             } else {
                 self.compute_phrase_count()
@@ -548,17 +795,27 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     fn phrase_exists(&mut self) -> bool {
         // Fast path: 2-term phrases without slop.
         // Decode positions and check existence in one step.
-        if self.num_terms == 2 && !self.has_slop() {
+        if self.num_terms == 2 && !self.has_slop() && !self.ordered {
             return self.phrase_exists_two_terms();
         }
         self.compute_phrase_match();
         if self.has_slop() {
-            intersection_exists_with_slop(
-                &self.left_positions,
-                &self.right_positions[..],
-                self.slop,
-            )
+            if self.ordered {
+                intersection_exists_with_slop_ordered(
+                    &self.left_positions,
+                    &self.right_positions[..],
+                    self.slop,
+                )
+            } else {
+                intersection_exists_with_slop(
+                    &self.left_positions,
+                    &self.right_positions[..],
+                    self.slop,
+                )
+            }
         } else {
+            // Without slop, intersection (positions equal in shifted space)
+            // already enforces exact in-order phrase, so ordered has no effect.
             intersection_exists(&self.left_positions, &self.right_positions[..])
         }
     }
@@ -631,15 +888,34 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
         self.compute_phrase_match();
         if self.has_slop() {
             if self.num_terms > 2 {
-                intersection_count_with_carrying_slop(
+                if self.ordered {
+                    intersection_count_with_carrying_slop_ordered(
+                        &mut self.left_positions,
+                        &mut self.left_slops,
+                        &self.right_positions[..],
+                        self.slop,
+                        false,
+                        &mut self.positions_buffer,
+                        &mut self.slops_buffer,
+                    )
+                } else {
+                    intersection_count_with_carrying_slop(
+                        &mut self.left_positions,
+                        &mut self.left_slops,
+                        &self.right_positions[..],
+                        self.slop,
+                        false,
+                        &mut self.positions_buffer,
+                        &mut self.slops_buffer,
+                    )
+                }
+            } else if self.ordered {
+                intersection_count_with_slop_ordered(
                     &mut self.left_positions,
-                    &mut self.left_slops,
                     &self.right_positions[..],
                     self.slop,
                     false,
-                    &mut self.positions_buffer,
-                    &mut self.slops_buffer,
-                )
+                ) as u32
             } else {
                 intersection_count_with_slop(
                     &mut self.left_positions,
@@ -654,6 +930,34 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     fn compute_phrase_match(&mut self) {
+        // For ordered + slop matching we need left_positions to hold the
+        // positions of the *earliest* phrase term and right_positions to hold
+        // the positions of the *latest* phrase term. Intersection::new sorts
+        // docsets by cost, so specialized index 0/1 does NOT correspond to
+        // term 0/last in general. Use the PostingsWithOffset::position_shift()
+        // to recover term order: the earliest phrase term has the HIGHEST
+        // shift; the latest has shift 0.
+        if self.ordered && self.num_terms == 2 {
+            let shift0 = self
+                .intersection_docset
+                .docset_mut_specialized(0)
+                .position_shift();
+            let shift1 = self
+                .intersection_docset
+                .docset_mut_specialized(1)
+                .position_shift();
+            let (earliest_ord, latest_ord) = if shift0 > shift1 { (0, 1) } else { (1, 0) };
+            self.intersection_docset
+                .docset_mut_specialized(earliest_ord)
+                .positions(&mut self.left_positions);
+            self.intersection_docset
+                .docset_mut_specialized(latest_ord)
+                .positions(&mut self.right_positions);
+            if self.has_slop() {
+                self.left_slops.clear();
+            }
+            return;
+        }
         {
             self.intersection_docset
                 .docset_mut_specialized(0)
@@ -670,14 +974,33 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             }
             if self.has_slop() {
                 if self.num_terms > 2 {
-                    intersection_count_with_carrying_slop(
+                    if self.ordered {
+                        intersection_count_with_carrying_slop_ordered(
+                            &mut self.left_positions,
+                            &mut self.left_slops,
+                            &self.right_positions[..],
+                            self.slop,
+                            true,
+                            &mut self.positions_buffer,
+                            &mut self.slops_buffer,
+                        );
+                    } else {
+                        intersection_count_with_carrying_slop(
+                            &mut self.left_positions,
+                            &mut self.left_slops,
+                            &self.right_positions[..],
+                            self.slop,
+                            true,
+                            &mut self.positions_buffer,
+                            &mut self.slops_buffer,
+                        );
+                    }
+                } else if self.ordered {
+                    intersection_count_with_slop_ordered(
                         &mut self.left_positions,
-                        &mut self.left_slops,
                         &self.right_positions[..],
                         self.slop,
                         true,
-                        &mut self.positions_buffer,
-                        &mut self.slops_buffer,
                     );
                 } else {
                     intersection_count_with_slop(

@@ -25,7 +25,15 @@ pub enum DateTimePrecision {
     Nanoseconds,
 }
 
-/// A date/time value with nanoseconds precision.
+/// A date/time value stored with microseconds precision.
+///
+/// Internally we use an `i64` microseconds-since-epoch counter. This gives
+/// us a usable range of ±292,471 years (vs ±292 years for a nanoseconds
+/// counter), which is required to represent the full proleptic Gregorian
+/// calendar that Elasticsearch exposes through the `uuuu` / `yyyy` date
+/// formats. Conversions to nanosecond precision clamp to `i64::MIN`/`MAX`
+/// for values outside the ~1677-2262 nanos epoch window so that relative
+/// ordering is preserved.
 ///
 /// This timestamp does not carry any explicit time zone information.
 /// Users are responsible for applying the provided conversion
@@ -37,46 +45,69 @@ pub enum DateTimePrecision {
 /// to prevent unintended usage.
 #[derive(Clone, Default, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DateTime {
-    // Timestamp in nanoseconds.
-    pub(crate) timestamp_nanos: i64,
+    // Timestamp in microseconds. Micros gives us a ±292,471 year range, which
+    // is enough to represent any date expressible in the proleptic Gregorian
+    // calendar used by Elasticsearch's `uuuu` format. Conversions to nanos
+    // clamp to `i64::MIN`/`MAX` outside the nanos-representable window.
+    pub(crate) timestamp_micros: i64,
 }
 
 impl DateTime {
     /// Minimum possible `DateTime` value.
     pub const MIN: DateTime = DateTime {
-        timestamp_nanos: i64::MIN,
+        timestamp_micros: i64::MIN,
     };
 
     /// Maximum possible `DateTime` value.
     pub const MAX: DateTime = DateTime {
-        timestamp_nanos: i64::MAX,
+        timestamp_micros: i64::MAX,
     };
+
+    /// Clamp-then-multiply: ensures the result stays within `i64` range
+    /// without losing relative ordering for values that would overflow.
+    /// This preserves sort order for dates outside the representable
+    /// epoch window by mapping them to the min/max representable value.
+    const fn clamp_mul(value: i64, factor: i64) -> i64 {
+        // Pre-compute the safe input range to avoid overflow
+        let min_safe = i64::MIN / factor;
+        let max_safe = i64::MAX / factor;
+        if value < min_safe {
+            i64::MIN
+        } else if value > max_safe {
+            i64::MAX
+        } else {
+            value * factor
+        }
+    }
 
     /// Create new from UNIX timestamp in seconds
     pub const fn from_timestamp_secs(seconds: i64) -> Self {
         Self {
-            timestamp_nanos: seconds * 1_000_000_000,
+            timestamp_micros: Self::clamp_mul(seconds, 1_000_000),
         }
     }
 
     /// Create new from UNIX timestamp in milliseconds
     pub const fn from_timestamp_millis(milliseconds: i64) -> Self {
         Self {
-            timestamp_nanos: milliseconds * 1_000_000,
+            timestamp_micros: Self::clamp_mul(milliseconds, 1_000),
         }
     }
 
     /// Create new from UNIX timestamp in microseconds.
     pub const fn from_timestamp_micros(microseconds: i64) -> Self {
         Self {
-            timestamp_nanos: microseconds * 1_000,
+            timestamp_micros: microseconds,
         }
     }
 
     /// Create new from UNIX timestamp in nanoseconds.
+    ///
+    /// Nanosecond precision below 1µs is truncated (floor division). Callers
+    /// that need sub-microsecond precision should keep their own `i128` value.
     pub const fn from_timestamp_nanos(nanoseconds: i64) -> Self {
         Self {
-            timestamp_nanos: nanoseconds,
+            timestamp_micros: nanoseconds / 1_000,
         }
     }
 
@@ -85,8 +116,11 @@ impl DateTime {
     /// The given date/time is converted to UTC and the actual
     /// time zone is discarded.
     pub fn from_utc(dt: OffsetDateTime) -> Self {
-        let timestamp_nanos = dt.unix_timestamp_nanos() as i64;
-        Self { timestamp_nanos }
+        // `OffsetDateTime::unix_timestamp_nanos` returns an `i128` to avoid
+        // overflow outside the nanos-representable window. We store micros,
+        // so divide by 1000 after casting.
+        let timestamp_micros = (dt.unix_timestamp_nanos() / 1_000) as i64;
+        Self { timestamp_micros }
     }
 
     /// Create new from `PrimitiveDateTime`
@@ -100,27 +134,36 @@ impl DateTime {
 
     /// Convert to UNIX timestamp in seconds.
     pub const fn into_timestamp_secs(self) -> i64 {
-        self.timestamp_nanos / 1_000_000_000
+        // Use Euclidean division so that sub-second values for negative
+        // timestamps round towards `-inf` (same direction as truncating
+        // micros to seconds in ES / Java semantics).
+        self.timestamp_micros.div_euclid(1_000_000)
     }
 
     /// Convert to UNIX timestamp in milliseconds.
     pub const fn into_timestamp_millis(self) -> i64 {
-        self.timestamp_nanos / 1_000_000
+        self.timestamp_micros.div_euclid(1_000)
     }
 
     /// Convert to UNIX timestamp in microseconds.
     pub const fn into_timestamp_micros(self) -> i64 {
-        self.timestamp_nanos / 1_000
+        self.timestamp_micros
     }
 
     /// Convert to UNIX timestamp in nanoseconds.
+    ///
+    /// Clamps to `i64::MIN`/`MAX` when the underlying micros value is
+    /// outside the ~1677-2262 nanos-representable window.
     pub const fn into_timestamp_nanos(self) -> i64 {
-        self.timestamp_nanos
+        Self::clamp_mul(self.timestamp_micros, 1_000)
     }
 
     /// Convert to UTC `OffsetDateTime`
     pub fn into_utc(self) -> OffsetDateTime {
-        let utc_datetime = OffsetDateTime::from_unix_timestamp_nanos(self.timestamp_nanos as i128)
+        // Work in i128 nanos to stay within the `time` crate's supported
+        // range even for pre-1677 / post-2262 dates.
+        let timestamp_nanos_i128 = (self.timestamp_micros as i128) * 1_000;
+        let utc_datetime = OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos_i128)
             .expect("valid UNIX timestamp");
         debug_assert_eq!(UtcOffset::UTC, utc_datetime.offset());
         utc_datetime
@@ -142,16 +185,22 @@ impl DateTime {
         PrimitiveDateTime::new(utc_datetime.date(), utc_datetime.time())
     }
 
-    /// Truncates the microseconds value to the corresponding precision.
+    /// Truncates the timestamp to the corresponding precision.
     pub fn truncate(self, precision: DateTimePrecision) -> Self {
         let truncated_timestamp_micros = match precision {
-            DateTimePrecision::Seconds => (self.timestamp_nanos / 1_000_000_000) * 1_000_000_000,
-            DateTimePrecision::Milliseconds => (self.timestamp_nanos / 1_000_000) * 1_000_000,
-            DateTimePrecision::Microseconds => (self.timestamp_nanos / 1_000) * 1_000,
-            DateTimePrecision::Nanoseconds => self.timestamp_nanos,
+            // Truncate using `div_euclid` so that timestamps in the pre-epoch
+            // half of the number line round towards `-inf` rather than `0`,
+            // which matches ES / Java `Math.floorDiv` semantics.
+            DateTimePrecision::Seconds => self.timestamp_micros.div_euclid(1_000_000) * 1_000_000,
+            DateTimePrecision::Milliseconds => self.timestamp_micros.div_euclid(1_000) * 1_000,
+            DateTimePrecision::Microseconds => self.timestamp_micros,
+            // Sub-microsecond precision is not representable in our i64 micros
+            // counter; treat as a no-op (the value was already floor-truncated
+            // at construction time).
+            DateTimePrecision::Nanoseconds => self.timestamp_micros,
         };
         Self {
-            timestamp_nanos: truncated_timestamp_micros,
+            timestamp_micros: truncated_timestamp_micros,
         }
     }
 }

@@ -114,8 +114,12 @@ where
                 }
                 ReferenceValueLeaf::Date(val) => {
                     self.write_type_code(type_codes::DATE_CODE)?;
-                    let timestamp_nanos: i64 = val.into_timestamp_nanos();
-                    BinarySerializable::serialize(&timestamp_nanos, self.writer)
+                    // Serialize micros to preserve the full DateTime range.
+                    // Using nanos here would clamp pre-1677 / post-2262
+                    // dates to `i64::MIN` / `MAX` and destroy ordering for
+                    // stored docvalue retrieval.
+                    let timestamp_micros: i64 = val.into_timestamp_micros();
+                    BinarySerializable::serialize(&timestamp_micros, self.writer)
                 }
                 ReferenceValueLeaf::Facet(val) => self.serialize_with_type_code(
                     type_codes::HIERARCHICAL_FACET_CODE,

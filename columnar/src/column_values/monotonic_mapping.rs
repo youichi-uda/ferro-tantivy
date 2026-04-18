@@ -56,7 +56,8 @@ impl<T> From<T> for StrictlyMonotonicMappingInverter<T> {
 }
 
 impl<From, To, T> StrictlyMonotonicFn<To, From> for StrictlyMonotonicMappingInverter<T>
-where T: StrictlyMonotonicFn<From, To>
+where
+    T: StrictlyMonotonicFn<From, To>,
 {
     #[inline(always)]
     fn mapping(&self, val: To) -> From {
@@ -84,7 +85,8 @@ impl<T> StrictlyMonotonicMappingToInternal<T> {
 
 impl<External: MonotonicallyMappableToU128, T: MonotonicallyMappableToU128>
     StrictlyMonotonicFn<External, u128> for StrictlyMonotonicMappingToInternal<T>
-where T: MonotonicallyMappableToU128
+where
+    T: MonotonicallyMappableToU128,
 {
     #[inline(always)]
     fn mapping(&self, inp: External) -> u128 {
@@ -99,7 +101,8 @@ where T: MonotonicallyMappableToU128
 
 impl<External: MonotonicallyMappableToU64, T: MonotonicallyMappableToU64>
     StrictlyMonotonicFn<External, u64> for StrictlyMonotonicMappingToInternal<T>
-where T: MonotonicallyMappableToU64
+where
+    T: MonotonicallyMappableToU64,
 {
     #[inline(always)]
     fn mapping(&self, inp: External) -> u64 {
@@ -139,12 +142,17 @@ impl MonotonicallyMappableToU64 for i64 {
 impl MonotonicallyMappableToU64 for DateTime {
     #[inline(always)]
     fn to_u64(self) -> u64 {
-        common::i64_to_u64(self.into_timestamp_nanos())
+        // Store the micros counter directly so that the fast-field encoding
+        // preserves full ordering across the ±292,471 year DateTime range.
+        // Encoding via `into_timestamp_nanos` would clamp pre-1677 /
+        // post-2262 dates to `i64::MIN`/`MAX` and destroy their relative
+        // ordering against in-range values.
+        common::i64_to_u64(self.into_timestamp_micros())
     }
 
     #[inline(always)]
     fn from_u64(val: u64) -> Self {
-        DateTime::from_timestamp_nanos(common::u64_to_i64(val))
+        DateTime::from_timestamp_micros(common::u64_to_i64(val))
     }
 }
 

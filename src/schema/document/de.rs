@@ -38,15 +38,24 @@ fn skip_binary_value_after_type_code<R: Read>(
         type_codes::NULL_CODE => { /* 0 bytes */ }
         type_codes::BOOL_CODE => {
             let mut buf = [0u8; 1];
-            reader.read_exact(&mut buf).map_err(DeserializeError::from)?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(DeserializeError::from)?;
         }
-        type_codes::U64_CODE | type_codes::I64_CODE | type_codes::F64_CODE | type_codes::DATE_CODE => {
+        type_codes::U64_CODE
+        | type_codes::I64_CODE
+        | type_codes::F64_CODE
+        | type_codes::DATE_CODE => {
             let mut buf = [0u8; 8];
-            reader.read_exact(&mut buf).map_err(DeserializeError::from)?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(DeserializeError::from)?;
         }
         type_codes::IP_CODE => {
             let mut buf = [0u8; 16];
-            reader.read_exact(&mut buf).map_err(DeserializeError::from)?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(DeserializeError::from)?;
         }
         type_codes::TEXT_CODE | type_codes::BYTES_CODE | type_codes::HIERARCHICAL_FACET_CODE => {
             // VInt(len) + len bytes
@@ -112,7 +121,9 @@ fn skip_bytes<R: Read>(reader: &mut R, n: usize) -> Result<(), DeserializeError>
     // For small skips, read into stack buffer. For large, use io::copy.
     if n <= 256 {
         let mut buf = [0u8; 256];
-        reader.read_exact(&mut buf[..n]).map_err(DeserializeError::from)?;
+        reader
+            .read_exact(&mut buf[..n])
+            .map_err(DeserializeError::from)?;
     } else {
         let copied = io::copy(&mut reader.take(n as u64), &mut io::sink())
             .map_err(DeserializeError::from)?;
@@ -278,7 +289,10 @@ fn skip_value_in_slice(
         type_codes::BOOL_CODE => {
             cursor += 1;
         }
-        type_codes::U64_CODE | type_codes::I64_CODE | type_codes::F64_CODE | type_codes::DATE_CODE => {
+        type_codes::U64_CODE
+        | type_codes::I64_CODE
+        | type_codes::F64_CODE
+        | type_codes::DATE_CODE => {
             cursor += 8;
         }
         type_codes::IP_CODE => {
@@ -819,14 +833,15 @@ where
 
     fn deserialize_datetime(self) -> Result<DateTime, DeserializeError> {
         self.validate_type(ValueType::DateTime)?;
+        // Both V1 and V2 now store microseconds. V2 originally stored
+        // nanoseconds, but that clamped pre-1677 / post-2262 dates to
+        // `i64::MIN` / `MAX` and lost ordering. Micros give us a
+        // ±292,471 year range which covers any proleptic-Gregorian
+        // date expressible through the `uuuu` format.
         match self.doc_store_version {
-            DocStoreVersion::V1 => {
+            DocStoreVersion::V1 | DocStoreVersion::V2 => {
                 let timestamp_micros = <i64 as BinarySerializable>::deserialize(self.reader)?;
                 Ok(DateTime::from_timestamp_micros(timestamp_micros))
-            }
-            DocStoreVersion::V2 => {
-                let timestamp_nanos = <i64 as BinarySerializable>::deserialize(self.reader)?;
-                Ok(DateTime::from_timestamp_nanos(timestamp_nanos))
             }
         }
     }

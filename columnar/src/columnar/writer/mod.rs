@@ -197,7 +197,11 @@ impl ColumnarWriter {
                 let mut column: ColumnWriter = column_opt.unwrap_or_default();
                 column.record(
                     doc,
-                    NumericalValue::I64(datetime.into_timestamp_nanos()),
+                    // Record micros — matches the encoding used by
+                    // `MonotonicallyMappableToU64` for `DateTime`. Using nanos
+                    // would clamp pre-1677 / post-2262 dates and lose
+                    // ordering.
+                    NumericalValue::I64(datetime.into_timestamp_micros()),
                     arena,
                 );
                 column
@@ -645,7 +649,9 @@ fn sort_values_within_row_in_place(
 fn coerce_numerical_symbol<T>(
     operation_iterator: impl Iterator<Item = ColumnOperation<NumericalValue>>,
 ) -> impl Iterator<Item = ColumnOperation<u64>>
-where T: Coerce + MonotonicallyMappableToU64 {
+where
+    T: Coerce + MonotonicallyMappableToU64,
+{
     operation_iterator.map(|symbol| match symbol {
         ColumnOperation::NewDoc(doc) => ColumnOperation::NewDoc(doc),
         ColumnOperation::Value(numerical_value) => {

@@ -252,7 +252,9 @@ impl CompactDoc {
             ReferenceValueLeaf::F64(num) => write_into(&mut self.node_data, num),
             ReferenceValueLeaf::Bool(b) => b as u32,
             ReferenceValueLeaf::Date(date) => {
-                write_into(&mut self.node_data, date.into_timestamp_nanos())
+                // Serialize micros — matches internal DateTime representation
+                // and the on-disk format used by `BinarySerializable<DateTime>`.
+                write_into(&mut self.node_data, date.into_timestamp_micros())
             }
             ReferenceValueLeaf::IpAddr(num) => write_into(&mut self.node_data, num.to_u128()),
             ReferenceValueLeaf::PreTokStr(pre_tok) => write_into(&mut self.node_data, *pre_tok),
@@ -455,7 +457,7 @@ impl<'a> CompactDocValue<'a> {
             ValueType::Date => self
                 .container
                 .read_from::<i64>(addr)
-                .map(|ts| ReferenceValueLeaf::Date(DateTime::from_timestamp_nanos(ts)))
+                .map(|ts| ReferenceValueLeaf::Date(DateTime::from_timestamp_micros(ts)))
                 .map(Into::into),
             ValueType::IpAddr => self
                 .container

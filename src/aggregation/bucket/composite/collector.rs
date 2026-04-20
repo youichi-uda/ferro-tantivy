@@ -570,7 +570,11 @@ impl CompositeKeyVisitor<'_> {
                         let float_value = match accessor.column_type {
                             ColumnType::U64 => value as f64,
                             ColumnType::I64 => i64::from_u64(value) as f64,
-                            ColumnType::DateTime => i64::from_u64(value) as f64 / 1_000_000.,
+                            // DateTime fast field is stored in microseconds.
+                            // Convert to milliseconds to match the unit
+                            // convention used by ES/OS histograms over date
+                            // fields.
+                            ColumnType::DateTime => i64::from_u64(value) as f64 / 1_000.,
                             ColumnType::F64 => f64::from_u64(value),
                             _ => {
                                 panic!(
@@ -600,7 +604,12 @@ impl CompositeKeyVisitor<'_> {
                         self.sub_level_values.pop();
                     }
                     CompositeAggregationSource::DateHistogram(_) => {
-                        let value_ns = match accessor.column_type {
+                        // Tantivy stores `DateTime` fast fields in microseconds,
+                        // so the raw fast-field value is already micros. Using
+                        // it directly (rather than treating it as nanoseconds,
+                        // which is what the old code assumed) is what makes
+                        // `1d`, month, and year buckets split correctly.
+                        let value_us = match accessor.column_type {
                             ColumnType::DateTime => i64::from_u64(value),
                             _ => {
                                 panic!(
@@ -610,17 +619,20 @@ impl CompositeKeyVisitor<'_> {
                             }
                         };
                         let bucket_index = match accessor.date_histogram_interval {
-                            PrecomputedDateInterval::FixedNanoseconds(fixed_interval_ns) => {
-                                (value_ns / fixed_interval_ns) * fixed_interval_ns
+                            PrecomputedDateInterval::FixedMicroseconds(fixed_interval_us) => {
+                                value_us.div_euclid(fixed_interval_us) * fixed_interval_us
                             }
                             PrecomputedDateInterval::Calendar(CalendarInterval::Year) => {
-                                calendar_interval::try_year_bucket(value_ns)?
+                                calendar_interval::try_year_bucket(value_us)?
                             }
                             PrecomputedDateInterval::Calendar(CalendarInterval::Month) => {
-                                calendar_interval::try_month_bucket(value_ns)?
+                                calendar_interval::try_month_bucket(value_us)?
                             }
                             PrecomputedDateInterval::Calendar(CalendarInterval::Week) => {
-                                calendar_interval::week_bucket(value_ns)
+                                calendar_interval::week_bucket(value_us)
+                            }
+                            PrecomputedDateInterval::Calendar(CalendarInterval::Day) => {
+                                calendar_interval::day_bucket(value_us)
                             }
                             PrecomputedDateInterval::NotApplicable => {
                                 panic!("interval not precomputed for date histogram source")

@@ -411,7 +411,10 @@ impl From<CompositeIntermediateKey> for CompositeKey {
             CompositeIntermediateKey::Bool(f) => Self::Bool(f),
             CompositeIntermediateKey::U64(f) => Self::U64(f),
             CompositeIntermediateKey::I64(f) => Self::I64(f),
-            CompositeIntermediateKey::DateTime(f) => Self::I64(f / 1_000_000), // ns to ms
+            // DateTime fast fields are stored as microseconds by Tantivy,
+            // and composite collectors keep them in micros throughout. The
+            // user-facing Key, however, is epoch milliseconds.
+            CompositeIntermediateKey::DateTime(f) => Self::I64(f.div_euclid(1_000)),
             CompositeIntermediateKey::Null => Self::Null,
         }
     }

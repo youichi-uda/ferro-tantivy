@@ -323,8 +323,9 @@ fn precompute_missing_after_key(
 pub enum PrecomputedDateInterval {
     /// This is not a date histogram source
     NotApplicable,
-    /// Source was configured with a fixed interval
-    FixedNanoseconds(i64),
+    /// Source was configured with a fixed interval, expressed in microseconds
+    /// to match Tantivy's `DateTime` fast-field storage unit.
+    FixedMicroseconds(i64),
     /// Source was configured with a calendar interval
     Calendar(CalendarInterval),
 }
@@ -343,8 +344,12 @@ impl PrecomputedDateInterval {
             )),
             (Some(fixed_interval), None) => {
                 let fixed_interval_ms = parse_into_milliseconds(fixed_interval)?;
-                Ok(PrecomputedDateInterval::FixedNanoseconds(
-                    fixed_interval_ms * 1_000_000,
+                // Tantivy's DateTime fast-field stores microseconds, so keep
+                // the interval in the same unit to avoid unit mismatch when
+                // computing bucket indices (this previously stored nanoseconds
+                // which collapsed multi-day dates into a single bucket).
+                Ok(PrecomputedDateInterval::FixedMicroseconds(
+                    fixed_interval_ms * 1_000,
                 ))
             }
             (None, Some(calendar_interval)) => {

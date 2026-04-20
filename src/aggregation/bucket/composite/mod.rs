@@ -99,6 +99,8 @@ pub enum CalendarInterval {
     Month,
     /// A week between Monday and Sunday.
     Week,
+    /// A single calendar day (midnight UTC to next midnight UTC).
+    Day,
 }
 
 /// Date histogram source for a composite aggregation.

@@ -14,12 +14,14 @@ use crate::{DocId, Score, TERMINATED};
 /// Unlike BufferedUnionScorer, this scorer does not buffer documents.
 /// Instead it iterates via find_min_and_score which advances the minimum
 /// scorer and computes the combined score in a single pass.
+#[allow(dead_code)]
 pub struct BlockWandScorer {
     scorers: Vec<Box<dyn Scorer>>,
     current_doc: DocId,
     current_score: Score,
 }
 
+#[allow(dead_code)]
 impl BlockWandScorer {
     pub fn new(mut scorers: Vec<Box<dyn Scorer>>) -> BlockWandScorer {
         // Remove terminated scorers.

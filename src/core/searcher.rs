@@ -7,7 +7,7 @@ use crate::core::Executor;
 use crate::index::{SegmentId, SegmentReader};
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
 use crate::schema::document::DocumentDeserialize;
-use crate::schema::{Field, Schema, Term};
+use crate::schema::{Schema, Term};
 use common::OwnedBytes;
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};

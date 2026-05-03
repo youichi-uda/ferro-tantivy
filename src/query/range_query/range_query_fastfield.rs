@@ -64,13 +64,12 @@ impl Weight for FastFieldRangeWeight {
             .expect("At least one bound must be set");
         let schema = reader.schema();
         let field_type = schema.get_field_entry(term.field()).field_type();
-        assert_eq!(
-            term.typ(),
-            field_type.value_type(),
-            "Field is of type {:?}, but got term of type {:?}",
-            field_type,
-            term.typ()
-        );
+        if term.typ() != field_type.value_type() {
+            // Type mismatch: the caller built a range term with the wrong type
+            // (e.g., F64 term on an I64 field). Return empty results — no
+            // documents can match when the types are incompatible.
+            return Ok(Box::new(crate::query::EmptyScorer));
+        }
         let field_name = term.get_full_path(reader.schema());
 
         let get_value_bytes = |term: &Term| term.value().value_bytes_payload();
@@ -1170,6 +1169,33 @@ mod tests {
     fn range_regression3_test() {
         let ops = vec![doc_from_id_1(1), doc_from_id_1(2), doc_from_id_1(3)];
         assert!(test_id_range_for_docs(ops).is_ok());
+    }
+
+    /// Regression test: a `RangeQuery` whose term type does not match the
+    /// target field's value type must not panic; it must return an empty
+    /// scorer (no document can match when the types are incompatible).
+    #[test]
+    fn test_range_query_term_type_mismatch_returns_empty_scorer() {
+        let mut schema_builder = SchemaBuilder::new();
+        let i64_field = schema_builder.add_i64_field("i64_field", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+        writer.add_document(doc!(i64_field => 42i64)).unwrap();
+        writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+
+        // Build the range with F64 terms even though the field is I64.
+        // The previous behavior was to panic via `assert_eq!`; the expected
+        // behavior is to return an `EmptyScorer` (zero hits).
+        let range_query = FastFieldRangeWeight::new(BoundsRange::new(
+            Bound::Included(Term::from_field_f64(i64_field, 0.0)),
+            Bound::Included(Term::from_field_f64(i64_field, 100.0)),
+        ));
+        let scorer = range_query
+            .scorer(searcher.segment_reader(0), 1.0f32)
+            .expect("type mismatch must not error");
+        assert_eq!(scorer.doc(), TERMINATED);
     }
 
     #[test]

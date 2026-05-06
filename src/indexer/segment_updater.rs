@@ -448,6 +448,10 @@ impl SegmentUpdater {
         self.schedule_task(move || {
             let segment_entries = segment_updater.purge_deletes(opstamp)?;
             segment_updater.segment_manager.commit(segment_entries);
+            // `save_metas` calls `store_meta`, which also mirrors the
+            // updated `IndexMeta` into the index-level soft-meta slot —
+            // so readers see the freshly-persisted segment set without a
+            // separate publication step.
             segment_updater.save_metas(opstamp, payload)?;
             let _ = garbage_collect_files(segment_updater.clone());
             segment_updater.consider_merge_options();
@@ -455,8 +459,84 @@ impl SegmentUpdater {
         })
     }
 
+    /// Refresh-only commit: publishes recently-flushed segments to readers
+    /// **without** fsync'ing `meta.json` or running garbage collection.
+    ///
+    /// Maps to ES `refresh` semantics (NRT visibility). Steps performed:
+    /// 1. `purge_deletes(opstamp)` — apply any pending deletes (cheap when
+    ///    no deletes are queued, the common refresh-timer case).
+    /// 2. `segment_manager.commit(...)` — atomic in-memory swap promoting
+    ///    uncommitted segment entries to the committed list.
+    /// 3. Update `active_index_meta` so subsequent calls to
+    ///    `Index::searchable_segment_metas()` (and therefore
+    ///    `IndexReader::reload()`) observe the new segment set.
+    /// 4. `consider_merge_options()` — maybe schedule a merge.
+    ///
+    /// **Skipped** vs. `schedule_commit`:
+    /// - `save_metas()` (no `meta.json` write, no fsync, no
+    ///   `sync_directory()`).
+    /// - `garbage_collect_files()` (no listing, no unlinks).
+    ///
+    /// Durability contract: callers that need crash-recovery durability
+    /// must arrange for a separate `commit()` (a.k.a. `flush()`) on a
+    /// slower cadence; FerroSearch ferro-index pairs this with its own
+    /// translog so a crash between soft-commits replays cleanly.
+    pub(crate) fn schedule_soft_commit(
+        &self,
+        opstamp: Opstamp,
+        payload: Option<String>,
+    ) -> FutureResult<Opstamp> {
+        let segment_updater: SegmentUpdater = self.clone();
+        self.schedule_task(move || {
+            let segment_entries = segment_updater.purge_deletes(opstamp)?;
+            segment_updater.segment_manager.commit(segment_entries);
+            // Build an IndexMeta in-memory (NO fsync, NO directory write)
+            // and publish it via the shared soft-meta slot so that
+            // `Index::searchable_segment_metas()` picks it up on the
+            // next `reload()`.
+            segment_updater.publish_soft_meta(opstamp, payload)?;
+            segment_updater.consider_merge_options();
+            Ok(opstamp)
+        })
+    }
+
+    /// Build an `IndexMeta` from current in-memory committed-segments
+    /// state and publish it via the active-meta slot (which also mirrors
+    /// to the index-level soft-meta slot consulted by readers). Does NOT
+    /// touch disk.
+    fn publish_soft_meta(
+        &self,
+        opstamp: Opstamp,
+        commit_message: Option<String>,
+    ) -> crate::Result<()> {
+        if !self.is_alive() {
+            return Ok(());
+        }
+        let index = &self.index;
+        let mut committed_segment_metas = self.segment_manager.committed_segment_metas();
+        committed_segment_metas
+            .sort_by_key(|segment_meta| std::cmp::Reverse(segment_meta.max_doc()));
+        let index_meta = IndexMeta {
+            index_settings: index.settings().clone(),
+            segments: committed_segment_metas,
+            schema: index.schema(),
+            opstamp,
+            payload: commit_message,
+        };
+        // `store_meta` updates `active_index_meta` AND mirrors into
+        // `index.soft_meta` so subsequent `IndexReader::reload()` calls
+        // pick up the new segment set without a `meta.json` read.
+        self.store_meta(&index_meta);
+        Ok(())
+    }
+
     fn store_meta(&self, index_meta: &IndexMeta) {
         *self.active_index_meta.write().unwrap() = Arc::new(index_meta.clone());
+        // Mirror into the index-level soft-meta slot so that
+        // `Index::searchable_segment_metas()` / `IndexReader::reload()`
+        // observe up-to-date segment lists across hard commits, soft
+        // commits AND post-merge meta updates uniformly.
+        self.index.store_soft_meta(index_meta.clone());
     }
 
     fn load_meta(&self) -> Arc<IndexMeta> {

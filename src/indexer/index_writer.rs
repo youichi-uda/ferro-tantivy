@@ -684,6 +684,60 @@ impl<D: Document> IndexWriter<D> {
         self.prepare_commit()?.commit()
     }
 
+    /// Explicit alias for [`IndexWriter::commit`] documenting the
+    /// "durable flush" semantic. Equivalent to `commit()`: cuts the
+    /// indexing queue, joins workers, persists `meta.json` (fsync),
+    /// runs garbage collection, and considers merge options. This is
+    /// the path callers should use when they need crash-recoverable
+    /// durability after a batch of writes.
+    pub fn flush(&mut self) -> crate::Result<Opstamp> {
+        self.commit()
+    }
+
+    /// Refresh-only commit (cheap, no fsync).
+    ///
+    /// Equivalent to ES/Lucene `refresh()` semantics: makes recently
+    /// indexed documents visible to subsequent searches **without**
+    /// performing the expensive parts of a full commit
+    /// (`save_metas`/fsync of `meta.json` and `garbage_collect_files`).
+    ///
+    /// Concretely it:
+    /// 1. Joins indexing workers and stamps the commit opstamp (same as
+    ///    `prepare_commit`).
+    /// 2. Schedules a `schedule_soft_commit` on the segment updater that
+    ///    runs `purge_deletes` + `segment_manager.commit` + publishes a
+    ///    fresh in-memory `IndexMeta` snapshot consulted by
+    ///    `Index::searchable_segment_metas()`.
+    /// 3. Returns the assigned `Opstamp`.
+    ///
+    /// The caller is still responsible for arranging a separate full
+    /// `commit()` / `flush()` on a slower cadence to bound translog
+    /// replay work after a crash. Soft commits are NOT durable: a
+    /// process kill between soft commits and the next flush replays
+    /// from the last on-disk meta.json + translog (FerroSearch's
+    /// translog handles this independently of tantivy).
+    ///
+    /// Returns the `Opstamp` of the last document made visible.
+    pub fn soft_commit(&mut self) -> crate::Result<Opstamp> {
+        // Mirror prepare_commit: cut the indexing queue, join workers,
+        // and stamp a commit opstamp.
+        info!("Preparing soft commit");
+        self.recreate_document_channel();
+        let former_workers_join_handle = std::mem::take(&mut self.workers_join_handle);
+        for worker_handle in former_workers_join_handle {
+            let indexing_worker_result = worker_handle
+                .join()
+                .map_err(|e| TantivyError::ErrorInThread(format!("{e:?}")))?;
+            indexing_worker_result?;
+            self.add_indexing_worker()?;
+        }
+        let commit_opstamp = self.stamper.stamp();
+        info!("Soft commit {commit_opstamp}");
+        self.segment_updater
+            .schedule_soft_commit(commit_opstamp, None)
+            .wait()
+    }
+
     pub(crate) fn segment_updater(&self) -> &SegmentUpdater {
         &self.segment_updater
     }
@@ -2608,5 +2662,174 @@ mod tests {
             "Writer should reject options with too high memory size"
         );
         assert!(matches!(result, Err(TantivyError::InvalidArgument(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // soft_commit tests (FerroSearch-driven addition)
+    // -------------------------------------------------------------------
+
+    /// soft_commit makes new docs visible to a reader after `reload()`.
+    #[test]
+    fn test_soft_commit_visibility_after_reload() {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+        writer.add_document(doc!(text_field => "alpha")).unwrap();
+        writer.add_document(doc!(text_field => "beta")).unwrap();
+
+        let reader = index.reader().unwrap();
+        // Before soft_commit, no docs are visible.
+        assert_eq!(reader.searcher().num_docs(), 0);
+
+        let _opstamp = writer.soft_commit().expect("soft_commit failed");
+        reader.reload().unwrap();
+        assert_eq!(
+            reader.searcher().num_docs(),
+            2,
+            "soft_commit should expose newly indexed docs to the reader"
+        );
+    }
+
+    /// soft_commit must NOT modify `meta.json` on disk.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn test_soft_commit_does_not_write_meta_json() {
+        use std::time::Duration;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_dir(dir.path(), schema_builder.build()).unwrap();
+        let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+        // Force an initial flush to materialise meta.json on disk.
+        writer.add_document(doc!(text_field => "seed")).unwrap();
+        writer.commit().unwrap();
+
+        let meta_path = dir.path().join("meta.json");
+        let initial_mtime = std::fs::metadata(&meta_path).unwrap().modified().unwrap();
+        // Sleep beyond filesystem mtime resolution for a sound assertion.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Soft-commit a batch — should NOT touch meta.json.
+        for i in 0..100 {
+            writer.add_document(doc!(text_field => format!("doc_{i}"))).unwrap();
+        }
+        writer.soft_commit().unwrap();
+
+        let after_soft_mtime = std::fs::metadata(&meta_path).unwrap().modified().unwrap();
+        assert_eq!(
+            initial_mtime, after_soft_mtime,
+            "soft_commit must not rewrite meta.json (mtime changed)"
+        );
+
+        // The reader should still see the new docs after reload despite
+        // meta.json being stale.
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 101);
+    }
+
+    /// A full commit/flush after a soft_commit catches meta.json up to
+    /// the latest opstamp.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn test_flush_after_soft_commit_persists_meta() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_dir(dir.path(), schema_builder.build()).unwrap();
+        let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+
+        writer.add_document(doc!(text_field => "x")).unwrap();
+        writer.add_document(doc!(text_field => "y")).unwrap();
+        writer.soft_commit().unwrap();
+
+        // After soft_commit, on-disk meta.json should have 0 segments.
+        // Direct on-disk read (bypass soft-meta cache) confirms no flush.
+        index.clear_soft_meta();
+        let on_disk = index.load_metas().unwrap();
+        assert_eq!(
+            on_disk.segments.len(),
+            0,
+            "soft_commit must not have written segments to meta.json"
+        );
+
+        // Now full flush — meta.json catches up.
+        writer.flush().unwrap();
+        index.clear_soft_meta();
+        let after_flush = index.load_metas().unwrap();
+        assert!(
+            !after_flush.segments.is_empty(),
+            "flush() should persist segments to meta.json"
+        );
+        assert!(
+            after_flush.opstamp > 0,
+            "opstamp should advance past 0 after a full flush"
+        );
+    }
+
+    /// soft_commit + reader.reload() returns the correct opstamp via the
+    /// in-memory soft-meta path.
+    #[test]
+    fn test_soft_commit_returns_advancing_opstamp() {
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+
+        writer.add_document(doc!(text_field => "a")).unwrap();
+        let op1 = writer.soft_commit().unwrap();
+        assert!(op1 >= 1, "first soft_commit opstamp should be >= 1");
+
+        writer.add_document(doc!(text_field => "b")).unwrap();
+        writer.add_document(doc!(text_field => "c")).unwrap();
+        let op2 = writer.soft_commit().unwrap();
+        assert!(op2 > op1, "second soft_commit must advance opstamp");
+
+        // The reader picks up all three docs.
+        let reader = index.reader().unwrap();
+        reader.reload().unwrap();
+        assert_eq!(reader.searcher().num_docs(), 3);
+    }
+
+    /// Crash-recovery semantics: soft-committed-only docs DO NOT
+    /// survive a process kill (which is exactly what makes soft_commit
+    /// cheap). A reopened index sees only flushed-segment docs. The
+    /// caller (FerroSearch) is responsible for translog replay if it
+    /// wants the soft-committed docs back.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn test_soft_commit_not_durable_across_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut schema_builder = schema::Schema::builder();
+        let text_field = schema_builder.add_text_field("text", TEXT);
+        let schema = schema_builder.build();
+        {
+            let index = Index::create_in_dir(dir.path(), schema.clone()).unwrap();
+            let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+            // Persist one doc via full commit.
+            writer.add_document(doc!(text_field => "durable")).unwrap();
+            writer.commit().unwrap();
+            // Soft-commit a second doc — survives only in soft-meta.
+            writer.add_document(doc!(text_field => "ephemeral")).unwrap();
+            writer.soft_commit().unwrap();
+            // Drop writer and index without an explicit flush.
+        }
+        // Reopen — only the durable doc should be visible.
+        let index = Index::open_in_dir(dir.path()).unwrap();
+        let reader = index.reader().unwrap();
+        let count = reader.searcher().num_docs();
+        assert_eq!(
+            count, 1,
+            "after reopen without final flush, only durably-committed docs survive"
+        );
+        // Sanity: search returns exactly the durable doc.
+        let parser = QueryParser::for_index(&index, vec![text_field]);
+        let q = parser.parse_query("durable").unwrap();
+        let count = reader.searcher().search(&q, &Count).unwrap();
+        assert_eq!(count, 1);
+        let q_eph = parser.parse_query("ephemeral").unwrap();
+        let count_eph = reader.searcher().search(&q_eph, &Count).unwrap();
+        assert_eq!(count_eph, 0, "ephemeral (soft-only) doc must not survive reopen");
     }
 }

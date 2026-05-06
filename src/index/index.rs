@@ -3,7 +3,10 @@ use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::available_parallelism;
+
+use arc_swap::ArcSwapOption;
 
 use super::segment::Segment;
 use super::segment_reader::merge_field_meta_data;
@@ -272,6 +275,14 @@ pub struct Index {
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
+    /// Soft (in-memory) view of the index meta. Populated by
+    /// `IndexWriter::soft_commit()` to expose newly-flushed segments to
+    /// readers without paying the meta.json fsync + GC cost. When `Some`,
+    /// `searchable_segment_metas()` consults this in-memory snapshot
+    /// instead of reading `meta.json` from disk. A subsequent full
+    /// `commit()` updates this slot to the persisted meta so readers
+    /// stay consistent with the on-disk manifest.
+    soft_meta: Arc<ArcSwapOption<IndexMeta>>,
 }
 
 impl Index {
@@ -391,7 +402,36 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Executor::single_thread(),
             inventory,
+            soft_meta: Arc::new(ArcSwapOption::empty()),
         }
+    }
+
+    /// Internal handle to the in-memory soft-meta slot.
+    ///
+    /// Populated by `IndexWriter::soft_commit()` (cheap refresh-only
+    /// publish) and by `IndexWriter::commit()` (full flush), consulted by
+    /// `searchable_segment_metas()` so that `IndexReader::reload()` can
+    /// pick up newly-flushed segments without performing a meta.json
+    /// fsync / read.
+    #[doc(hidden)]
+    pub fn soft_meta_handle(&self) -> Arc<ArcSwapOption<IndexMeta>> {
+        self.soft_meta.clone()
+    }
+
+    /// Replace the in-memory soft-meta snapshot. Called by the segment
+    /// updater after a soft-commit (refresh-only, no fsync) or after a
+    /// full commit (so readers stay aligned with the persisted manifest).
+    #[doc(hidden)]
+    pub fn store_soft_meta(&self, meta: IndexMeta) {
+        self.soft_meta.store(Some(Arc::new(meta)));
+    }
+
+    /// Clear the in-memory soft-meta snapshot, forcing the next
+    /// `searchable_segment_metas()` to fall back to the on-disk
+    /// `meta.json`. Used by tests and by recovery paths.
+    #[doc(hidden)]
+    pub fn clear_soft_meta(&self) {
+        self.soft_meta.store(None);
     }
 
     /// Setter for the tokenizer manager.
@@ -708,7 +748,18 @@ impl Index {
 
     /// Reads the meta.json and returns the list of
     /// `SegmentMeta` from the last commit.
+    ///
+    /// When a soft-commit has populated the in-memory soft-meta slot,
+    /// the in-memory snapshot takes precedence over the on-disk
+    /// `meta.json`. This is what makes `IndexWriter::soft_commit()`
+    /// cheap: readers can see new segments via `reload()` without the
+    /// soft-commit having to fsync `meta.json`. After a full
+    /// `IndexWriter::commit()` or `flush()`, the soft-meta is refreshed
+    /// to match the on-disk manifest, so readers remain consistent.
     pub fn searchable_segment_metas(&self) -> crate::Result<Vec<SegmentMeta>> {
+        if let Some(soft) = self.soft_meta.load_full() {
+            return Ok(soft.segments.clone());
+        }
         Ok(self.load_metas()?.segments)
     }
 

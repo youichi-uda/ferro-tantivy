@@ -232,6 +232,84 @@ fn test_dictionary_encoded_bytes() {
     assert_eq!(term_buffer, b"b");
 }
 
+/// `BytesColumn::min_max_bytes` returns the (min, max) raw byte terms in
+/// dictionary order. Underpins the keyword-sort `can_match` shortcut that
+/// skips segments whose [min, max] is disjoint from a query range.
+#[test]
+fn test_bytes_column_min_max() {
+    let mut buffer = Vec::new();
+    let mut columnar_writer = ColumnarWriter::default();
+    // Insert in non-sorted order to confirm dictionary sort dominates.
+    columnar_writer.record_bytes(0, "cc", b"jpn");
+    columnar_writer.record_bytes(1, "cc", b"alpha");
+    columnar_writer.record_bytes(2, "cc", b"zulu");
+    columnar_writer.record_bytes(3, "cc", b"mango");
+    columnar_writer.serialize(4, &mut buffer).unwrap();
+    let columnar_reader = ColumnarReader::open(buffer).unwrap();
+    let col_handles = columnar_reader.read_columns("cc").unwrap();
+    let DynamicColumn::Bytes(bytes_col) = col_handles[0].open().unwrap() else {
+        panic!()
+    };
+    let mm = bytes_col.min_max_bytes().unwrap().expect("non-empty col");
+    assert_eq!(mm.0, b"alpha", "min = first byte-sorted term");
+    assert_eq!(mm.1, b"zulu", "max = last byte-sorted term");
+}
+
+/// Empty dictionary → `None`. Required so callers can fall back to "search
+/// the segment" instead of treating "min == max == empty" as "skip".
+#[test]
+fn test_bytes_column_min_max_empty() {
+    let mut buffer = Vec::new();
+    let mut columnar_writer = ColumnarWriter::default();
+    columnar_writer.serialize(0, &mut buffer).unwrap();
+    let columnar_reader = ColumnarReader::open(buffer).unwrap();
+    assert_eq!(columnar_reader.num_columns(), 0);
+}
+
+/// Single-term dictionary: min == max. Catches a regression where the
+/// short-circuit on `n == 1` would return `(min, "")` instead of cloning min.
+#[test]
+fn test_bytes_column_min_max_single() {
+    let mut buffer = Vec::new();
+    let mut columnar_writer = ColumnarWriter::default();
+    columnar_writer.record_bytes(0, "cc", b"only");
+    columnar_writer.record_bytes(1, "cc", b"only");
+    columnar_writer.serialize(2, &mut buffer).unwrap();
+    let columnar_reader = ColumnarReader::open(buffer).unwrap();
+    let col_handles = columnar_reader.read_columns("cc").unwrap();
+    let DynamicColumn::Bytes(bytes_col) = col_handles[0].open().unwrap() else {
+        panic!()
+    };
+    let mm = bytes_col.min_max_bytes().unwrap().expect("non-empty col");
+    assert_eq!(mm.0, b"only");
+    assert_eq!(mm.1, b"only");
+}
+
+/// `StrColumn::min_max_str` mirrors the byte API and decodes UTF-8.
+#[test]
+fn test_str_column_min_max() {
+    use crate::StrColumn;
+    let mut buffer = Vec::new();
+    let mut columnar_writer = ColumnarWriter::default();
+    columnar_writer.record_str(0, "cc", "jpn");
+    columnar_writer.record_str(1, "cc", "alpha");
+    columnar_writer.record_str(2, "cc", "zulu");
+    columnar_writer.serialize(3, &mut buffer).unwrap();
+    let columnar_reader = ColumnarReader::open(buffer).unwrap();
+    let col_handles = columnar_reader.read_columns("cc").unwrap();
+    let DynamicColumn::Str(str_col) = col_handles[0].open().unwrap() else {
+        panic!()
+    };
+    let mm = str_col.min_max_str().unwrap().expect("non-empty col");
+    assert_eq!(mm.0, "alpha");
+    assert_eq!(mm.1, "zulu");
+    // BytesColumn min/max via deref must agree with StrColumn min/max.
+    let _: &StrColumn = &str_col;
+    let bytes_mm = (*str_col).min_max_bytes().unwrap().unwrap();
+    assert_eq!(bytes_mm.0, b"alpha");
+    assert_eq!(bytes_mm.1, b"zulu");
+}
+
 fn num_strategy() -> impl Strategy<Value = NumericalValue> {
     prop_oneof![
         3 => Just(NumericalValue::U64(0u64)),

@@ -1,11 +1,13 @@
 use crate::schema::Type;
 
 mod fast_field_range_doc_set;
+mod index_or_dv_range_query;
 mod range_query;
 mod range_query_fastfield;
 
 pub use common::bounds::BoundsRange;
 
+pub use self::index_or_dv_range_query::{IndexOrDocValuesQuery, SELECTIVITY_THRESHOLD};
 pub use self::range_query::*;
 pub use self::range_query_fastfield::*;
 

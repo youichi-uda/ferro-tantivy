@@ -208,3 +208,7 @@ harness = false
 [[bench]]
 name = "regex_all_terms"
 harness = false
+
+[[bench]]
+name = "multithread_executor"
+harness = false

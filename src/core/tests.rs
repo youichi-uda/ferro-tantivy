@@ -466,3 +466,205 @@ fn test_non_text_json_term_freq_bitpacked() {
         assert_eq!(postings.term_freq(), 1u32);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Wave 10 #X: Multi-thread executor regression tests.
+//
+// The fork already exposes `Index::set_multithread_executor(n)` and
+// `Index::set_default_multithread_executor()`.  These tests pin down the
+// observable contract:
+//
+//   1. The default executor is `Executor::SingleThread`.
+//   2. After `set_multithread_executor`, the executor is `ThreadPool` with
+//      the requested thread count.
+//   3. `Searcher::search` returns identical results regardless of executor
+//      variant — parallelism is a perf concern, not a semantic one.  This
+//      is the property FerroSearch's Wave 10 #X fix relies on.
+//   4. `Searcher::clone` (the PIT pinning operation) preserves the
+//      executor — both clones share `Arc<SearcherInner>` whose `Index`
+//      holds an Arc-backed executor.
+//
+// These tests are deliberately small (each ≤500 docs across 2-4 segments).
+// They validate the wiring, not the perf characteristics — a bench in
+// `benches/` would be needed for the latter and is intentionally omitted
+// from the unit suite (CI runtime budget).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Produces a small index with `num_segments` segments by committing per
+/// chunk.  Used by the executor tests below.
+fn build_multi_segment_index(num_segments: u32, docs_per_segment: u32) -> Index {
+    let mut schema_builder = Schema::builder();
+    let value_field = schema_builder.add_u64_field("value", INDEXED | crate::schema::FAST);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema);
+    let mut writer: IndexWriter = index.writer_for_tests().unwrap();
+    writer.set_merge_policy(Box::new(NoMergePolicy));
+    let mut doc_id = 0u64;
+    for _ in 0..num_segments {
+        for _ in 0..docs_per_segment {
+            let mut doc = TantivyDocument::default();
+            doc.add_u64(value_field, doc_id);
+            writer.add_document(doc).unwrap();
+            doc_id += 1;
+        }
+        writer.commit().unwrap();
+    }
+    index
+}
+
+/// Default executor must be `SingleThread`.
+#[test]
+fn executor_default_is_single_thread() {
+    let index = build_multi_segment_index(2, 50);
+    assert!(matches!(
+        index.search_executor(),
+        crate::Executor::SingleThread
+    ));
+}
+
+/// `set_multithread_executor(n)` flips the executor variant.
+#[test]
+fn set_multithread_executor_flips_variant() {
+    let mut index = build_multi_segment_index(2, 50);
+    index
+        .set_multithread_executor(4)
+        .expect("multi_thread executor must build");
+    assert!(matches!(
+        index.search_executor(),
+        crate::Executor::ThreadPool(_)
+    ));
+}
+
+/// `set_default_multithread_executor()` produces a thread pool sized to
+/// `available_parallelism()`.  Smoke test only — we don't assert the exact
+/// thread count because it varies by host.
+#[test]
+fn set_default_multithread_executor_builds_pool() {
+    let mut index = build_multi_segment_index(2, 50);
+    index
+        .set_default_multithread_executor()
+        .expect("default multi-thread executor must build");
+    assert!(matches!(
+        index.search_executor(),
+        crate::Executor::ThreadPool(_)
+    ));
+}
+
+/// **Correctness invariant**: `Searcher::search` returns identical results
+/// under SingleThread and ThreadPool executors.  This is the central
+/// property the FerroSearch Wave 10 #X opt-in relies on — operators flipping
+/// `FERRO_SEARCH_EXECUTOR_THREADS` must not see different top-K.
+#[test]
+fn searcher_results_identical_across_executor_variants() {
+    use crate::collector::Count;
+
+    // Single-thread baseline.
+    let baseline_count = {
+        let index = build_multi_segment_index(4, 100);
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        searcher.search(&crate::query::AllQuery, &Count).unwrap()
+    };
+
+    // Multi-thread (4 segments × 4 threads → one task per segment).
+    let parallel_count = {
+        let mut index = build_multi_segment_index(4, 100);
+        index.set_multithread_executor(4).unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        searcher.search(&crate::query::AllQuery, &Count).unwrap()
+    };
+
+    assert_eq!(baseline_count, 400);
+    assert_eq!(
+        baseline_count, parallel_count,
+        "executor variant must not change Count fruit"
+    );
+}
+
+/// **Force-merged-1-seg case**: with a single segment the threadpool
+/// executor degenerates to one task → one thread; the result must still
+/// match SingleThread, and the call must not deadlock.  This is the
+/// minimal regression guard against the `Executor::ThreadPool::map`
+/// fan-out scope-drain path mishandling N=1.
+#[test]
+fn searcher_single_segment_works_under_threadpool() {
+    use crate::collector::Count;
+    let mut index = build_multi_segment_index(1, 200);
+    index.set_multithread_executor(4).unwrap();
+    let reader = index.reader().unwrap();
+    let searcher = reader.searcher();
+    assert_eq!(searcher.segment_readers().len(), 1);
+    let count = searcher.search(&crate::query::AllQuery, &Count).unwrap();
+    assert_eq!(count, 200);
+}
+
+/// `Searcher::clone` (the PIT pinning operation) preserves the executor
+/// of the underlying `Index`.  This is the structural property that makes
+/// `crates/ferro-query/src/execute.rs::searcher_for` correct — pinned
+/// PIT searchers from `request.pit_searchers` must inherit the same
+/// executor as the live shard searcher.
+#[test]
+fn searcher_clone_preserves_executor() {
+    let mut index = build_multi_segment_index(2, 50);
+    index.set_multithread_executor(2).unwrap();
+    let reader = index.reader().unwrap();
+    let live_searcher = reader.searcher();
+    let pinned_clone = live_searcher.clone();
+
+    // Both searchers' index() must report ThreadPool.
+    assert!(matches!(
+        live_searcher.index().search_executor(),
+        crate::Executor::ThreadPool(_)
+    ));
+    assert!(matches!(
+        pinned_clone.index().search_executor(),
+        crate::Executor::ThreadPool(_)
+    ));
+}
+
+/// **Send compile-time check** for the sort_key infrastructure.  The
+/// per-segment computer types (`SortByFastValueSegmentSortKeyComputer<T>`
+/// and `ByStringColumnSegmentSortKeyComputer`) live behind the
+/// `SortKeyComputer::Child` associated type and must be `Send` so the
+/// multi-thread executor can dispatch them across rayon worker threads.
+/// This is enforced structurally by `Executor::map`'s `R: Send` bound on
+/// the fruit and the `Sync + Send` bound on `Collector`, but the
+/// *intermediate* computer state must also be Send for the per-segment
+/// closure to be Send + Sync.
+///
+/// We assert the compile-time bounds via the public `SortByStaticFastValue`
+/// + `SortByString` factory types — their `Child` is the segment computer.
+/// If the Send bound regresses (e.g., someone adds an `Rc<...>` field),
+/// this test will fail to compile.
+#[test]
+fn sort_key_segment_computers_are_send() {
+    use crate::collector::sort_key::{SegmentSortKeyComputer, SortKeyComputer};
+
+    fn assert_child_send<S>()
+    where
+        S: SortKeyComputer,
+        <S as SortKeyComputer>::Child: Send,
+    {
+    }
+
+    // u64 / i64 / f64 / DateTime fast-value variants and the string variant
+    // all need to be Send for `Executor::ThreadPool::map` to dispatch the
+    // per-segment closure across worker threads.
+    assert_child_send::<crate::collector::sort_key::SortByStaticFastValue<u64>>();
+    assert_child_send::<crate::collector::sort_key::SortByStaticFastValue<i64>>();
+    assert_child_send::<crate::collector::sort_key::SortByStaticFastValue<f64>>();
+    assert_child_send::<crate::collector::sort_key::SortByStaticFastValue<crate::DateTime>>();
+    assert_child_send::<crate::collector::sort_key::SortByString>();
+
+    // SegmentSortKeyComputer's required associated types must also be Send
+    // (they cross thread boundaries via the topN computer's `merge_fruits`).
+    fn assert_seg_keys_send<S: SegmentSortKeyComputer>()
+    where
+        S::SortKey: Send,
+        S::SegmentSortKey: Send,
+    {
+    }
+    assert_seg_keys_send::<<crate::collector::sort_key::SortByStaticFastValue<u64> as SortKeyComputer>::Child>();
+    assert_seg_keys_send::<<crate::collector::sort_key::SortByString as SortKeyComputer>::Child>();
+}

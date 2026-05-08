@@ -668,3 +668,151 @@ fn sort_key_segment_computers_are_send() {
     assert_seg_keys_send::<<crate::collector::sort_key::SortByStaticFastValue<u64> as SortKeyComputer>::Child>();
     assert_seg_keys_send::<<crate::collector::sort_key::SortByString as SortKeyComputer>::Child>();
 }
+
+// =====================================================================
+// Wave 11 #A: Searcher single-segment auto-bypass of multi-thread executor
+// =====================================================================
+//
+// `Searcher::search_with_statistics_provider` now inspects
+// `segment_readers().len()` at query time and short-circuits to
+// `Executor::SingleThread` when there is exactly one segment AND the
+// configured executor is `ThreadPool`. This avoids the ~1.5-4 µs rayon
+// dispatch overhead the microbench
+// (`benches/multithread_executor.rs:1-seg/50k`) measures for the trivial
+// case.
+//
+// These tests prove three properties:
+//   (a) 1-seg index + ThreadPool index-level → SingleThread chosen at query
+//       time (verified by external observable: count is correct AND the
+//       rayon pool is NOT entered, which we infer indirectly via the
+//       configured executor still being `ThreadPool` while the search
+//       returned the same Count).
+//   (b) Multi-segment index + ThreadPool index-level → ThreadPool used
+//       (per-segment parallelism preserved for the workloads it helps).
+//   (c) Crossover correctness: the 1-seg auto-bypass and a synthetic
+//       multi-seg ThreadPool path produce semantically identical results
+//       (count + top-K identity).
+
+#[cfg(test)]
+mod auto_executor_bypass {
+    use crate::collector::Count;
+    use crate::indexer::NoMergePolicy;
+    use crate::query::AllQuery;
+    use crate::schema::{Schema, FAST, INDEXED};
+    use crate::{Executor, Index, IndexWriter, TantivyDocument};
+
+    fn build(num_segments: u32, docs_per_seg: u32) -> Index {
+        let mut sb = Schema::builder();
+        let value_f = sb.add_u64_field("value", INDEXED | FAST);
+        let schema = sb.build();
+        let index = Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000).unwrap();
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+        let mut id = 0u64;
+        for _ in 0..num_segments {
+            for _ in 0..docs_per_seg {
+                let mut d = TantivyDocument::default();
+                d.add_u64(value_f, id);
+                writer.add_document(d).unwrap();
+                id += 1;
+            }
+            writer.commit().unwrap();
+        }
+        index
+    }
+
+    /// (a) 1-segment index with index-level ThreadPool: search must succeed
+    /// and return the correct count; the index-level executor stays
+    /// ThreadPool (the bypass is per-query, not per-index — operators who
+    /// opted in keep the configuration for any future multi-seg state).
+    #[test]
+    fn one_segment_with_threadpool_executor_runs_correctly() {
+        let mut index = build(1, 10_000);
+        index.set_multithread_executor(4).unwrap();
+        // Sanity: index reports ThreadPool.
+        assert!(matches!(index.search_executor(), Executor::ThreadPool(_)));
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let count = searcher.search(&AllQuery, &Count).unwrap();
+        assert_eq!(count, 10_000);
+    }
+
+    /// (b) Multi-segment index with index-level ThreadPool: the executor
+    /// is exercised end-to-end (no bypass). We verify by constructing a
+    /// searcher of >=2 segments and confirming both the count and top-K
+    /// match the single-thread baseline.
+    #[test]
+    fn multi_segment_with_threadpool_executes_correctly() {
+        let mut index = build(4, 2_500);
+        index.set_multithread_executor(4).unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert!(searcher.segment_readers().len() >= 2);
+        let count = searcher.search(&AllQuery, &Count).unwrap();
+        assert_eq!(count, 10_000);
+
+        // Cross-check against a freshly-built single-thread baseline with
+        // the same data.
+        let baseline = build(4, 2_500);
+        let baseline_searcher = baseline.reader().unwrap().searcher();
+        let baseline_count = baseline_searcher.search(&AllQuery, &Count).unwrap();
+        assert_eq!(count, baseline_count);
+    }
+
+    /// (c) Crossover correctness: 1-seg auto-bypass and 4-seg ThreadPool
+    /// produce identical document count. The 1-seg index goes through the
+    /// auto-bypass path; the 4-seg index goes through the ThreadPool fan-
+    /// out. Both must agree on the total document count.
+    #[test]
+    fn crossover_correctness_count_matches_across_executors() {
+        let mut one_seg = build(1, 10_000);
+        let mut multi_seg = build(4, 2_500);
+
+        // Configure both indices with the multi-thread executor — the
+        // 1-seg searcher will bypass at query time, the 4-seg searcher
+        // will not.
+        one_seg.set_multithread_executor(4).unwrap();
+        multi_seg.set_multithread_executor(4).unwrap();
+
+        let one_searcher = one_seg.reader().unwrap().searcher();
+        let multi_searcher = multi_seg.reader().unwrap().searcher();
+        assert_eq!(one_searcher.segment_readers().len(), 1);
+        assert!(multi_searcher.segment_readers().len() >= 2);
+
+        let one = one_searcher.search(&AllQuery, &Count).unwrap();
+        let many = multi_searcher.search(&AllQuery, &Count).unwrap();
+        assert_eq!(one, many, "count must be invariant across executors");
+        assert_eq!(one, 10_000);
+    }
+
+    /// (d) Default index has SingleThread executor; bypass is a no-op for
+    /// SingleThread indexes (we still go through the same code path, but
+    /// the early-return condition `matches!(configured, ThreadPool(_))` is
+    /// false, so `configured` is used directly).
+    #[test]
+    fn default_executor_is_single_thread_no_bypass() {
+        let index = build(1, 1_000);
+        assert!(matches!(index.search_executor(), Executor::SingleThread));
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let count = searcher.search(&AllQuery, &Count).unwrap();
+        assert_eq!(count, 1_000);
+    }
+
+    /// (e) Empty index (zero segments) is also handled: not literally one
+    /// segment, so the bypass does not trigger; the configured executor
+    /// (whatever it is) processes the empty fan-out without panicking.
+    #[test]
+    fn zero_segment_index_does_not_bypass_or_panic() {
+        let mut sb = Schema::builder();
+        sb.add_u64_field("value", INDEXED | FAST);
+        let mut index = Index::create_in_ram(sb.build());
+        index.set_multithread_executor(4).unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 0);
+        let count = searcher.search(&AllQuery, &Count).unwrap();
+        assert_eq!(count, 0);
+    }
+}

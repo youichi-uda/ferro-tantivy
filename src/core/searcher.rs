@@ -8,10 +8,10 @@ use crate::index::{SegmentId, SegmentReader};
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
 use crate::schema::document::DocumentDeserialize;
 use crate::schema::{Schema, Term};
-use common::OwnedBytes;
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
 use crate::{DocAddress, Index, Opstamp, TrackedObject};
+use common::OwnedBytes;
 
 /// Identifies the searcher generation accessed by a [`Searcher`].
 ///
@@ -171,7 +171,8 @@ impl Searcher {
                 .collect();
             indexed.sort_unstable_by_key(|(_, doc_id)| *doc_id);
             let doc_ids: Vec<crate::DocId> = indexed.iter().map(|(_, d)| *d).collect();
-            let mut batch = store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
+            let mut batch =
+                store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
             let mut results: Vec<Option<common::OwnedBytes>> = vec![None; doc_addresses.len()];
             for (i, &(orig_idx, _)) in indexed.iter().enumerate() {
                 results[orig_idx] = batch[i].take();
@@ -199,7 +200,8 @@ impl Searcher {
             let group = &indexed[seg_start..seg_end];
             let doc_ids: Vec<crate::DocId> = group.iter().map(|(_, a)| a.doc_id).collect();
             let store_reader = &self.inner.store_readers[seg_ord as usize];
-            let mut batch = store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
+            let mut batch =
+                store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
             for (i, &(orig_idx, _)) in group.iter().enumerate() {
                 results[orig_idx] = batch[i].take();
             }
@@ -353,10 +355,10 @@ impl Searcher {
                 if pair_idx < ord_pairs.len() {
                     let orig_idx = ord_pairs[pair_idx].0;
                     // SSTable data is valid UTF-8 for StrColumn; zero-copy via from_utf8
-                    results[orig_idx] = Some(
-                        String::from_utf8(bytes.to_vec())
-                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
-                    );
+                    results[orig_idx] =
+                        Some(String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
+                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                        }));
                     pair_idx += 1;
                 }
                 Ok(())
@@ -479,6 +481,28 @@ impl Searcher {
     ///
     /// This can be used to adjust the statistics used in computing BM25
     /// scores.
+    ///
+    /// ## Wave 11 #A: 1-segment auto-bypass of multi-thread executor
+    ///
+    /// When `self.segment_readers().len() == 1`, dispatching the single
+    /// segment task through a `ThreadPool` executor is pure overhead — the
+    /// FerroSearch microbench
+    /// (`vendor/tantivy-local/benches/multithread_executor.rs`) measures
+    /// `1-seg/50k: 1.92 µs (single) → 3.43 µs (4-thread pool)`, ~1.8× slower
+    /// for the trivial case.
+    ///
+    /// Wave 10 verify EC2 (`dd-pack/rally-bench-fullmode-2026-05-08-postwave10`)
+    /// confirmed this regression on force-merged http_logs (1 segment per
+    /// shard) where Wave 9 wins flipped back: `desc_sort_timestamp_can_match`
+    /// FS 1.23× → ES 3.11×, `sort_status_desc` FS 2.40× → ES 9.64×.
+    ///
+    /// The fix: detect `segment_readers().len() == 1` at query time and use
+    /// `Executor::SingleThread` regardless of the index-level configured
+    /// executor. The check is a single comparison on a `Vec` length the
+    /// searcher already owns — zero extra work. Multi-segment indexes
+    /// continue to use the configured executor as before, so operators can
+    /// still opt in to per-shard parallelism for large multi-segment
+    /// workloads via `FERRO_SEARCH_EXECUTOR_THREADS`.
     pub fn search_with_statistics_provider<C: Collector>(
         &self,
         query: &dyn Query,
@@ -490,8 +514,23 @@ impl Searcher {
         } else {
             EnableScoring::disabled_from_searcher(self)
         };
-        let executor = self.inner.index.search_executor();
-        self.search_with_executor(query, collector, executor, enabled_scoring)
+        // Wave 11 #A: single-segment auto-bypass.
+        // Tantivy's `Executor::ThreadPool::map` for a 1-element iterator
+        // pays ~1.5-4 µs of dispatch overhead (rayon scope spawn +
+        // crossbeam channel hop) for zero parallelism gain. With
+        // force-merged 1-shard-per-segment indexes this overhead dominates
+        // sort/can_match query latency. Bypass to SingleThread when there
+        // is exactly one segment task to dispatch.
+        //
+        // `Executor::SingleThread` is a zero-sized unit variant — owning it
+        // in a local is free, and `&Executor` borrows from the local for
+        // the duration of the call.
+        let configured = self.inner.index.search_executor();
+        if self.inner.segment_readers.len() == 1 && matches!(configured, Executor::ThreadPool(_)) {
+            let bypass = Executor::SingleThread;
+            return self.search_with_executor(query, collector, &bypass, enabled_scoring);
+        }
+        self.search_with_executor(query, collector, configured, enabled_scoring)
     }
 
     /// Same as [`search(...)`](Searcher::search) but multithreaded.

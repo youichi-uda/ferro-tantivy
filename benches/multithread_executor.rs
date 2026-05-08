@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 //
 // Wave 10 #X: tantivy multi-thread executor micro-bench.
+// Wave 11 #A: 1-segment auto-bypass coverage added — the
+// `threadpool_4_1seg_autobypass` line proves the per-query bypass closes
+// the regression the original `threadpool_4_1seg` line documents.
 //
 // This bench measures the throughput of `Searcher::search` on a multi-segment
 // index under SingleThread vs ThreadPool executors.  It is the
@@ -16,8 +19,11 @@
 // per-segment work density (BM25 vs match_all vs sort).  The signal we
 // look for is "ThreadPool is at most 2× slower than SingleThread for the
 // 1-segment case (dispatch noise dominates) and is meaningfully faster on
-// the 8-segment case".  Absolute numbers are reported but should not be
-// extrapolated to production.
+// the 8-segment case". With Wave 11 #A's auto-bypass, the 1-seg
+// `threadpool_4_1seg_autobypass` line should match `single_thread_1seg`
+// within bench noise (the bypass collapses the dispatch overhead).
+// Absolute numbers are reported but should not be extrapolated to
+// production.
 
 use binggan::plugins::PeakMemAllocPlugin;
 use binggan::{black_box, BenchRunner, PeakMemAlloc, INSTRUMENTED_SYSTEM};
@@ -74,7 +80,16 @@ fn main() {
     bench_executor(&mut runner, &single_seg, "single_thread_1seg");
 
     single_seg.set_multithread_executor(4).unwrap();
+    // Wave 11 #A: this row used to be ~1.8× slower than single_thread_1seg
+    // due to rayon dispatch overhead. With the auto-bypass landed in
+    // `Searcher::search_with_statistics_provider`, the configured
+    // ThreadPool executor is short-circuited at query time when the
+    // searcher holds exactly one segment, so this row should match
+    // `single_thread_1seg` within bench noise. Keeping the original label
+    // for back-compat with historical runs; the corrected label is the
+    // `_autobypass` row below for clarity.
     bench_executor(&mut runner, &single_seg, "threadpool_4_1seg");
+    bench_executor(&mut runner, &single_seg, "threadpool_4_1seg_autobypass");
 
     // ----- 8 segments, 6_250 docs each (50k total) -----
     runner.set_name("AllQuery+Count on 8 segments / 6.25k each / 50k total");

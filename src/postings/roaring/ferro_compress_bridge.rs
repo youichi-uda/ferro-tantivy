@@ -14,12 +14,13 @@
 //!   round-tripping cleanly. Useful for tests, the OSS fork, and any
 //!   non-FerroSearch downstream.
 //! - **Enabled** ([`feature = "ferro-compress"`] on): the
-//!   [`FerroBitcompCodec`] *will* delegate to
-//!   `ferro_compress::nvcomp::Algo::Bitcomp` once Cargo wiring lands
-//!   in Wave 6 (Phase 2 C-4). Until then it returns
-//!   [`BitcompError::WaitingOnWave6`] from every call — by design,
-//!   so a misconfigured build fails fast rather than silently
-//!   skipping compression.
+//!   [`FerroBitcompCodec`] delegates to a real
+//!   [`ferro_compress::Backend`]. The default backend resolution is
+//!   [`ferro_compress::Backend::cpu`] with [`ferro_compress::Algo::Snappy`]
+//!   — the Phase 0 fastest-decompress codec on json_logs / postings
+//!   workloads (146 GB/s GPU decompress, 6.29 GB/s CPU). Callers that
+//!   want Bitcomp / GPU dispatch construct a custom
+//!   [`FerroBitcompCodec::with_backend`] with the appropriate algo.
 //!
 //! ## Wire considerations
 //!
@@ -29,19 +30,10 @@
 //!
 //! 1. swap codecs without touching the encoder/decoder; and
 //! 2. keep the GPU-native form (raw bitmap) and the on-disk form
-//!    (Bitcomp-compressed bitmap) decoupled — the encoder writes
+//!    (compressed bitmap) decoupled — the encoder writes
 //!    `compress(raw_words)` to disk and the decoder reads
 //!    `decompress(compressed_bytes) -> [u32; 2048]` back into VRAM /
 //!    host memory.
-//!
-//! ## What this wave (C-3) does *not* do
-//!
-//! - No `Cargo.toml` `path = "../ferro-compress"` dependency wiring
-//!   (Wave 6 / C-4).
-//! - No `Cargo.lock` mutation outside this crate.
-//! - No `BitmapContainer::compressed_bytes` helpers on the container
-//!   itself (kept here, in the bridge module, to avoid a circular
-//!   dep direction between `container.rs` and the codec layer).
 
 use crate::postings::roaring::container::BitmapContainer;
 use crate::postings::roaring::BITMAP_CONTAINER_WORDS;
@@ -58,9 +50,12 @@ pub enum BitcompError {
         /// Words the codec actually wrote.
         got: usize,
     },
-    /// Real `ferro-compress` codec is selected via the
-    /// `ferro-compress` feature, but the actual Cargo path-dep wiring
-    /// is deferred to Wave 6.
+    /// Reserved variant: until Wave 6 the [`FerroBitcompCodec`] short-
+    /// circuited to this error so misconfigured builds failed fast. Wave
+    /// 6 swapped the short-circuit for a real
+    /// [`ferro_compress::Backend`] round-trip; the variant is retained
+    /// for back-compat with downstream `match` arms / tests pinned to
+    /// the previous behaviour.
     #[error("bitcomp: ferro-compress codec selected but Cargo wiring is deferred to Wave 6 (C-4)")]
     WaitingOnWave6,
     /// Decompression produced fewer / more bytes than the bitmap
@@ -181,41 +176,145 @@ impl BitcompCodec for IdentityBitcompCodec {
 }
 
 // ============================================================
-// FerroBitcompCodec — Wave-6 placeholder.
+// FerroBitcompCodec — Wave 6 (C-4) real wiring.
 // ============================================================
 
-/// Codec that delegates to `ferro_compress::nvcomp::Algo::Bitcomp`.
+/// Codec that delegates to a [`ferro_compress::Backend`].
 ///
-/// **Wave 5 status**: structurally complete, but every method short-
-/// circuits to [`BitcompError::WaitingOnWave6`]. Wave 6 (Phase 2 C-4)
-/// adds the `path = "../../ferrosearch-gpu-compress/crates/ferro-compress"`
-/// dep + builds the actual Bitcomp call. Tests in this module pin the
-/// short-circuit so the contract is observable today.
+/// Wave 6 (Phase 2 C-4) lands the real round-trip. The default
+/// constructor picks [`ferro_compress::Algo::Snappy`] on the CPU
+/// backend — this is the Phase 0 fastest-decompress codec on
+/// json_logs / postings workloads and avoids per-call CUDA overhead at
+/// the 8 KiB Roaring container size (well under the
+/// [`ferro_compress::AUTO_GPU_THRESHOLD_BYTES`] = 1 MiB GPU floor, so
+/// `Backend::Auto` would dispatch to CPU anyway). Callers that want
+/// Bitcomp / GPU paths construct via [`FerroBitcompCodec::with_backend`]
+/// and pass an explicit [`ferro_compress::Algo`] / [`ferro_compress::Backend`]
+/// pair — typically [`ferro_compress::Algo::for_postings_uint32`] for
+/// the Bitcomp uint32-typed-numeric column win measured at Phase 0
+/// (3.59× ratio / 366 GB/s decomp).
+///
+/// Round-trip safe by construction: every algorithm in
+/// [`ferro_compress::Algo`] is lossless.
 #[cfg(feature = "ferro-compress")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FerroBitcompCodec;
+pub struct FerroBitcompCodec {
+    backend: ferro_compress::Backend,
+    algo: ferro_compress::Algo,
+}
+
+#[cfg(feature = "ferro-compress")]
+impl std::fmt::Debug for FerroBitcompCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FerroBitcompCodec")
+            .field("backend_kind", &self.backend.kind())
+            .field("algo", &self.algo)
+            .finish()
+    }
+}
+
+#[cfg(feature = "ferro-compress")]
+impl Default for FerroBitcompCodec {
+    fn default() -> Self {
+        // Snappy on CPU: best CPU-decompress per Phase 0 (6.29 GB/s),
+        // and 8 KiB containers fall well below the GPU dispatch
+        // threshold so even `Backend::Auto` would route here. Picking
+        // it explicitly keeps the default a fast, predictable path.
+        FerroBitcompCodec {
+            backend: ferro_compress::Backend::cpu(),
+            algo: ferro_compress::Algo::Snappy,
+        }
+    }
+}
+
+#[cfg(feature = "ferro-compress")]
+impl FerroBitcompCodec {
+    /// Construct with an explicit [`ferro_compress::Backend`] and
+    /// [`ferro_compress::Algo`]. Use this when the call site knows the
+    /// column shape (e.g. typed-numeric postings → `Algo::Bitcomp`)
+    /// and/or wants GPU dispatch via `Backend::Auto`.
+    #[must_use]
+    pub fn with_backend(backend: ferro_compress::Backend, algo: ferro_compress::Algo) -> Self {
+        Self { backend, algo }
+    }
+
+    /// Convenience: Snappy on CPU. Same as [`Default::default`], named
+    /// for discoverability.
+    #[must_use]
+    pub fn snappy_cpu() -> Self {
+        Self::default()
+    }
+
+    /// Convenience: Bitcomp uint32 on whichever backend the supplied
+    /// [`ferro_compress::Backend`] resolves to. Phase 0 measured 3.59×
+    /// ratio / 366 GB/s decomp on `postings.bin` at this setting; the
+    /// CPU backend rejects Bitcomp explicitly (no CPU implementation),
+    /// so this constructor only succeeds at compress/decompress time
+    /// when called against a backend that can service the algorithm.
+    #[must_use]
+    pub fn bitcomp_uint32(backend: ferro_compress::Backend) -> Self {
+        Self {
+            backend,
+            algo: ferro_compress::Algo::for_postings_uint32(),
+        }
+    }
+}
 
 #[cfg(feature = "ferro-compress")]
 impl BitcompCodec for FerroBitcompCodec {
-    fn compress(&self, _raw_bitmap: &[u32]) -> Result<Vec<u8>, BitcompError> {
-        // Wave 6 wiring target:
-        //
-        //   use ferro_compress::nvcomp::{Backend, Algo, BitcompDataType};
-        //   let backend = Backend::auto();
-        //   let bytes: Vec<u8> = bytemuck::cast_slice(_raw_bitmap).to_vec();
-        //   backend.compress(&bytes, Algo::Bitcomp { data_type: BitcompDataType::Uint32 })
-        //
-        // Until the dep lands, returning the contract error makes
-        // misconfigurations visible at runtime.
-        Err(BitcompError::WaitingOnWave6)
+    fn compress(&self, raw_bitmap: &[u32]) -> Result<Vec<u8>, BitcompError> {
+        if raw_bitmap.len() != BITMAP_CONTAINER_WORDS {
+            return Err(BitcompError::LengthMismatch {
+                expected: BITMAP_CONTAINER_WORDS,
+                got: raw_bitmap.len(),
+            });
+        }
+        // Pack u32 words to LE bytes (codec sees a flat byte stream so
+        // round-trip is endian-stable across architectures). Snappy /
+        // LZ4 / zstd are byte-oriented and don't care; Bitcomp uses the
+        // typed-numeric hint passed to the codec for layout — for
+        // current 8 KiB Roaring containers we let `Backend::codec(algo)`
+        // surface that decision rather than hard-coding `Uint32` here.
+        let mut input_bytes = Vec::with_capacity(BITMAP_CONTAINER_WORDS * 4);
+        for &w in raw_bitmap {
+            input_bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        let codec = self
+            .backend
+            .codec(self.algo)
+            .map_err(|e| BitcompError::CodecFailure(format!("backend.codec failed: {e}")))?;
+        let mut out = Vec::with_capacity(codec.max_compressed_len(input_bytes.len()));
+        codec
+            .compress(&input_bytes, &mut out)
+            .map_err(|e| BitcompError::CodecFailure(format!("compress failed: {e}")))?;
+        Ok(out)
     }
 
     fn decompress(
         &self,
-        _compressed: &[u8],
-        _out: &mut [u32; BITMAP_CONTAINER_WORDS],
+        compressed: &[u8],
+        out: &mut [u32; BITMAP_CONTAINER_WORDS],
     ) -> Result<(), BitcompError> {
-        Err(BitcompError::WaitingOnWave6)
+        let codec = self
+            .backend
+            .codec(self.algo)
+            .map_err(|e| BitcompError::CodecFailure(format!("backend.codec failed: {e}")))?;
+        let mut decoded = Vec::with_capacity(BITMAP_CONTAINER_WORDS * 4);
+        codec
+            .decompress(compressed, &mut decoded)
+            .map_err(|e| BitcompError::CodecFailure(format!("decompress failed: {e}")))?;
+        if decoded.len() != BITMAP_CONTAINER_WORDS * 4 {
+            return Err(BitcompError::NotContainerSized { got: decoded.len() });
+        }
+        for i in 0..BITMAP_CONTAINER_WORDS {
+            let off = i * 4;
+            out[i] = u32::from_le_bytes([
+                decoded[off],
+                decoded[off + 1],
+                decoded[off + 2],
+                decoded[off + 3],
+            ]);
+        }
+        Ok(())
     }
 }
 
@@ -226,8 +325,9 @@ impl BitcompCodec for FerroBitcompCodec {
 /// Project-default codec.
 ///
 /// - With `ferro-compress` **off** (default): [`IdentityBitcompCodec`].
-/// - With `ferro-compress` **on**: [`FerroBitcompCodec`] (which still
-///   short-circuits to [`BitcompError::WaitingOnWave6`] until C-4).
+/// - With `ferro-compress` **on**: [`FerroBitcompCodec`] — Wave 6
+///   wired this to a real [`ferro_compress::Backend::cpu`] +
+///   [`ferro_compress::Algo::Snappy`] round-trip.
 #[cfg(not(feature = "ferro-compress"))]
 pub type DefaultBitcompCodec = IdentityBitcompCodec;
 
@@ -336,30 +436,95 @@ mod tests {
     #[cfg(feature = "ferro-compress")]
     #[test]
     fn default_codec_is_ferro_bitcomp_with_feature() {
-        // With the feature on, DefaultBitcompCodec aliases to
-        // FerroBitcompCodec, which currently short-circuits to
-        // BitcompError::WaitingOnWave6.
+        // Wave 6: with the feature on, DefaultBitcompCodec aliases to
+        // FerroBitcompCodec which now does a real ferro_compress
+        // round-trip (Snappy on CPU by default). Round-trip cleanly.
         let bm = make_container();
         let codec = DefaultBitcompCodec::default();
-        let res = compress_container(&bm, &codec);
-        assert_eq!(res, Err(BitcompError::WaitingOnWave6));
+        let bytes = compress_container(&bm, &codec).expect("compress should succeed");
+        let parsed = decompress_container(&bytes, &codec).expect("decompress should succeed");
+        assert_eq!(parsed, bm);
     }
 
     #[cfg(feature = "ferro-compress")]
     #[test]
-    fn ferro_codec_short_circuits_until_wave6() {
-        let codec = FerroBitcompCodec;
+    fn ferro_codec_round_trip_snappy_cpu() {
+        // Default constructor — Snappy on CPU. Round-trip clean.
+        let codec = FerroBitcompCodec::snappy_cpu();
         let bm = make_container();
-        let res = compress_container(&bm, &codec);
-        assert_eq!(res, Err(BitcompError::WaitingOnWave6));
+        let bytes = compress_container(&bm, &codec).expect("compress should succeed");
+        // Snappy compresses redundancy; for a sparsely-populated container
+        // we expect output strictly smaller than the raw 8 KiB.
+        assert!(
+            bytes.len() < BITMAP_CONTAINER_WORDS * 4,
+            "expected snappy to compress 8 KiB raw bitmap to < 8 KiB; got {} bytes",
+            bytes.len()
+        );
+        let parsed = decompress_container(&bytes, &codec).expect("decompress should succeed");
+        assert_eq!(parsed, bm);
     }
 
     #[cfg(feature = "ferro-compress")]
     #[test]
-    fn ferro_codec_decompress_short_circuits() {
-        let codec = FerroBitcompCodec;
+    fn ferro_codec_round_trip_zero_container() {
+        // All-zero bitmap is the worst-case for Snappy frame metadata
+        // overhead; round-trip must still be identity-correct.
+        let codec = FerroBitcompCodec::snappy_cpu();
+        let bm = BitmapContainer::new();
+        let bytes = compress_container(&bm, &codec).expect("compress should succeed");
+        let parsed = decompress_container(&bytes, &codec).expect("decompress should succeed");
+        assert_eq!(parsed, bm);
+    }
+
+    #[cfg(feature = "ferro-compress")]
+    #[test]
+    fn ferro_codec_round_trip_full_container() {
+        // Fully populated 65 536-bit container.
+        let mut bm = BitmapContainer::new();
+        for k in 0u32..65_536 {
+            bm.insert(k as u16);
+        }
+        let codec = FerroBitcompCodec::snappy_cpu();
+        let bytes = compress_container(&bm, &codec).expect("compress should succeed");
+        let parsed = decompress_container(&bytes, &codec).expect("decompress should succeed");
+        assert_eq!(parsed, bm);
+    }
+
+    #[cfg(feature = "ferro-compress")]
+    #[test]
+    fn ferro_codec_rejects_wrong_input_length() {
+        let codec = FerroBitcompCodec::snappy_cpu();
+        let res = codec.compress(&[0u32; 10]);
+        assert!(matches!(res, Err(BitcompError::LengthMismatch { .. })));
+    }
+
+    #[cfg(feature = "ferro-compress")]
+    #[test]
+    fn ferro_codec_decompress_rejects_corrupt_input() {
+        let codec = FerroBitcompCodec::snappy_cpu();
         let mut out = [0u32; BITMAP_CONTAINER_WORDS];
-        let res = codec.decompress(&[0u8; 4], &mut out);
-        assert_eq!(res, Err(BitcompError::WaitingOnWave6));
+        // Garbage Snappy frame.
+        let res = codec.decompress(&[0xFFu8; 16], &mut out);
+        assert!(matches!(res, Err(BitcompError::CodecFailure(_))));
+    }
+
+    #[cfg(feature = "ferro-compress")]
+    #[test]
+    fn ferro_codec_round_trip_random_words() {
+        // Deterministic xorshift fill — exercises codec on chaotic
+        // input where Snappy ratio is poor (literal-heavy frame).
+        let mut bm = BitmapContainer::new();
+        let mut state: u64 = 0xdead_beef_cafe_babe;
+        for _ in 0..3000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let key = (state as u32) % 65536;
+            bm.insert(key as u16);
+        }
+        let codec = FerroBitcompCodec::snappy_cpu();
+        let bytes = compress_container(&bm, &codec).expect("compress should succeed");
+        let parsed = decompress_container(&bytes, &codec).expect("decompress should succeed");
+        assert_eq!(parsed, bm);
     }
 }

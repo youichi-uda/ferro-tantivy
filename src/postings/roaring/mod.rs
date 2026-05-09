@@ -60,6 +60,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod ferro_compress_bridge;
 pub mod from_block_segment;
+pub mod gpu_dispatch;
 pub mod planner;
 
 pub use container::{
@@ -72,6 +73,9 @@ pub use ferro_compress_bridge::{
     IdentityBitcompCodec,
 };
 pub use from_block_segment::drain_block_segment_to_roaring;
+pub use gpu_dispatch::{
+    cpu_fallback_count, gpu_dispatch_count, reset_dispatch_counters, try_gpu_bool, BoolOp,
+};
 pub use planner::{should_dispatch_gpu, TermStat, MIN_CONTAINERS, MIN_RATIO};
 
 #[cfg(feature = "ferro-compress")]

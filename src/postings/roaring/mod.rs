@@ -60,6 +60,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod ferro_compress_bridge;
 pub mod from_block_segment;
+pub mod planner;
 
 pub use container::{
     ArrayContainer, BitmapContainer, Container, ContainerError, Run, RunContainer,
@@ -71,6 +72,7 @@ pub use ferro_compress_bridge::{
     IdentityBitcompCodec,
 };
 pub use from_block_segment::drain_block_segment_to_roaring;
+pub use planner::{should_dispatch_gpu, TermStat, MIN_CONTAINERS, MIN_RATIO};
 
 #[cfg(feature = "ferro-compress")]
 pub use ferro_compress_bridge::FerroBitcompCodec;

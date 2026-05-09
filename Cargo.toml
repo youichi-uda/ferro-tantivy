@@ -72,6 +72,12 @@ futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
 typetag = "0.2.21"
 tantivy-gpu = { version = "0.1.0", path = "./gpu", optional = true }
+# Phase 2 C-4 (Wave 6) — optional path dep on the FerroSearch ferro-compress
+# crate. Off by default so the OSS fork keeps building standalone with the
+# `IdentityBitcompCodec` passthrough; enabled it routes Roaring Bitmap
+# containers through `ferro_compress::Backend` (CPU snappy/lz4/zstd default,
+# GPU nvCOMP Bitcomp under `nvcomp` feature).
+ferro-compress = { version = "0.1.0", path = "../ferroSearchProjects/ferrosearch-gpu-compress/crates/ferro-compress", default-features = false, features = ["snappy"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -147,12 +153,13 @@ gpu = ["tantivy-gpu"]
 
 # Phase 2 C-3 (Wave 5) Roaring posting list — ferro-compress Bitcomp
 # bridge. Off by default: the OSS fork builds standalone with the
-# passthrough `IdentityBitcompCodec`. Wave 6 (C-4) will add the
-# `path = "../../ferrosearch-gpu-compress/crates/ferro-compress"`
-# dependency and replace the short-circuiting `FerroBitcompCodec`
-# placeholder; until then this feature gate lets downstream crates
-# opt into the trait abstraction surface without wiring the dep.
-ferro-compress = []
+# passthrough `IdentityBitcompCodec`. Phase 2 C-4 (Wave 6) wires the
+# real `path = "../ferroSearchProjects/ferrosearch-gpu-compress/crates/ferro-compress"`
+# dependency under this same feature flag, swapping the
+# short-circuiting `FerroBitcompCodec` placeholder for an actual
+# `ferro_compress::Backend` round-trip (CPU snappy by default; GPU
+# nvCOMP Bitcomp when ferro-compress is built with `nvcomp`).
+ferro-compress = ["dep:ferro-compress"]
 
 [workspace]
 members = [

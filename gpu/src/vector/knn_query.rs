@@ -149,6 +149,68 @@ pub fn binary_hamming_distances(
     kernel.compute(query_bits, corpus_bits, num_vecs, dim_bits)
 }
 
+/// API surface: compute the full Q × N Hamming-distance matrix for `Q`
+/// queries against `N` corpus vectors in one GPU dispatch.
+///
+/// Calls [`BinaryDistanceKernel::compute_batched`] under the hood; see
+/// that method's docs for the size limits and tile-shared-memory
+/// behaviour. The output is row-major: `result[q * num_vecs + n]` is
+/// the Hamming distance from query `q` to corpus vector `n`.
+///
+/// # Example
+/// ```ignore
+/// use tantivy_gpu::device::GpuContext;
+/// use tantivy_gpu::vector::knn_query::binary_hamming_distances_batched;
+/// use tantivy_gpu::vector::binary_distance::BinaryDistanceMetric;
+///
+/// let ctx = GpuContext::cpu_fallback();
+/// let dim_bits = 768;
+/// let dim_u32 = 24;
+/// let q = vec![0u32; 8 * dim_u32];     // 8 queries
+/// let c = vec![0u32; 1000 * dim_u32];  // 1000 corpus vectors
+/// let dists = binary_hamming_distances_batched(
+///     &ctx, &q, &c, 8, 1000, dim_bits, BinaryDistanceMetric::Hamming,
+/// ).unwrap();
+/// assert_eq!(dists.len(), 8 * 1000);
+/// ```
+pub fn binary_hamming_distances_batched(
+    ctx: &GpuContext,
+    queries_bits: &[u32],
+    corpus_bits: &[u32],
+    num_queries: usize,
+    num_vecs: usize,
+    dim_bits: usize,
+    metric: BinaryDistanceMetric,
+) -> GpuResult<Vec<u32>> {
+    let BinaryDistanceMetric::Hamming = metric;
+    let kernel = BinaryDistanceKernel::compile(ctx)?;
+    kernel.compute_batched(queries_bits, corpus_bits, num_queries, num_vecs, dim_bits)
+}
+
+/// API surface: end-to-end binary k-NN search — Q queries × N corpus →
+/// per-query top-K `(distance, corpus_id)` pairs sorted ascending by
+/// distance.
+///
+/// Wraps [`BinaryDistanceKernel::knn_search`]. Two GPU dispatches
+/// chained on-device: the batched distance kernel (Q × N) followed by a
+/// bitonic top-K reduction. Only `Q × K` 8-byte pairs cross PCIe back
+/// to host memory, regardless of N. `k` must be in `1..=1024`.
+#[allow(clippy::too_many_arguments)]
+pub fn binary_knn_search(
+    ctx: &GpuContext,
+    queries_bits: &[u32],
+    corpus_bits: &[u32],
+    num_queries: usize,
+    num_vecs: usize,
+    dim_bits: usize,
+    k: usize,
+    metric: BinaryDistanceMetric,
+) -> GpuResult<Vec<Vec<(u32, u32)>>> {
+    let BinaryDistanceMetric::Hamming = metric;
+    let kernel = BinaryDistanceKernel::compile(ctx)?;
+    kernel.knn_search(queries_bits, corpus_bits, num_queries, num_vecs, dim_bits, k)
+}
+
 /// Convert a raw distance to a relevance score (higher = more relevant).
 fn distance_to_score(distance: f32, metric: DistanceMetric) -> f32 {
     match metric {

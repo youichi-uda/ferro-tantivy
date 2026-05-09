@@ -37,7 +37,8 @@ pub mod knn_query;
 pub mod persistence;
 
 pub use binary_distance::{
-    dim_u32_for, hamming_distance_cpu, BinaryDistanceKernel, BinaryDistanceMetric,
+    dim_u32_for, hamming_distance_cpu, hamming_distances_batched_cpu, top_k_select_cpu,
+    BinaryDistanceKernel, BinaryDistanceMetric, BATCHED_MAX_DIM_U32, TOP_K_MAX_K_PADDED,
 };
 pub use distance::{DistanceMetric, GpuDistanceKernel};
 pub use field::VectorFieldOptions;

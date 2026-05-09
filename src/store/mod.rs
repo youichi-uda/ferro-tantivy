@@ -52,6 +52,9 @@ mod compression_lz4_block;
 #[cfg(feature = "zstd-compression")]
 mod compression_zstd_block;
 
+#[cfg(feature = "snappy-compression")]
+mod compression_snappy_block;
+
 #[cfg(test)]
 pub(crate) mod tests {
 

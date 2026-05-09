@@ -16,6 +16,13 @@ pub enum Compressor {
     /// Use the zstd compressor
     #[cfg(feature = "zstd-compression")]
     Zstd(ZstdCompressor),
+    /// Use the snappy compressor (raw block format).
+    /// Phase 0 ferro-compress measurements: 105-191 GB/s GPU decompression
+    /// (Snappy beats LZ4 ~2× on json_logs / silesia / postings / enwik9) and
+    /// 1.6-7.4 GB/s CPU decompression (comparable to LZ4). Recommended for
+    /// the Hot tier where read latency is decompression-bound.
+    #[cfg(feature = "snappy-compression")]
+    Snappy,
 }
 
 impl Serialize for Compressor {
@@ -29,6 +36,8 @@ impl Serialize for Compressor {
             Compressor::Lz4 => serializer.serialize_str("lz4"),
             #[cfg(feature = "zstd-compression")]
             Compressor::Zstd(zstd) => serializer.serialize_str(&zstd.ser_to_string()),
+            #[cfg(feature = "snappy-compression")]
+            Compressor::Snappy => serializer.serialize_str("snappy"),
         }
     }
 }
@@ -48,6 +57,13 @@ impl<'de> Deserialize<'de> for Compressor {
                 "lz4" => return Err(serde::de::Error::custom(
                     "unsupported variant `lz4`, please enable Tantivy's `lz4-compression` feature",
                 )),
+                #[cfg(feature = "snappy-compression")]
+                "snappy" => Compressor::Snappy,
+                #[cfg(not(feature = "snappy-compression"))]
+                "snappy" => return Err(serde::de::Error::custom(
+                    "unsupported variant `snappy`, please enable Tantivy's `snappy-compression` \
+                     feature",
+                )),
                 #[cfg(feature = "zstd-compression")]
                 _ if buf.starts_with("zstd") => Compressor::Zstd(
                     ZstdCompressor::deser_from_str(&buf).map_err(serde::de::Error::custom)?,
@@ -66,6 +82,8 @@ impl<'de> Deserialize<'de> for Compressor {
                             "none",
                             #[cfg(feature = "lz4-compression")]
                             "lz4",
+                            #[cfg(feature = "snappy-compression")]
+                            "snappy",
                             #[cfg(feature = "zstd-compression")]
                             "zstd",
                             #[cfg(feature = "zstd-compression")]
@@ -167,6 +185,8 @@ impl Compressor {
                 compressed,
                 _zstd_compressor.compression_level,
             ),
+            #[cfg(feature = "snappy-compression")]
+            Self::Snappy => super::compression_snappy_block::compress(uncompressed, compressed),
         }
     }
 }

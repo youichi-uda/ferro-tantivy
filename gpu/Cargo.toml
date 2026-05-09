@@ -38,6 +38,10 @@ harness = false
 name = "binary_distance"
 harness = false
 
+[[bench]]
+name = "hnsw_binary"
+harness = false
+
 [features]
 default = ["wgpu-backend"]
 wgpu-backend = ["wgpu", "pollster"]

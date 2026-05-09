@@ -29,6 +29,7 @@
 //! ```
 
 pub mod binary_distance;
+pub mod binary_hnsw;
 pub mod distance;
 pub mod field;
 pub mod gpu_cache;
@@ -40,6 +41,7 @@ pub use binary_distance::{
     dim_u32_for, hamming_distance_cpu, hamming_distances_batched_cpu, top_k_select_cpu,
     BinaryDistanceKernel, BinaryDistanceMetric, BATCHED_MAX_DIM_U32, TOP_K_MAX_K_PADDED,
 };
+pub use binary_hnsw::{brute_force_knn_cpu, BinaryHnswIndex};
 pub use distance::{DistanceMetric, GpuDistanceKernel};
 pub use field::VectorFieldOptions;
 pub use hnsw::HnswIndex;

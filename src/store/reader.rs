@@ -16,8 +16,8 @@ use crate::directory::FileSlice;
 use crate::error::DataCorruption;
 use crate::fastfield::AliveBitSet;
 use crate::schema::document::{
-    extract_field_bytes_from_doc, extract_field_bytes_range_from_doc, BinaryDocumentDeserializer,
-    DocumentDeserialize,
+    extract_field_bytes_from_doc, extract_field_bytes_range_from_doc,
+    extract_two_field_bytes_ranges_from_doc, BinaryDocumentDeserializer, DocumentDeserialize,
 };
 use crate::schema::Field;
 use crate::space_usage::StoreSpaceUsage;
@@ -90,7 +90,9 @@ impl BlockCache {
     fn lock_cache<'a>(
         cache: &'a Mutex<LruCache<usize, Block>>,
     ) -> std::sync::MutexGuard<'a, LruCache<usize, Block>> {
-        cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn get_from_cache(&self, pos: usize) -> Option<Block> {
@@ -378,6 +380,98 @@ impl StoreReader {
         results
     }
 
+    /// Block-grouped batch extraction of **two** stored fields per document.
+    ///
+    /// Wave 14 #B: scroll's per-page hot path needs both `_id` and `_source`
+    /// for every hit. Calling [`batch_get_field_owned_bytes_grouped`] twice
+    /// requires two passes over each doc body even when blocks are cached;
+    /// this variant captures both ranges in a single linear scan.
+    ///
+    /// `doc_ids` MUST be sorted ascending. Returns `(field_a_results,
+    /// field_b_results)`, each a `Vec<Option<OwnedBytes>>` of the same
+    /// length as `doc_ids` and in the same order. `None` entries indicate
+    /// the doc was missing the field, the block decompressed but the field
+    /// type was unexpected, or the entire block could not be read.
+    pub fn batch_get_two_fields_owned_bytes_grouped(
+        &self,
+        doc_ids: &[DocId],
+        field_a: Field,
+        field_b: Field,
+    ) -> (Vec<Option<OwnedBytes>>, Vec<Option<OwnedBytes>>) {
+        if doc_ids.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        debug_assert!(
+            doc_ids.windows(2).all(|w| w[0] <= w[1]),
+            "batch_get_two_fields_owned_bytes_grouped: doc_ids must be sorted ascending"
+        );
+        let mut results_a: Vec<Option<OwnedBytes>> = vec![None; doc_ids.len()];
+        let mut results_b: Vec<Option<OwnedBytes>> = vec![None; doc_ids.len()];
+        let mut checkpoints = self.block_checkpoints();
+        let mut current_cp: Option<Checkpoint> = checkpoints.next();
+        let mut current_block: Option<OwnedBytes> = None;
+
+        let mut idx = 0;
+        while idx < doc_ids.len() {
+            let doc_id = doc_ids[idx];
+
+            // Advance to the checkpoint covering this doc_id
+            while let Some(ref cp) = current_cp {
+                if doc_id < cp.doc_range.end {
+                    break;
+                }
+                current_cp = checkpoints.next();
+                current_block = None;
+            }
+            let Some(ref cp) = current_cp else { break };
+            if doc_id < cp.doc_range.start {
+                idx += 1;
+                continue;
+            }
+
+            if current_block.is_none() {
+                current_block = self.read_block(cp).ok();
+            }
+            if current_block.is_none() {
+                while idx < doc_ids.len() && doc_ids[idx] < cp.doc_range.end {
+                    idx += 1;
+                }
+                current_cp = checkpoints.next();
+                continue;
+            }
+            let block = current_block.as_ref().unwrap();
+
+            while idx < doc_ids.len() && doc_ids[idx] < cp.doc_range.end {
+                let did = doc_ids[idx];
+                if did >= cp.doc_range.start {
+                    let doc_pos = did - cp.doc_range.start;
+                    if let Ok(doc_range) = block_read_index(block, doc_pos) {
+                        let doc_slice = &block[doc_range.clone()];
+                        if let Ok((range_a, range_b)) = extract_two_field_bytes_ranges_from_doc(
+                            doc_slice,
+                            self.doc_store_version,
+                            field_a,
+                            field_b,
+                        ) {
+                            if let Some(r) = range_a {
+                                let abs_start = doc_range.start + r.start;
+                                let abs_end = doc_range.start + r.end;
+                                results_a[idx] = Some(block.slice(abs_start..abs_end));
+                            }
+                            if let Some(r) = range_b {
+                                let abs_start = doc_range.start + r.start;
+                                let abs_end = doc_range.start + r.end;
+                                results_b[idx] = Some(block.slice(abs_start..abs_end));
+                            }
+                        }
+                    }
+                }
+                idx += 1;
+            }
+        }
+        (results_a, results_b)
+    }
+
     /// Returns raw bytes of a given document.
     ///
     /// Calling `.get(doc)` is relatively costly as it requires
@@ -645,9 +739,7 @@ mod tests {
         use std::sync::Arc;
 
         let cache = Arc::new(BlockCache {
-            cache: Some(Mutex::new(LruCache::new(
-                NonZeroUsize::new(4).unwrap(),
-            ))),
+            cache: Some(Mutex::new(LruCache::new(NonZeroUsize::new(4).unwrap()))),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
         });
@@ -674,5 +766,146 @@ mod tests {
         cache.put_into_cache(7, OwnedBytes::new(b"world".to_vec()));
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.stats().num_entries, 2);
+    }
+
+    /// Wave 14 #B: `batch_get_two_fields_owned_bytes_grouped` must extract
+    /// both target fields in a single block-decompression pass and return
+    /// the values in input order.
+    #[test]
+    fn test_batch_get_two_fields_owned_bytes_grouped() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let path = Path::new("store");
+        let writer = directory.open_write(path)?;
+        // 500 docs with body + title fields.
+        let schema = write_lorem_ipsum_store(writer, 500, Compressor::None, BLOCK_SIZE, true);
+        let title = schema.get_field("title").unwrap();
+        let body = schema.get_field("body").unwrap();
+        let store_file = directory.open_read(path)?;
+        let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;
+
+        // Sample 25 doc ids in ascending order across the corpus, to exercise
+        // multi-block traversal.
+        let doc_ids: Vec<DocId> = (0..500u32).step_by(20).collect();
+        assert_eq!(doc_ids.len(), 25);
+
+        let (title_results, body_results) =
+            store.batch_get_two_fields_owned_bytes_grouped(&doc_ids, title, body);
+
+        assert_eq!(title_results.len(), 25);
+        assert_eq!(body_results.len(), 25);
+        for (i, &doc_id) in doc_ids.iter().enumerate() {
+            let title_bytes = title_results[i]
+                .as_ref()
+                .expect("title must be present for every doc");
+            let title_str = std::str::from_utf8(title_bytes).expect("utf8");
+            assert_eq!(title_str, format!("Doc {doc_id}"));
+
+            let body_bytes = body_results[i]
+                .as_ref()
+                .expect("body must be present for every doc");
+            assert!(!body_bytes.is_empty(), "body must be non-empty");
+            // body starts with "Doc Lorem ipsum"
+            let body_str = std::str::from_utf8(body_bytes).expect("utf8");
+            assert!(body_str.starts_with("Doc Lorem ipsum"));
+        }
+        Ok(())
+    }
+
+    /// Wave 14 #B: equivalence — two-field grouped extraction must produce
+    /// identical bytes to two separate one-field extractions.
+    #[test]
+    fn test_batch_get_two_fields_matches_one_field_calls() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let path = Path::new("store");
+        let writer = directory.open_write(path)?;
+        let schema = write_lorem_ipsum_store(writer, 200, Compressor::None, BLOCK_SIZE, true);
+        let title = schema.get_field("title").unwrap();
+        let body = schema.get_field("body").unwrap();
+        let store_file = directory.open_read(path)?;
+        let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;
+
+        let doc_ids: Vec<DocId> = (0..200u32).step_by(7).collect();
+        let titles_separate = store.batch_get_field_owned_bytes_grouped(&doc_ids, title);
+        let bodies_separate = store.batch_get_field_owned_bytes_grouped(&doc_ids, body);
+        let (titles_combined, bodies_combined) =
+            store.batch_get_two_fields_owned_bytes_grouped(&doc_ids, title, body);
+
+        assert_eq!(titles_separate.len(), titles_combined.len());
+        for i in 0..titles_separate.len() {
+            assert_eq!(
+                titles_separate[i].as_ref().map(|b| b.as_slice()),
+                titles_combined[i].as_ref().map(|b| b.as_slice()),
+                "title bytes diverged at i={i}"
+            );
+            assert_eq!(
+                bodies_separate[i].as_ref().map(|b| b.as_slice()),
+                bodies_combined[i].as_ref().map(|b| b.as_slice()),
+                "body bytes diverged at i={i}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Wave 14 #B: empty input returns empty vectors.
+    #[test]
+    fn test_batch_get_two_fields_empty_input() -> crate::Result<()> {
+        let directory = RamDirectory::create();
+        let path = Path::new("store");
+        let writer = directory.open_write(path)?;
+        let schema = write_lorem_ipsum_store(writer, 10, Compressor::None, BLOCK_SIZE, true);
+        let title = schema.get_field("title").unwrap();
+        let body = schema.get_field("body").unwrap();
+        let store_file = directory.open_read(path)?;
+        let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;
+
+        let (a, b) = store.batch_get_two_fields_owned_bytes_grouped(&[], title, body);
+        assert!(a.is_empty());
+        assert!(b.is_empty());
+        Ok(())
+    }
+
+    /// Wave 14 #B: doc-body parser correctly captures both fields even when
+    /// they appear in either order in the binary doc.
+    #[test]
+    fn test_extract_two_fields_field_order_independent() -> crate::Result<()> {
+        use crate::schema::document::extract_two_field_bytes_ranges_from_doc;
+        use crate::store::DocStoreVersion;
+
+        let directory = RamDirectory::create();
+        let path = Path::new("store");
+        let writer = directory.open_write(path)?;
+        // Use the standard write_lorem_ipsum_store which writes body before title.
+        let schema = write_lorem_ipsum_store(writer, 5, Compressor::None, BLOCK_SIZE, true);
+        let title = schema.get_field("title").unwrap();
+        let body = schema.get_field("body").unwrap();
+        let store_file = directory.open_read(path)?;
+        let store = StoreReader::open(store_file, DOCSTORE_CACHE_CAPACITY)?;
+
+        // Read raw doc 2 bytes directly from a block.
+        let doc_id: DocId = 2;
+        let cp = store.block_checkpoint(doc_id)?;
+        let block = store.read_block(&cp)?;
+        let doc_pos = doc_id - cp.doc_range.start;
+        let doc_range = block_read_index(&block, doc_pos)?;
+        let doc_slice = &block[doc_range];
+
+        // Forward order (body, title)
+        let (a, b) =
+            extract_two_field_bytes_ranges_from_doc(doc_slice, DocStoreVersion::V2, body, title)
+                .expect("extract ok");
+        assert!(a.is_some(), "body must be found");
+        assert!(b.is_some(), "title must be found");
+
+        // Reverse order (title, body) — the function is order-independent.
+        let (a2, b2) =
+            extract_two_field_bytes_ranges_from_doc(doc_slice, DocStoreVersion::V2, title, body)
+                .expect("extract ok");
+        assert!(a2.is_some(), "title must be found");
+        assert!(b2.is_some(), "body must be found");
+
+        // The bytes captured are the same regardless of argument order.
+        assert_eq!(a.unwrap(), b2.unwrap());
+        assert_eq!(b.unwrap(), a2.unwrap());
+        Ok(())
     }
 }

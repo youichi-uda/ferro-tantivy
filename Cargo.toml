@@ -212,3 +212,7 @@ harness = false
 [[bench]]
 name = "multithread_executor"
 harness = false
+
+[[bench]]
+name = "sort_simd"
+harness = false

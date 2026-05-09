@@ -258,6 +258,18 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
     /// (the block size the query iterator hands us), but we read whatever the
     /// caller actually delivers — `for_each_no_score` may pass a final
     /// short block at the segment tail.
+    ///
+    /// **Wave 14 — SIMD top-K threshold filter.**  When the warm cache is
+    /// available, the heap-full threshold is set, and the block delivered by
+    /// `for_each_no_score` is contiguous (`docs[i] == docs[0] + i`, which is
+    /// the common case for AllQuery / match_all / range scans), we run a
+    /// SIMD greater-than/less-than filter against the threshold and **only
+    /// push the survivors** into the heap.  This skips the generic
+    /// `Comparator<Option<u64>>` dispatch on the 99%+ of docs that fail the
+    /// threshold check after the heap fills up — exactly the pattern that
+    /// gives ES Lucene's `NumericComparator` its 3–8× lead on
+    /// http_logs `desc/asc-sort-*-after-force-merge-1-seg`.  See
+    /// [`super::simd_top_k`] for the SIMD kernel and the correctness oracle.
     #[inline]
     fn compute_block_sort_keys_and_collect<C: Comparator<Self::SegmentSortKey>>(
         &mut self,
@@ -266,6 +278,70 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
     ) {
         // Fast path: warm cache covers everything, no first_vals needed.
         if let Some(buf) = self.warm_first_vals.as_ref() {
+            // Wave 14 SIMD top-K filter — only viable when:
+            //   1. block is contiguous (no gather needed),
+            //   2. block is reasonably large (amortise SIMD setup),
+            //   3. threshold is established (heap full),
+            //   4. cursor is absent (cursor variant is in
+            //      sort_by_static_fast_value_with_cursor.rs).
+            //
+            // We probe the comparator once with two known values to detect
+            // asc vs desc semantics — the segment-level threshold/sort-key
+            // is `Option<u64>` and the comparator's "Greater" semantics
+            // determine which docs survive.
+            let n = docs.len();
+            if self.cursor_u64.is_none()
+                && n >= 16
+                && top_n_computer.threshold.is_some()
+                && super::simd_top_k::is_contiguous_block(docs)
+            {
+                let start = docs[0] as usize;
+                if start + n <= buf.len() {
+                    if let Some(threshold) =
+                        super::simd_top_k::unwrap_threshold(&top_n_computer.threshold)
+                    {
+                        let order =
+                            super::simd_top_k::detect_order(top_n_computer.comparator_ref());
+                        let slice = &buf[start..start + n];
+                        let mask = match order {
+                            super::simd_top_k::DetectedOrder::Desc => {
+                                super::simd_top_k::simd_filter_block_gt_u64(slice, threshold, n)
+                            }
+                            super::simd_top_k::DetectedOrder::Asc => {
+                                super::simd_top_k::simd_filter_block_lt_u64(slice, threshold, n)
+                            }
+                            super::simd_top_k::DetectedOrder::Unknown => {
+                                // Fall back to scalar — comparator we can't classify
+                                // (e.g. user-supplied custom).  Push everything.
+                                u64::MAX
+                            }
+                        };
+                        if order != super::simd_top_k::DetectedOrder::Unknown {
+                            // Top-K block-level early termination: when the
+                            // entire block fails the threshold, skip the
+                            // per-doc loop entirely.  `count_ones() == 0` ⇒
+                            // no survivors ⇒ skip block.
+                            if mask == 0 {
+                                return;
+                            }
+                            // Iterate only set bits — survivors.
+                            let docs_start = docs[0];
+                            let mut m = mask;
+                            while m != 0 {
+                                let i = m.trailing_zeros() as usize;
+                                m &= m - 1;
+                                let val = slice[i];
+                                let doc = docs_start + i as u32;
+                                top_n_computer.push(Some(val), doc);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Slow path: scalar per-doc loop (cursor present, threshold not
+            // set, non-contiguous block, or unknown comparator).
             for &doc in docs {
                 // SAFETY: doc < num_docs == buf.len() (see `first_value`).
                 let val = unsafe {

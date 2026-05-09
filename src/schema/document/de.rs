@@ -248,6 +248,100 @@ pub(crate) fn extract_field_bytes_range_from_doc(
     Ok(None)
 }
 
+/// Zero-copy variant of [`extract_field_bytes_range_from_doc`] that extracts
+/// **two** target fields in a single linear scan over the document body.
+///
+/// Wave 14 #B: scroll's per-page hot path needs both `_id` and `_source` for
+/// every hit. The single-field variant is called twice (or `_id` is read via
+/// SSTable while `_source` is read via DocStore), forcing two passes over the
+/// same doc bytes. This function walks the doc once, capturing both ranges
+/// during the same field scan. Saves ~50% of doc-body parse work for the
+/// scroll fast path which doesn't need any other stored fields.
+///
+/// Returns `Ok((id_range, source_range))` where each is `Some(Range)` when
+/// the corresponding field was found as a BYTES_CODE/TEXT_CODE entry,
+/// otherwise `None`. The function returns early once **both** ranges are
+/// captured to skip remaining fields.
+pub(crate) fn extract_two_field_bytes_ranges_from_doc(
+    data: &[u8],
+    doc_store_version: DocStoreVersion,
+    field_a: Field,
+    field_b: Field,
+) -> Result<
+    (
+        Option<std::ops::Range<usize>>,
+        Option<std::ops::Range<usize>>,
+    ),
+    DeserializeError,
+> {
+    let mut cursor = 0usize;
+
+    let (num_fields, consumed) = read_vint_from_slice(&data[cursor..])?;
+    cursor += consumed;
+
+    let mut range_a: Option<std::ops::Range<usize>> = None;
+    let mut range_b: Option<std::ops::Range<usize>> = None;
+
+    for _ in 0..num_fields {
+        if cursor + 4 > data.len() {
+            return Err(DeserializeError::from(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected eof reading field id (two-field)",
+            )));
+        }
+        let field_val = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+        let field = Field::from_field_id(field_val);
+        cursor += 4;
+
+        if cursor >= data.len() {
+            return Err(DeserializeError::from(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected eof reading type code (two-field)",
+            )));
+        }
+        let type_code = data[cursor];
+        cursor += 1;
+
+        let is_target_a = field == field_a && range_a.is_none();
+        let is_target_b = field == field_b && range_b.is_none();
+
+        if is_target_a || is_target_b {
+            match type_code {
+                type_codes::BYTES_CODE | type_codes::TEXT_CODE => {
+                    let (len, consumed) = read_vint_from_slice(&data[cursor..])?;
+                    cursor += consumed;
+                    let len = len as usize;
+                    if cursor + len > data.len() {
+                        return Err(DeserializeError::from(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected eof reading field bytes (two-field)",
+                        )));
+                    }
+                    let r = cursor..cursor + len;
+                    if is_target_a {
+                        range_a = Some(r);
+                    } else {
+                        range_b = Some(r);
+                    }
+                    cursor += len;
+
+                    // Early exit: both fields captured, no need to scan rest.
+                    if range_a.is_some() && range_b.is_some() {
+                        return Ok((range_a, range_b));
+                    }
+                }
+                _ => {
+                    // Wrong type for an _id/_source extraction — skip silently.
+                    cursor = skip_value_in_slice(data, cursor, type_code, doc_store_version)?;
+                }
+            }
+        } else {
+            cursor = skip_value_in_slice(data, cursor, type_code, doc_store_version)?;
+        }
+    }
+    Ok((range_a, range_b))
+}
+
 /// Read a VInt from a byte slice, returning (value, bytes_consumed).
 ///
 /// Tantivy VInt convention: continuation bytes have MSB CLEAR (< 128),

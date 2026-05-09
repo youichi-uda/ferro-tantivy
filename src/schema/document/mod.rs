@@ -169,7 +169,10 @@ mod value;
 use std::collections::BTreeMap;
 use std::mem;
 
-pub(crate) use self::de::{BinaryDocumentDeserializer, extract_field_bytes_from_doc, extract_field_bytes_range_from_doc};
+pub(crate) use self::de::{
+    extract_field_bytes_from_doc, extract_field_bytes_range_from_doc,
+    extract_two_field_bytes_ranges_from_doc, BinaryDocumentDeserializer,
+};
 pub use self::de::{
     ArrayAccess, DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess,
     ValueDeserialize, ValueDeserializer, ValueType, ValueVisitor,

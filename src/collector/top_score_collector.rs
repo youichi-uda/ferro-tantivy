@@ -538,7 +538,7 @@ pub struct TopNComputer<Score, D, C> {
     buffer: Vec<ComparableDoc<Score, D>>,
     top_n: usize,
     pub(crate) threshold: Option<Score>,
-    comparator: C,
+    pub(crate) comparator: C,
 }
 
 // Intermediate struct for TopNComputer for deserialization, to keep vec capacity
@@ -628,6 +628,14 @@ where
     TSortKey: Clone,
     C: Comparator<TSortKey>,
 {
+    /// Borrow the comparator.  Used by Wave 14 SIMD top-K dispatch in
+    /// `SortByFastValueSegmentSortKeyComputer::compute_block_sort_keys_and_collect`
+    /// to probe asc/desc semantics.
+    #[inline]
+    pub(crate) fn comparator_ref(&self) -> &C {
+        &self.comparator
+    }
+
     /// Create a new `TopNComputer`.
     /// Internally it will allocate a buffer of size `2 * top_n`.
     pub fn new_with_comparator(top_n: usize, comparator: C) -> Self {

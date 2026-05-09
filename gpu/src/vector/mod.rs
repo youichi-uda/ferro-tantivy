@@ -28,6 +28,7 @@
 //! └──────────────────────────────────────────────┘
 //! ```
 
+pub mod binary_distance;
 pub mod distance;
 pub mod field;
 pub mod gpu_cache;
@@ -35,6 +36,9 @@ pub mod hnsw;
 pub mod knn_query;
 pub mod persistence;
 
+pub use binary_distance::{
+    dim_u32_for, hamming_distance_cpu, BinaryDistanceKernel, BinaryDistanceMetric,
+};
 pub use distance::{DistanceMetric, GpuDistanceKernel};
 pub use field::VectorFieldOptions;
 pub use hnsw::HnswIndex;

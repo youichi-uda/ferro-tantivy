@@ -5,6 +5,8 @@
 
 use crate::device::GpuContext;
 use crate::error::GpuResult;
+use crate::kernel::GpuKernel;
+use crate::vector::binary_distance::{BinaryDistanceKernel, BinaryDistanceMetric};
 use crate::vector::distance::DistanceMetric;
 use crate::vector::hnsw::HnswIndex;
 
@@ -105,6 +107,48 @@ impl KnnQuery {
     }
 }
 
+/// API surface: compute Hamming distances between a bit-packed query and
+/// a batch of bit-packed corpus vectors, using the GPU
+/// [`BinaryDistanceKernel`].
+///
+/// This is the foundation entry point for BBQ (Binary Block Quantization)
+/// kNN — it returns the **full distance vector** (one `u32` per corpus
+/// vector) rather than top-K. Top-K reduction and full HNSW-with-binary
+/// integration are deferred to a later phase; the goal of this entry
+/// point is to expose a callable API surface from the kNN query
+/// namespace so that downstream callers can build pipelines now.
+///
+/// The supplied `metric` is currently always
+/// [`BinaryDistanceMetric::Hamming`]; the parameter is reserved for
+/// future variants (Jaccard, weighted Hamming).
+///
+/// # Example
+/// ```ignore
+/// use tantivy_gpu::device::GpuContext;
+/// use tantivy_gpu::vector::knn_query::binary_hamming_distances;
+/// use tantivy_gpu::vector::binary_distance::BinaryDistanceMetric;
+///
+/// let ctx = GpuContext::cpu_fallback();
+/// let q = vec![0xAAAAAAAA_u32; 24];           // 768-bit query
+/// let c = vec![0u32; 1000 * 24];               // 1000 corpus vectors
+/// let dists = binary_hamming_distances(
+///     &ctx, &q, &c, 1000, 768, BinaryDistanceMetric::Hamming,
+/// ).unwrap();
+/// assert_eq!(dists.len(), 1000);
+/// ```
+pub fn binary_hamming_distances(
+    ctx: &GpuContext,
+    query_bits: &[u32],
+    corpus_bits: &[u32],
+    num_vecs: usize,
+    dim_bits: usize,
+    metric: BinaryDistanceMetric,
+) -> GpuResult<Vec<u32>> {
+    let BinaryDistanceMetric::Hamming = metric;
+    let kernel = BinaryDistanceKernel::compile(ctx)?;
+    kernel.compute(query_bits, corpus_bits, num_vecs, dim_bits)
+}
+
 /// Convert a raw distance to a relevance score (higher = more relevant).
 fn distance_to_score(distance: f32, metric: DistanceMetric) -> f32 {
     match metric {
@@ -163,6 +207,37 @@ mod tests {
             "score should be ~1.0: {}",
             results[0].score
         );
+    }
+
+    #[test]
+    fn test_binary_hamming_distances_api() {
+        // Smoke test: API surface from knn_query into BinaryDistanceKernel
+        // works on the CPU-fallback device.
+        let ctx = GpuContext::cpu_fallback();
+        let dim_bits = 64;
+        let dim_u32 = 2;
+        let num_vecs = 4;
+        let query: Vec<u32> = vec![0xFFFF_FFFF, 0x0000_0000];
+        // corpus[0] == query → dist 0
+        // corpus[1] == NOT(query) → dist 64 (32 + 32)
+        // corpus[2] == 0 0 → dist 32 (only first word differs)
+        // corpus[3] == query → dist 0
+        let corpus: Vec<u32> = vec![
+            0xFFFF_FFFF, 0x0000_0000, 0x0000_0000, 0xFFFF_FFFF, 0x0000_0000, 0x0000_0000,
+            0xFFFF_FFFF, 0x0000_0000,
+        ];
+        let dists = binary_hamming_distances(
+            &ctx,
+            &query,
+            &corpus,
+            num_vecs,
+            dim_bits,
+            BinaryDistanceMetric::Hamming,
+        )
+        .expect("compute");
+        assert_eq!(dists, vec![0, 64, 32, 0]);
+        // Suppress dead_code on dim_u32 — used only for documentation parity.
+        let _ = dim_u32;
     }
 
     #[test]

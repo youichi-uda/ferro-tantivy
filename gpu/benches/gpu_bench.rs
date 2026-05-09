@@ -18,7 +18,6 @@ use tantivy_gpu::device::GpuContext;
 use tantivy_gpu::kernel::bm25::Bm25Kernel;
 use tantivy_gpu::kernel::histogram::HistogramParams;
 use tantivy_gpu::kernel::{GpuKernel, HistogramKernel, StatsKernel};
-use tantivy_gpu::scorer::GpuBm25Weight;
 use tantivy_gpu::vector::distance::DistanceMetric;
 use tantivy_gpu::vector::hnsw::HnswIndex;
 
@@ -44,6 +43,7 @@ fn cpu_stats_f32(values: &[f32]) -> (u32, f32, f32, f32) {
 }
 
 /// CPU stats baseline in f64 (Tantivy's actual precision).
+#[allow(dead_code)]
 fn cpu_stats_f64(values: &[f32]) -> (u32, f64, f64, f64) {
     let mut count = 0u32;
     let mut sum = 0.0f64;
@@ -158,13 +158,13 @@ fn main() {
         let start = std::time::Instant::now();
         for _ in 0..20 {
             let mut scores = Vec::with_capacity(n);
-            for i in 0..n {
+            for (i, &tf) in term_freqs.iter().enumerate() {
                 scores.push(cpu_bm25_score(
                     2.5,
                     1.2,
                     0.75,
                     120.0,
-                    term_freqs[i],
+                    tf,
                     (i % 40) as f32,
                 ));
             }

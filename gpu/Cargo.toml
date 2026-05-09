@@ -34,6 +34,10 @@ rand = "0.9"
 name = "gpu_bench"
 harness = false
 
+[[bench]]
+name = "binary_distance"
+harness = false
+
 [features]
 default = ["wgpu-backend"]
 wgpu-backend = ["wgpu", "pollster"]

@@ -26,6 +26,7 @@ pub fn dispatch_cpu_kernel(
         "histogram_bucket" => dispatch_histogram_bucket(bind_groups, workgroups, buffers),
         "bm25_score" => dispatch_bm25_score(bind_groups, workgroups, buffers),
         "compute_distances" => dispatch_compute_distances(bind_groups, workgroups, buffers),
+        "xor_popcount" => dispatch_xor_popcount(bind_groups, workgroups, buffers),
         _ => Err(GpuError::CpuFallback {
             reason: format!("Unknown kernel entry point: {entry_point}"),
         }),
@@ -319,6 +320,51 @@ fn dispatch_compute_distances(
         };
 
         output.extend_from_slice(&distance.to_le_bytes());
+    }
+
+    write_buf(buffers, bg.buffer_ids[2], &output)?;
+    Ok(())
+}
+
+/// CPU implementation of xor_popcount (binary Hamming distance) kernel.
+///
+/// Mirrors `gpu/src/shaders/xor_popcount.wgsl` byte-for-byte:
+///   binding 0: query u32 array (dim_u32 words)
+///   binding 1: corpus u32 array (num_vecs * dim_u32 words)
+///   binding 2: dists u32 array (num_vecs)
+///   binding 3: uniform Params {num_vecs, dim_u32}
+fn dispatch_xor_popcount(
+    bind_groups: &[GpuBindGroupRaw],
+    _workgroups: (u32, u32, u32),
+    buffers: &Mutex<HashMap<u64, Arc<Mutex<Vec<u8>>>>>,
+) -> GpuResult<()> {
+    if bind_groups.is_empty() || bind_groups[0].buffer_ids.len() < 4 {
+        return Err(GpuError::Dispatch(
+            "xor_popcount: expected 4 buffers in bind group 0".to_string(),
+        ));
+    }
+
+    let bg = &bind_groups[0];
+    let query_data = read_buf(buffers, bg.buffer_ids[0])?;
+    let corpus_data = read_buf(buffers, bg.buffer_ids[1])?;
+    let params_data = read_buf(buffers, bg.buffer_ids[3])?;
+
+    let num_vecs = read_u32_at(&params_data, 0)? as usize;
+    let dim_u32 = read_u32_at(&params_data, 4)? as usize;
+
+    let query: Vec<u32> = (0..dim_u32)
+        .map(|i| read_u32_at(&query_data, i * 4))
+        .collect::<GpuResult<_>>()?;
+
+    let mut output = Vec::with_capacity(num_vecs * 4);
+    for v in 0..num_vecs {
+        let base = v * dim_u32;
+        let mut sum: u32 = 0;
+        for (i, &q) in query.iter().enumerate() {
+            let c = read_u32_at(&corpus_data, (base + i) * 4)?;
+            sum = sum.wrapping_add((q ^ c).count_ones());
+        }
+        output.extend_from_slice(&sum.to_le_bytes());
     }
 
     write_buf(buffers, bg.buffer_ids[2], &output)?;

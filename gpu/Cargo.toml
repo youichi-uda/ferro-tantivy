@@ -42,6 +42,10 @@ harness = false
 name = "hnsw_binary"
 harness = false
 
+[[bench]]
+name = "bitmap_op"
+harness = false
+
 [features]
 default = ["wgpu-backend"]
 wgpu-backend = ["wgpu", "pollster"]

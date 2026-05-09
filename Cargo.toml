@@ -77,6 +77,21 @@ tantivy-gpu = { version = "0.1.0", path = "./gpu", optional = true }
 # `IdentityBitcompCodec` passthrough; enabled it routes Roaring Bitmap
 # containers through `ferro_compress::Backend` (CPU snappy/lz4/zstd default,
 # GPU nvCOMP Bitcomp under `nvcomp` feature).
+#
+# Path resolution caveat: Cargo resolves path-deps relative to the *literal
+# discovery* of the Cargo.toml, **not** the realpath. When this fork is
+# consumed via the symlink `<ferrosearch>/vendor/tantivy-local`, the same
+# relative path fails to resolve (cargo treats `vendor/tantivy-local` as a
+# literal child of `<ferrosearch>/vendor/`, so `../ferroSearchProjects/...`
+# escapes to `<ferrosearch>/vendor/ferroSearchProjects/...` which doesn't
+# exist). The relative path below works for the standalone tantivy build
+# (`/home/y1/git/tantivy-gpu-compress`), which is what the Wave 6 acceptance
+# step `cargo check --features ferro-compress` runs in. ferrosearch leaves
+# the feature off; ferrosearch can still use the wave's IdentityBitcompCodec
+# passthrough surface on the no-feature path. A future wave that resolves
+# the symlink path-dep limitation (likely via cargo `[patch]` or by moving
+# ferro-compress into a shared parent workspace) can enable the feature on
+# the ferrosearch side.
 ferro-compress = { version = "0.1.0", path = "../ferroSearchProjects/ferrosearch-gpu-compress/crates/ferro-compress", default-features = false, features = ["snappy"], optional = true }
 
 [target.'cfg(windows)'.dependencies]

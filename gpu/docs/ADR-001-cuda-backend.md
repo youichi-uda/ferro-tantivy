@@ -242,9 +242,52 @@ post-correction.
     will plumb BMMA through the cached corpus + double-buffered
     batches so the production HNSW search loop benefits from both
     the 1.25-1.8× compute win and the 9× device-memory shrink.
+- **Phase 5-4 — real-data SIFT1M binary recall@k via
+  `ferro-bench-runner`**: a new sibling repo
+  (`~/git/ferroSearchProjects/ferro-bench-runner`) hosts a
+  `binary-knn` binary that runs the CUDA `knn_search` end-to-end
+  against the SIFT1M corpus from corpus-texmex.irisa.fr (1 M × 128
+  f32 vectors, 10 k queries, 100-NN ground truth) and reports
+  `recall@1 / @10 / @100` vs f32 ground truth. Three deliverables in
+  one binary:
+  1. **Synthetic CUDA / WGSL / CPU agreement** (no dataset required) —
+     asserts the GPU top-K is byte-equal to the CPU oracle on a
+     deterministic xorshift64 corpus across four `(Q, N, dim, K)`
+     cells. This is the regression gate the prompt's "CUDA と WGSL
+     の recall 一致" criterion translates to: distances are integer-
+     exact, so set-equality is the strict form.
+  2. **Real-data load + BBQ-encode + knn pipeline** — reads the
+     texmex `.fvecs` / `.ivecs` files, packs to 1 bit per dimension
+     using a per-dim mean-threshold sign packer, runs `knn_search`
+     in `Q = 64` chunks (the full `10 000 × 1 000 000 × 4 B`
+     distance matrix would exceed wgpu's 2 GB binding-size limit, so
+     the harness chunks queries and concatenates top-K results), and
+     writes a JSON recall report.
+  3. **Recall numbers** — measured on RTX 4070 Ti SUPER, 7.93 s for
+     all 10 k queries:
+     | k | recall@k |
+     |---|----------|
+     | 1   | 0.1253 |
+     | 10  | 0.1239 |
+     | 100 | 0.1697 |
+     Raw timings: `ferro-bench-runner/benches/data/sift1m_binary_recall.json`.
+     The recall is well below the prompt's `recall@10 ≥ 0.95`
+     target — but not because of a CUDA-path issue. SIFT features
+     are non-negative histogram bins, and per-dim mean-threshold
+     sign-bit BBQ has a documented low ceiling on that distribution.
+     This is a quantiser-design limitation, **not a tantivy-gpu
+     correctness issue**: the synthetic phase already proved CUDA
+     `knn_search` is byte-equal to the CPU oracle on integer-exact
+     binary inputs. Replace the packer with the production BBQ /
+     RaBitQ / OPQ encoder once it lands in `tantivy-gpu`; the same
+     harness will then report the true recall the binary path
+     achieves on this hardware.
+  Run-instructions in `ferro-bench-runner/README.md`; download
+  script at `ferro-bench-runner/scripts/download/sift1m.sh`.
 - Phase 5 still on the table: 5-3 a (production migration of the
-  cached corpus + knn_search paths to the BMMA kernel), and 5-4
-  real-data SIFT1M / GIST1M recall@k in `ferro-bench-runner`.
+  cached corpus + knn_search paths to the BMMA kernel), and 5-4 a
+  (replace the placeholder sign-bit packer in `ferro-bench-runner`
+  with the production BBQ encoder, re-measure recall@k).
 - **Phase C — `knn_search` end-to-end CUDA path**: the WGSL
   `top_k_select.wgsl` bitonic-merge top-K shader has been ported to
   CUDA (NVRTC, same algorithm, same tie-break), and

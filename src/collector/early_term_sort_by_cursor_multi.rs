@@ -622,16 +622,65 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
         // mirrors `convert_segment_sort_key`'s buffer reuse on
         // `SortByString` to avoid per-hit allocation.
         let mut decode_scratch: Vec<u8> = Vec::with_capacity(32);
+        // **Wave 18-6 — exact tie-group score ordering.**
+        //
+        // Pre-Wave-18-6 the harvest pushed each matched doc straight
+        // into `hits` and broke as soon as `hits.len() >= limit`.
+        // Wave 18-4 documented this as an "ES Lucene
+        // `IndexSortByField` + secondary score" approximation: when
+        // the primary tie group spans more docs than the cursor's
+        // emit window, the per-segment slice could miss a higher-
+        // score doc whose cursor index sat past `limit`.  Cross-
+        // segment merge then locked in the wrong tie-break order.
+        //
+        // Wave 18-6 fixes the approximation by buffering each tie
+        // group (rows sharing the same cursor-recorded primary
+        // tuple) until the cursor crosses a primary boundary.  At
+        // the boundary we sort the buffer by the full lex order
+        // (including the trailing score slot when scoring is on)
+        // and only then push to `hits`.  The early break stays at
+        // the **boundary**: once `hits.len() >= limit` AND the
+        // current tie group has been flushed, subsequent groups
+        // have a strictly worse primary in the cursor's recorded
+        // order so they can't influence the global top-K.
+        //
+        // When scoring is off the buffer-then-sort is a no-op
+        // (within a tie group `compare_hits_multi` reduces to
+        // `(segment_ord, doc_id)` which already matches the
+        // cursor's stored order), so existing Wave 18-1 / 18-3
+        // callers see no behavioural change.
+        //
+        // Buffer size is bounded by the largest primary tie group
+        // in the segment (typically tiny for high-cardinality
+        // primaries like `@timestamp`).  Pathological case: a query
+        // whose entire result set shares a single primary value —
+        // the buffer grows to N matched docs.  That is the cost of
+        // exact tie-break correctness; callers who can't afford it
+        // should not configure score as a sort tail.
+        let mut buffer: Vec<(Vec<CursorSortVal>, DocAddress)> = Vec::new();
+        // Tie-group key: the cursor-recorded primary tuple
+        // (encoded `Option<u64>` per field, raw — same compare basis
+        // the cursor itself uses on disk).  Within a segment, two
+        // docs are in the same tie group iff their primary tuples
+        // are identical under `==`.
+        let mut buffer_primary: Option<Vec<Option<u64>>> = None;
         for cursor_idx in 0..cursor.len() {
             let doc = cursor.doc_ids()[cursor_idx];
             if !self.matched_bitset.contains(doc) {
                 continue;
             }
+            // Materialise the cursor-recorded primary tuple as the
+            // tie-group key.  String slots are kept as their
+            // segment-local term ord here (cheap u64 compare for
+            // tie-group equality) — the *fruit* below decodes them
+            // to bytes for the cross-segment merge.
+            let cur_primary: Vec<Option<u64>> =
+                (0..prefix_len).map(|fi| cursor.value(cursor_idx, fi)).collect();
             // Materialise the prefix the request cares about, decoding
             // string term ords to bytes via the captured `StrColumn`.
             let mut tuple: Vec<CursorSortVal> = Vec::with_capacity(tuple_capacity);
             for fi in 0..prefix_len {
-                let raw = cursor.value(cursor_idx, fi);
+                let raw = cur_primary[fi];
                 let val = match self.value_kinds[fi] {
                     ValueKind::String => {
                         let bytes = match (raw, self.str_columns[fi].as_ref()) {
@@ -669,19 +718,65 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
                     continue;
                 }
             }
-            hits.push((
-                tuple,
-                DocAddress {
-                    segment_ord: self.segment_ord,
-                    doc_id: doc,
-                },
-            ));
-            if hits.len() >= self.limit {
-                break;
+            let addr = DocAddress {
+                segment_ord: self.segment_ord,
+                doc_id: doc,
+            };
+            // Wave 18-6: tie-group accumulation.
+            match &buffer_primary {
+                None => {
+                    // First matched doc — open a new buffer.
+                    buffer_primary = Some(cur_primary);
+                    buffer.push((tuple, addr));
+                }
+                Some(prev) if *prev == cur_primary => {
+                    // Same tie group — keep accumulating.
+                    buffer.push((tuple, addr));
+                }
+                Some(_) => {
+                    // Primary changed — flush the previous tie group
+                    // before starting a new one.
+                    flush_tie_group(&mut buffer, &mut hits, &orders);
+                    if hits.len() >= self.limit {
+                        // Subsequent tie groups have a strictly worse
+                        // primary in the cursor's recorded order, so
+                        // they cannot improve the global top-K.
+                        return hits;
+                    }
+                    buffer_primary = Some(cur_primary);
+                    buffer.push((tuple, addr));
+                }
             }
         }
+        // Flush whatever's left in the buffer at the end of the
+        // cursor walk.  No early-break here — we always emit the
+        // final tie group so cross-segment merge has the full slice
+        // of the boundary group to score-tie-break across segments.
+        flush_tie_group(&mut buffer, &mut hits, &orders);
         hits
     }
+}
+
+/// **Wave 18-6 helper.**  Sorts `buffer` by the full multi-field lex
+/// order (including the trailing `_score` slot when scoring is
+/// enabled) and drains it into `hits`.  Within a single tie group
+/// every docs' primary tuple is equal, so `compare_hits_multi`
+/// effectively reduces to score (when present) and then to the
+/// `(segment_ord, doc_id)` stable tie-break — preserving the cursor's
+/// recorded doc-id ordering when scoring is off.
+fn flush_tie_group(
+    buffer: &mut Vec<(Vec<CursorSortVal>, DocAddress)>,
+    hits: &mut Vec<(Vec<CursorSortVal>, DocAddress)>,
+    orders: &[Order],
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    // Stable sort so docs with identical sort keys preserve cursor
+    // order (matches the cursor's `(value, doc_id ASC)` stored
+    // tie-break used by Wave 18-1 / 18-3 callers without score).
+    buffer.sort_by(|a, b| compare_hits_multi(a, b, orders));
+    hits.extend(buffer.drain(..));
 }
 
 /// Lex-compare a [`CursorSortVal`] tuple against `start_after`.
@@ -1606,5 +1701,205 @@ mod tests {
             vec![(0, 2), (1, 0), (0, 1), (1, 4)],
             "ts=100 tie group must be ordered by score DESC, with seg 1 doc 0 (score 2.0) before seg 0 doc 1 (score 0.5)"
         );
+    }
+
+    // -------------------------------------------------------------
+    // Wave 18-6 — exact tie-group score ordering.
+    //
+    // These pin the per-segment harvest now buffers entire tie
+    // groups before sorting + emitting, so a doc with a top score
+    // that lives past the `limit` cursor index still wins the
+    // tie-break.  Before Wave 18-6 the harvest emitted the first
+    // `limit` matched docs in cursor order, dropping later high-
+    // score ties (the documented "ES Lucene `IndexSortByField` +
+    // secondary score" approximation).
+    // -------------------------------------------------------------
+
+    /// All-same-primary segment + scoring: the cursor-stored doc
+    /// order is reverse of score order, so a pre-Wave-18-6 harvest
+    /// would emit the WORST-scoring doc as #1.  Wave 18-6 buffers
+    /// the entire ts=100 tie group, sorts by score DESC, and emits
+    /// in correct rank.  The driving fixture uses a real tantivy
+    /// segment so the captured score is genuine BM25 rather than a
+    /// synthetic stand-in.
+    #[test]
+    fn wave_18_6_tie_group_buffer_picks_top_score_past_cursor_limit() {
+        use crate::index::IndexSortByField;
+        use crate::query::QueryParser;
+        use crate::schema::{FAST, INDEXED, STORED, Schema, TEXT};
+        use crate::{Index, IndexBuilder, IndexSettings};
+
+        let _ = IndexSortByField {
+            field: "ts".to_string(),
+            order: Order::Desc,
+        };
+        let mut sb = Schema::builder();
+        let body = sb.add_text_field("body", TEXT);
+        let ts = sb.add_i64_field("ts", FAST | INDEXED | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "ts".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema.clone())
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().unwrap();
+        // 5 docs all ts=100.  Term frequencies grow with doc-id so
+        // BM25 score grows: doc 0 = 1×, doc 1 = 2×, ..., doc 4 = 5×.
+        // The cursor stores docs by `(ts, doc_id ASC)` since ts is
+        // identical, so cursor walk emits in doc-id order
+        // [0, 1, 2, 3, 4] — i.e. ASCENDING score.  A `limit=2`
+        // request must NOT just take the first 2 cursor positions
+        // (which would be the LOWEST scores); Wave 18-6 buffers the
+        // tie group and sorts by score DESC.
+        for i in 0..5 {
+            let mut text = String::from("rust");
+            for _ in 0..i {
+                text.push_str(" rust");
+            }
+            writer.add_document(doc!(body => text.as_str(), ts => 100i64)).unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let qp = QueryParser::for_index(&index, vec![body]);
+        let q = qp.parse_query("rust").unwrap();
+
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("ts", Order::Desc)],
+            2,
+        )
+        .with_scoring(Order::Desc);
+        let hits = searcher.search(&*q, &collector).unwrap();
+        let docs: Vec<u32> = hits.iter().map(|(_, a)| a.doc_id).collect();
+        // With Wave 18-6: doc 4 (5× term, highest score) and doc 3
+        // (4× term, second highest).  Pre-Wave-18-6 result would
+        // have been [doc 0, doc 1] — the LOWEST scores in the tie
+        // group, exactly because cursor's `(ts, doc_id ASC)` order
+        // emitted them first.
+        assert_eq!(docs, vec![4u32, 3]);
+        // Both hits must carry positive BM25 scores (the trailing
+        // `Score(_)` slot from Wave 18-4 is preserved through Wave
+        // 18-6's buffer-then-sort).
+        for h in &hits {
+            match h.0.last() {
+                Some(CursorSortVal::Score(s)) => assert!(*s > 0.0),
+                _ => panic!("expected trailing Score slot"),
+            }
+        }
+        // Sanity: doc 4's score > doc 3's score (more matching terms).
+        let s4 = match hits[0].0.last() {
+            Some(CursorSortVal::Score(s)) => *s,
+            _ => unreachable!(),
+        };
+        let s3 = match hits[1].0.last() {
+            Some(CursorSortVal::Score(s)) => *s,
+            _ => unreachable!(),
+        };
+        assert!(s4 > s3, "doc 4 score ({s4}) must beat doc 3 score ({s3})");
+    }
+
+    /// Multi-tie-group segment with `limit = group_size`: harvest
+    /// emits exactly the first tie group score-sorted.  This test
+    /// pins the early-break — once `hits.len() >= limit` AND the
+    /// current tie group is flushed, subsequent tie groups (with
+    /// strictly worse primary in DESC) are NOT walked.
+    #[test]
+    fn wave_18_6_early_break_at_tie_group_boundary() {
+        use crate::index::IndexSortByField;
+        use crate::query::QueryParser;
+        use crate::schema::{FAST, INDEXED, STORED, Schema, TEXT};
+        use crate::{Index, IndexBuilder, IndexSettings};
+
+        let mut sb = Schema::builder();
+        let body = sb.add_text_field("body", TEXT);
+        let ts = sb.add_i64_field("ts", FAST | INDEXED | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "ts".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().unwrap();
+        // 3 docs ts=200 (high primary tie group), 5 docs ts=100
+        // (low primary tie group).  All match "rust".
+        for _ in 0..3 {
+            writer.add_document(doc!(body => "rust", ts => 200i64)).unwrap();
+        }
+        for _ in 0..5 {
+            writer.add_document(doc!(body => "rust", ts => 100i64)).unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let qp = QueryParser::for_index(&index, vec![body]);
+        let q = qp.parse_query("rust").unwrap();
+
+        // limit=3 == size of first tie group.  Harvest should emit
+        // the 3 ts=200 docs and stop without walking ts=100.
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("ts", Order::Desc)],
+            3,
+        )
+        .with_scoring(Order::Desc);
+        let hits = searcher.search(&*q, &collector).unwrap();
+        assert_eq!(hits.len(), 3);
+        // All hits must come from the ts=200 tie group.
+        for h in &hits {
+            match &h.0[0] {
+                CursorSortVal::Numeric(Some(u)) => {
+                    let v = i64::from_u64(*u);
+                    assert_eq!(v, 200i64, "all hits must be in the ts=200 tie group");
+                }
+                _ => panic!("expected numeric primary"),
+            }
+        }
+    }
+
+    /// Wave 18-6 should NOT change behaviour when scoring is
+    /// **off** — the buffer-then-sort within a tie group reduces to
+    /// `(segment_ord, doc_id)` lex tie-break, which already matches
+    /// the cursor's stored doc-id order.  This pins the no-regression
+    /// contract for Wave 18-1 / 18-3 callers that don't touch
+    /// `with_scoring`.
+    #[test]
+    fn wave_18_6_no_scoring_preserves_v1_v3_behaviour() {
+        // 4 docs ts=100, no scoring → cursor walks doc 0,1,2,3 in
+        // doc-id ASC, harvest emits in same order with limit=4.
+        let v: Vec<Option<u64>> = vec![
+            Some(100i64.to_u64()),
+            Some(100i64.to_u64()),
+            Some(100i64.to_u64()),
+            Some(100i64.to_u64()),
+        ];
+        let cursor = build_cursor(
+            vec![("ts", Order::Desc, ValueKind::I64)],
+            vec![v],
+            4,
+        );
+        let hits = harvest_with_matched(
+            cursor,
+            vec![("ts", Order::Desc)],
+            10,
+            None,
+            &[0, 1, 2, 3],
+        );
+        let docs: Vec<DocId> = hits.iter().map(|(_, a)| a.doc_id).collect();
+        // Cursor's `(value, doc_id ASC)` build order — preserved by
+        // Wave 18-6's stable buffer sort when scoring is off.
+        assert_eq!(docs, vec![0u32, 1, 2, 3]);
     }
 }

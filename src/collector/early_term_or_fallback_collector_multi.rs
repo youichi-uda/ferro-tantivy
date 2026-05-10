@@ -466,7 +466,8 @@ mod tests {
 
     use crate::query::AllQuery;
     use crate::schema::{FAST, INDEXED, STORED, STRING, Schema};
-    use crate::{Index, IndexBuilder, IndexSettings, IndexSortByField};
+    use crate::index::IndexSortByField;
+    use crate::{Index, IndexBuilder, IndexSettings};
 
     /// Convenience: numeric `CursorSortVal::Numeric(Some(_))`.
     fn n(v: i64) -> CursorSortVal {

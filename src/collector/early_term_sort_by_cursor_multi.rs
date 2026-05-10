@@ -944,7 +944,8 @@ mod tests {
     fn string_single_field_real_segment_decodes_bytes() {
         use crate::index::SegmentReader;
         use crate::schema::{FAST, STRING, Schema};
-        use crate::{Index, IndexBuilder, IndexSettings, IndexSortByField};
+        use crate::index::IndexSortByField;
+    use crate::{Index, IndexBuilder, IndexSettings};
 
         let mut sb = Schema::builder();
         let country = sb.add_text_field("country", STRING | FAST);
@@ -1033,7 +1034,8 @@ mod tests {
     #[test]
     fn string_cross_segment_dictionary_divergence_uses_bytes() {
         use crate::schema::{FAST, STRING, Schema};
-        use crate::{Index, IndexBuilder, IndexSettings, IndexSortByField};
+        use crate::index::IndexSortByField;
+    use crate::{Index, IndexBuilder, IndexSettings};
 
         let mut sb = Schema::builder();
         let country = sb.add_text_field("country", STRING | FAST);
@@ -1097,7 +1099,8 @@ mod tests {
     #[test]
     fn string_then_numeric_multi_field_real_segment() {
         use crate::schema::{FAST, INDEXED, STORED, STRING, Schema};
-        use crate::{Index, IndexBuilder, IndexSettings, IndexSortByField};
+        use crate::index::IndexSortByField;
+    use crate::{Index, IndexBuilder, IndexSettings};
 
         let mut sb = Schema::builder();
         let country = sb.add_text_field("country", STRING | FAST);

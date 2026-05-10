@@ -10,7 +10,10 @@ use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
-use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId, SortCursorIndex};
+use crate::index::{
+    InvertedIndexReader, Segment, SegmentComponent, SegmentId, SortCursorAny, SortCursorIndex,
+    SortCursorIndexV2,
+};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
@@ -52,7 +55,17 @@ pub struct SegmentReader {
     /// `Segment::meta().sort_cursor_fields()` at `open` time. Each entry
     /// is a small `Vec<DocId>` (~4 bytes/doc) wrapped in `Arc` for cheap
     /// sharing across `Searcher` clones.
+    ///
+    /// Only carries v1 (single-field) cursors; v2 (multi-field) cursors
+    /// live in [`Self::sort_cursors_v2`] keyed by the **primary** field
+    /// name. A given field name can only appear in one map per segment.
     sort_cursors: Arc<HashMap<String, Arc<SortCursorIndex>>>,
+    /// **FerroSearch Wave 18-1.** Eagerly-loaded multi-field sort
+    /// cursors, keyed by their primary field name. Populated from the
+    /// same `Segment::meta().sort_cursor_fields()` list as the v1 map;
+    /// the on-disk file's version byte is peeked at open time to route
+    /// each cursor to the correct map.
+    sort_cursors_v2: Arc<HashMap<String, Arc<SortCursorIndexV2>>>,
 }
 
 impl SegmentReader {
@@ -196,15 +209,24 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        // FerroSearch (Wave 15): eagerly load any auxiliary sort cursors
-        // listed in segment meta. Missing files are surfaced as errors
-        // because the meta entry advertises them as part of the segment
-        // contract.
+        // FerroSearch (Wave 15 / Wave 18-1): eagerly load any auxiliary
+        // sort cursors listed in segment meta. Each file's version byte
+        // is peeked at open time so v1 (single-field) and v2 (multi-
+        // field) cursors land in their respective maps. Missing files
+        // are surfaced as errors because the meta entry advertises
+        // them as part of the segment contract.
         let mut sort_cursors: HashMap<String, Arc<SortCursorIndex>> = HashMap::new();
+        let mut sort_cursors_v2: HashMap<String, Arc<SortCursorIndexV2>> = HashMap::new();
         for field in segment.meta().sort_cursor_fields() {
             let slice = segment.open_sort_cursor_read(field)?;
-            let cursor = SortCursorIndex::open(slice)?;
-            sort_cursors.insert(field.clone(), Arc::new(cursor));
+            match SortCursorAny::open(slice)? {
+                SortCursorAny::V1(c) => {
+                    sort_cursors.insert(field.clone(), Arc::new(c));
+                }
+                SortCursorAny::V2(c) => {
+                    sort_cursors_v2.insert(field.clone(), Arc::new(c));
+                }
+            }
         }
 
         Ok(SegmentReader {
@@ -222,6 +244,7 @@ impl SegmentReader {
             positions_composite,
             schema,
             sort_cursors: Arc::new(sort_cursors),
+            sort_cursors_v2: Arc::new(sort_cursors_v2),
         })
     }
 
@@ -233,10 +256,22 @@ impl SegmentReader {
         self.sort_cursors.get(field).cloned()
     }
 
+    /// **FerroSearch Wave 18-1.** Returns the multi-field sort cursor
+    /// keyed by `primary_field` (the first field in its declaration
+    /// order), or `None` if the segment does not carry one. The
+    /// returned `Arc` is shared with this reader and is cheap to clone.
+    pub fn sort_cursor_v2(&self, primary_field: &str) -> Option<Arc<SortCursorIndexV2>> {
+        self.sort_cursors_v2.get(primary_field).cloned()
+    }
+
     /// **FerroSearch extension (Wave 15).** Returns the names of the
-    /// fields for which a sort cursor was loaded.
+    /// fields for which a sort cursor (v1 or v2) was loaded. v2 cursors
+    /// are reported under their primary field name.
     pub fn sort_cursor_fields(&self) -> impl Iterator<Item = &str> + '_ {
-        self.sort_cursors.keys().map(String::as_str)
+        self.sort_cursors
+            .keys()
+            .chain(self.sort_cursors_v2.keys())
+            .map(String::as_str)
     }
 
     /// Returns a field reader associated with the field given in argument.

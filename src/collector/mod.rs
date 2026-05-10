@@ -111,6 +111,13 @@ pub use self::early_term_sort_by_cursor::{
     EarlyTermSortByCursorCollector, EarlyTermSortByCursorSegmentCollector,
 };
 
+/// FerroSearch Wave 18-1 — multi-field early-terminating top-K via
+/// auxiliary v2 sort cursor.
+pub mod early_term_sort_by_cursor_multi;
+pub use self::early_term_sort_by_cursor_multi::{
+    EarlyTermSortByCursorCollectorMulti, EarlyTermSortByCursorMultiSegmentCollector,
+};
+
 mod sort_key_top_collector;
 pub use self::sort_key::{SegmentSortKeyComputer, SortByStaticFastValue, SortKeyComputer};
 mod facet_collector;

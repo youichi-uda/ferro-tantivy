@@ -169,11 +169,20 @@ pub(crate) fn try_gpu_intersect(
     // next query touching the same posting list.
     use crate::postings::roaring::cht;
     use std::sync::Arc;
+    // Phase 2 D-3 measurement instrumentation. Per-step `Instant`
+    // timing emitted via `tracing::debug!` so the next-wave v2 design
+    // is data-driven (Wave 8 / D-1 left ~110 ms / query unattributed
+    // post-drain-bypass; this breakdown identifies the dominant
+    // residual). Build cost is one `Instant::now` per step
+    // (sub-µs syscall), only paid when `tracing::debug!` is active.
+    let t0 = std::time::Instant::now();
     let segment_id = reader.segment_id();
     let cht_handle = cht::global();
     let mut owned_postings: Vec<Arc<RoaringPostings>> =
         Vec::with_capacity(must_scorers.len());
     let mut term_scorers: Vec<Box<TermScorer>> = Vec::with_capacity(must_scorers.len());
+    let mut hit_count: u32 = 0;
+    let mut drain_us_total: u128 = 0;
     for scorer in must_scorers {
         // Infallible per gate 3. Box<dyn Scorer>::downcast moves the
         // value (so we don't lose ownership on success) — see
@@ -191,25 +200,41 @@ pub(crate) fn try_gpu_intersect(
         };
         let roaring = if let Some(cached) = cht_handle.get(&key) {
             // Hit — skip the drain entirely.
+            hit_count += 1;
             cached
         } else {
             // Miss — drain (the legacy hot path) + insert into cache
             // so subsequent queries hit. We clone the BlockSegmentPostings
             // so the original TermScorer keeps its read cursor for the
             // err-recovery path; cheap (file slice / Arc pattern).
+            let drain_t = std::time::Instant::now();
             let mut block_cursor = term_scorer.segment_postings().block_cursor.clone();
             let drained = Arc::new(drain_block_segment_to_roaring(&mut block_cursor));
+            drain_us_total += drain_t.elapsed().as_micros();
             cht_handle.insert(key, Arc::clone(&drained));
             drained
         };
         owned_postings.push(roaring);
         term_scorers.push(term_scorer);
     }
+    let drain_phase_us = t0.elapsed().as_micros();
 
     // ----- GPU dispatch -----
+    let dispatch_t = std::time::Instant::now();
     let term_refs: Vec<&RoaringPostings> =
         owned_postings.iter().map(|a| a.as_ref()).collect();
     let gpu_result = try_gpu_bool(BoolOp::And, &term_refs, num_docs_in_segment);
+    let dispatch_phase_us = dispatch_t.elapsed().as_micros();
+    log::debug!(
+        target: "tantivy::query::boolean_query::gpu_intersect",
+        "Phase 2 D-3 timing: cohort_size={} cht_hits={} cht_misses={} drain_phase_us={} drain_only_us={} dispatch_phase_us={}",
+        term_refs.len(),
+        hit_count,
+        term_refs.len() as u32 - hit_count,
+        drain_phase_us as u64,
+        drain_us_total as u64,
+        dispatch_phase_us as u64,
+    );
     let Some(roaring_result) = gpu_result else {
         // Driver init failed / wgpu unavailable / cohort emptied
         // by the bucket-union step. Fall back to the legacy CPU path

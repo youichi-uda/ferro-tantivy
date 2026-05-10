@@ -53,6 +53,13 @@ use crate::query::roaring_materialised_scorer::RoaringMaterialisedScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
 
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+use crate::postings::roaring::try_gpu_bool_vram;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+use crate::postings::roaring::vram_cht;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+use crate::postings::roaring::vram_cht::VramTermEntry;
+
 /// Try to route a Bool-AND cohort through the Wave 6 GPU Roaring
 /// dispatch path.
 ///
@@ -178,10 +185,21 @@ pub(crate) fn try_gpu_intersect(
     let t0 = std::time::Instant::now();
     let segment_id = reader.segment_id();
     let cht_handle = cht::global();
+    // Phase 2 D-3 v2 — VRAM CHT lookup. The VRAM cache is gated on
+    // `cuda-bitmap-kernel`; without it, `vram_entries` is unused
+    // (None for every term) and we fall through to the host fold
+    // path bytewise-identically.
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    let vram_handle = vram_cht::global();
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    let mut vram_entries: Vec<Option<Arc<VramTermEntry>>> =
+        Vec::with_capacity(must_scorers.len());
     let mut owned_postings: Vec<Arc<RoaringPostings>> =
         Vec::with_capacity(must_scorers.len());
     let mut term_scorers: Vec<Box<TermScorer>> = Vec::with_capacity(must_scorers.len());
-    let mut hit_count: u32 = 0;
+    let mut host_hit_count: u32 = 0;
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    let mut vram_hit_count: u32 = 0;
     let mut drain_us_total: u128 = 0;
     for scorer in must_scorers {
         // Infallible per gate 3. Box<dyn Scorer>::downcast moves the
@@ -198,22 +216,58 @@ pub(crate) fn try_gpu_intersect(
             posting_data_addr: data_addr,
             posting_data_len: data_len,
         };
+        // Step A: VRAM CHT v2 lookup (under cuda-bitmap-kernel only).
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        let vram_entry = vram_handle.get(&key);
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        if vram_entry.is_some() {
+            vram_hit_count += 1;
+        }
+        // Step B: host CHT v1 lookup (or drain on miss). The host
+        // entry is needed regardless of VRAM hit state — the fall-back
+        // host fold path consumes it, and on VRAM miss the dispatch
+        // layer also needs it for opportunistic promotion. We never
+        // skip the host insert: the host cache footprint is a small
+        // fraction of VRAM (4 GiB host budget vs 32 GiB VRAM budget on
+        // L40S) so the duplication cost is negligible vs the warm-
+        // restart benefit (host cache survives more events than VRAM,
+        // so it's the canonical "cheap" tier).
         let roaring = if let Some(cached) = cht_handle.get(&key) {
-            // Hit — skip the drain entirely.
-            hit_count += 1;
+            // Host hit — skip the drain entirely.
+            host_hit_count += 1;
             cached
         } else {
-            // Miss — drain (the legacy hot path) + insert into cache
-            // so subsequent queries hit. We clone the BlockSegmentPostings
-            // so the original TermScorer keeps its read cursor for the
+            // Miss — drain + insert into host cache so subsequent
+            // queries hit. We clone the BlockSegmentPostings so the
+            // original TermScorer keeps its read cursor for the
             // err-recovery path; cheap (file slice / Arc pattern).
             let drain_t = std::time::Instant::now();
             let mut block_cursor = term_scorer.segment_postings().block_cursor.clone();
             let drained = Arc::new(drain_block_segment_to_roaring(&mut block_cursor));
             drain_us_total += drain_t.elapsed().as_micros();
-            cht_handle.insert(key, Arc::clone(&drained));
+            cht_handle.insert(key.clone(), Arc::clone(&drained));
             drained
         };
+
+        // Step C: opportunistic VRAM promotion. If the host entry just
+        // became available (drain or v1 hit) but VRAM was a miss, try
+        // to promote so subsequent queries hit the VRAM tier. Failures
+        // (CUDA OOM, oversized term, budget pressure) are silently
+        // swallowed — promotion is best-effort, never blocks the query.
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        let final_vram_entry = if let Some(entry) = vram_entry {
+            Some(entry)
+        } else {
+            // Promote: insert into VRAM cache, then re-fetch the
+            // resulting Arc<VramTermEntry> for use in this same
+            // query (so the cohort can take the VRAM fast path on
+            // first warm-up after a miss).
+            let _ = vram_handle.promote(key.clone(), roaring.as_ref());
+            vram_handle.get(&key)
+        };
+
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        vram_entries.push(final_vram_entry);
         owned_postings.push(roaring);
         term_scorers.push(term_scorer);
     }
@@ -221,16 +275,60 @@ pub(crate) fn try_gpu_intersect(
 
     // ----- GPU dispatch -----
     let dispatch_t = std::time::Instant::now();
-    let term_refs: Vec<&RoaringPostings> =
-        owned_postings.iter().map(|a| a.as_ref()).collect();
-    let gpu_result = try_gpu_bool(BoolOp::And, &term_refs, num_docs_in_segment);
+    // Phase 2 D-3 v2 — choose the VRAM fold path iff every cohort
+    // member has a VRAM entry (cache hit OR successful first-touch
+    // promote-then-get). Mixed cohorts (some hits, some misses)
+    // fall back to the host fold path; the missing terms can promote
+    // on subsequent queries.
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    let gpu_result = {
+        let all_have_vram = vram_entries.iter().all(|opt| opt.is_some())
+            && !vram_entries.is_empty();
+        if all_have_vram {
+            // Move the Arcs out of the Option layer.
+            let vram_terms: Vec<Arc<VramTermEntry>> = vram_entries
+                .iter()
+                .map(|opt| {
+                    Arc::clone(opt.as_ref().expect("all_have_vram pre-checked"))
+                })
+                .collect();
+            try_gpu_bool_vram(BoolOp::And, &vram_terms)
+        } else {
+            // Mixed / no-VRAM-cache fall-through: host fold path.
+            let term_refs: Vec<&RoaringPostings> =
+                owned_postings.iter().map(|a| a.as_ref()).collect();
+            try_gpu_bool(BoolOp::And, &term_refs, num_docs_in_segment)
+        }
+    };
+    #[cfg(not(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel")))]
+    let gpu_result = {
+        let term_refs: Vec<&RoaringPostings> =
+            owned_postings.iter().map(|a| a.as_ref()).collect();
+        try_gpu_bool(BoolOp::And, &term_refs, num_docs_in_segment)
+    };
     let dispatch_phase_us = dispatch_t.elapsed().as_micros();
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    let cohort_size = owned_postings.len();
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    log::debug!(
+        target: "tantivy::query::boolean_query::gpu_intersect",
+        "Phase 2 D-3 timing: cohort_size={} host_cht_hits={} host_cht_misses={} vram_cht_hits={} vram_cht_misses={} drain_phase_us={} drain_only_us={} dispatch_phase_us={}",
+        cohort_size,
+        host_hit_count,
+        cohort_size as u32 - host_hit_count,
+        vram_hit_count,
+        cohort_size as u32 - vram_hit_count,
+        drain_phase_us as u64,
+        drain_us_total as u64,
+        dispatch_phase_us as u64,
+    );
+    #[cfg(not(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel")))]
     log::debug!(
         target: "tantivy::query::boolean_query::gpu_intersect",
         "Phase 2 D-3 timing: cohort_size={} cht_hits={} cht_misses={} drain_phase_us={} drain_only_us={} dispatch_phase_us={}",
-        term_refs.len(),
-        hit_count,
-        term_refs.len() as u32 - hit_count,
+        owned_postings.len(),
+        host_hit_count,
+        owned_postings.len() as u32 - host_hit_count,
         drain_phase_us as u64,
         drain_us_total as u64,
         dispatch_phase_us as u64,
@@ -401,6 +499,89 @@ mod tests {
             Err(recovered) => assert_eq!(recovered.len(), 1),
             Ok(_) => panic!("single-term cohort should not have dispatched"),
         }
+        Ok(())
+    }
+
+    /// Phase 2 D-3 v2 — VRAM CHT integration test.
+    ///
+    /// Build a heavy cohort, call `try_gpu_intersect` twice on the
+    /// same scorers, and assert:
+    /// 1. After call #1, the VRAM CHT has at least one inserted entry
+    ///    (= the first-touch promotion succeeded for at least one
+    ///    cohort member).
+    /// 2. After call #2, the VRAM CHT hits counter went up (= the
+    ///    second-call lookup found promoted entries).
+    /// 3. Both calls succeed (= byte-equal results for AND on the
+    ///    same fixture).
+    ///
+    /// Skip cleanly on hosts without a working CUDA driver (the
+    /// VRAM stats stay at zero and we don't assert further).
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    #[test]
+    fn vram_cht_warm_path_witnessed_via_stats() -> crate::Result<()> {
+        use crate::postings::roaring::vram_cht;
+
+        let _g = COUNTER_LOCK.lock().unwrap();
+        reset_dispatch_counters();
+        // Reset the VRAM cache so this test's stats counters start
+        // from a known baseline (no interference from earlier tests
+        // that share the process-global cache).
+        vram_cht::reset_global();
+
+        // Build the same heavy cohort as `heavy_cohort_dispatches_…`.
+        // 12 high-frequency terms × 100_000 docs = clears every
+        // planner gate.
+        let term_list: Vec<String> = (0..12).map(|i| format!("vterm{i}")).collect();
+        let doc_text = term_list.join(" ");
+        let mut docs: Vec<String> = Vec::with_capacity(100_000);
+        for _ in 0..100_000 {
+            docs.push(doc_text.clone());
+        }
+        let docs_refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (index, text_field) = build_index(&docs_refs)?;
+        let cohort_terms: Vec<&str> = term_list.iter().map(String::as_str).collect();
+        let reader = index.reader()?;
+        let segment_reader = reader.searcher().segment_reader(0).clone();
+
+        // Call #1: all VRAM misses → drain + promote.
+        let cohort_a = build_term_scorer_cohort(&index, text_field, &cohort_terms)?;
+        let res_a = try_gpu_intersect(cohort_a, &segment_reader, false);
+        let stats_after_a = vram_cht::global().stats();
+        // On a CUDA-driver-missing host, no promotions happened — the
+        // promote() call returns Ok(false) silently. Use the result
+        // of the dispatch as the "did anything actually run on GPU"
+        // witness; if Ok we got a scorer back, so the VRAM tier is
+        // alive.
+        let Ok(_scorer_a) = res_a else {
+            // Dispatch fell back to CPU on a sandbox box. No further
+            // assertions possible — the VRAM tier never engaged.
+            return Ok(());
+        };
+        // At least one promotion (typically all 12) recorded by call #1.
+        // We don't assert == 12 because the planner may admit fewer
+        // than 12 terms on this fixture (it admits all 12 here, but
+        // future planner tweaks may change that — pin only the
+        // monotonic property that promotion fired).
+        assert!(
+            stats_after_a.promotions >= 1,
+            "first try_gpu_intersect call must promote ≥1 entry, got promotions={}",
+            stats_after_a.promotions
+        );
+
+        // Call #2: same cohort terms, fresh scorer cohort. Now the
+        // VRAM CHT should have entries from call #1, so we expect
+        // hit_count to increase (= the warm-cache fast path engaged).
+        let cohort_b = build_term_scorer_cohort(&index, text_field, &cohort_terms)?;
+        let res_b = try_gpu_intersect(cohort_b, &segment_reader, false);
+        let stats_after_b = vram_cht::global().stats();
+        assert!(
+            res_b.is_ok(),
+            "second call must succeed (warm cache, identical fixture)"
+        );
+        assert!(
+            stats_after_b.hits > stats_after_a.hits,
+            "second try_gpu_intersect call must record at least one VRAM hit"
+        );
         Ok(())
     }
 

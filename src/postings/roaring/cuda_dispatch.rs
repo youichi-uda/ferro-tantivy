@@ -47,12 +47,15 @@ use std::ptr::null_mut;
 use std::sync::Mutex;
 
 use ferro_compress::nvcomp_sys::cuda::{
-    cudaFree, cudaMalloc, cudaMemcpyAsync, cudaMemcpyKind, cudaStreamCreate, cudaStreamDestroy,
-    cudaStreamSynchronize, cudaStream_t, CUDA_SUCCESS,
+    cudaFree, cudaMalloc, cudaMemcpyAsync, cudaMemcpyKind, cudaMemsetAsync, cudaStreamCreate,
+    cudaStreamDestroy, cudaStreamSynchronize, cudaStream_t, CUDA_SUCCESS,
 };
 use ferro_compress::{BitmapOp as FcBitmapOp, BitmapOpKernel as InnerKernel, Error as FcError};
 
 use super::gpu_dispatch::BoolOp;
+use super::vram_cht::VramTermEntry;
+use super::BITMAP_CONTAINER_WORDS;
+use std::sync::Arc;
 
 /// Errors that can surface from the CUDA wrapper. Distinct from
 /// [`ferro_compress::Error`] so the call site can match on
@@ -350,6 +353,216 @@ impl CudaBitmapOpKernel {
         }
     }
 
+    /// Run `out = TERMS[0] OP TERMS[1] OP … OP TERMS[N-1]` on
+    /// device-resident terms (Phase 2 D-3 v2 fast path).
+    ///
+    /// Each term is a [`VramTermEntry`] holding pre-expanded
+    /// BitmapContainer-form buckets in device memory under
+    /// `(high16, word_offset)` indexing. The function:
+    ///
+    /// 1. Resizes the persistent kernel buffers to fit
+    ///    `union_keys.len() * BITMAP_CONTAINER_WORDS` u32 words if
+    ///    needed.
+    /// 2. Builds the accumulator (`d_a`) by zero-filling and then
+    ///    per-bucket `cudaMemcpyAsync(DeviceToDevice)` from
+    ///    `terms[0]`'s cached buckets to the bucket slots dictated by
+    ///    `union_keys`. Buckets present in the term but not in
+    ///    `union_keys` are skipped (cohort intersection is bounded by
+    ///    the union, but a malformed `terms[0]` with extra buckets
+    ///    is handled defensively by the binary-search lookup).
+    /// 3. For each subsequent term: zero-fill `d_b`, scatter the
+    ///    term's buckets into `d_b`, run
+    ///    `inner.compute(op, d_a, d_b, d_out, words)`, pointer-swap
+    ///    `d_a` ↔ `d_out` so the next iteration consumes the just-
+    ///    written result as its accumulator.
+    /// 4. After the fold, `cudaMemcpyAsync(DeviceToHost)` from `d_a`
+    ///    (post-final-swap) into a fresh host `Vec<u32>` and a single
+    ///    end-of-fold `cudaStreamSynchronize`.
+    ///
+    /// Wallclock target vs [`compute_fold`] (host-slice fold):
+    ///
+    /// - `compute_fold` (host slices): N × `cudaMemcpyAsync` H→D of
+    ///   `union_keys.len() × 8 KiB` per term, plus N - 1 kernel
+    ///   launches, plus 1 D→H, plus 1 sync.
+    /// - `compute_fold_vram` (device-resident terms): N × per-bucket
+    ///   `cudaMemcpyAsync` D→D (only the buckets actually present in
+    ///   each term, typically far fewer than `union_keys.len()`),
+    ///   plus N - 1 kernel launches, plus 1 D→H, plus 1 sync.
+    ///
+    /// At cohort scale (12 terms × ~10 non-empty buckets each), the
+    /// D→D scatter is O(120) × 8 KiB = ~1 MiB on-device traffic per
+    /// query (~1.6 µs at L40S 600 GB/s+ bandwidth), vs ~1 MiB H→D
+    /// (~40 µs at PCIe 4.0 ×16). At larger cohort scales (50 terms ×
+    /// 100 buckets), the D→D advantage grows to ~24×.
+    ///
+    /// `union_keys` must be sorted ascending by `high16`.
+    /// (`super::gpu_dispatch::union_high16_keys` produces sorted output
+    /// from a `BTreeSet`, satisfying the invariant.)
+    ///
+    /// Empty / single-term short-circuit identical to [`compute_fold`].
+    pub fn compute_fold_vram(
+        &self,
+        op: BoolOp,
+        terms: &[Arc<VramTermEntry>],
+        union_keys: &[u16],
+    ) -> Result<Vec<u32>, CudaBitmapError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        if union_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Single-term: re-emit the term's own flat layout into a host
+        // Vec without going through the kernel. Caller usually short-
+        // circuits before us, but defensively handle it.
+        if terms.len() == 1 {
+            return self.gather_term_to_host(&terms[0], union_keys);
+        }
+        let words_per_term = union_keys
+            .len()
+            .checked_mul(BITMAP_CONTAINER_WORDS)
+            .ok_or(CudaBitmapError::Cuda {
+                what: "words_per_term overflow",
+                code: 0,
+            })?;
+        let bytes_per_term = words_per_term
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaBitmapError::Cuda {
+                what: "bytes_per_term overflow",
+                code: 0,
+            })?;
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("CudaBitmapOpKernel state mutex poisoned");
+        if words_per_term > state.capacity_words {
+            // SAFETY: we hold the state mutex; no other caller can
+            // observe the intermediate (freed) pointers.
+            unsafe { reallocate_buffers(&mut state, words_per_term.next_power_of_two())? };
+        }
+
+        let cuda_op = to_inner_op(op);
+        let n_u32 =
+            u32::try_from(words_per_term).map_err(|_| CudaBitmapError::Cuda {
+                what: "words_per_term exceeds u32::MAX",
+                code: 0,
+            })?;
+
+        // SAFETY: every cudaMemset / cudaMemcpyAsync below targets a
+        // `*mut c_void` (or `*mut u32` cast to `*mut c_void`) that
+        // points to one of the persistent kernel buffers we hold under
+        // the state mutex (`d_a`, `d_b`, `d_out`), each sized for
+        // `state.capacity_words ≥ words_per_term` u32s. Source
+        // pointers are read from the immutable
+        // [`VramTermEntry::device_ptr`] (Arc'd term entries hold the
+        // device buffer alive for the duration of this call). The whole
+        // chain runs on `self.stream`, terminated by a single
+        // `cudaStreamSynchronize` before D→H read.
+        unsafe {
+            // Step 1: scatter terms[0] into d_a (the initial accumulator).
+            scatter_term_to_device(
+                state.d_a,
+                bytes_per_term,
+                &terms[0],
+                union_keys,
+                self.stream,
+            )?;
+            // Step 2: per-term scatter + kernel + pointer-swap.
+            for term in terms.iter().skip(1) {
+                scatter_term_to_device(
+                    state.d_b,
+                    bytes_per_term,
+                    term,
+                    union_keys,
+                    self.stream,
+                )?;
+                self.inner.compute(
+                    cuda_op,
+                    state.d_a as *const u32,
+                    state.d_b as *const u32,
+                    state.d_out as *mut u32,
+                    n_u32,
+                )?;
+                // Pointer-swap d_a ↔ d_out so the next iteration reads
+                // the just-written result as its accumulator. Same idiom
+                // as [`Self::compute_fold`].
+                let tmp = state.d_a;
+                state.d_a = state.d_out;
+                state.d_out = tmp;
+            }
+            // Step 3: D→H from d_a (final result after last swap).
+            let mut out = vec![0u32; words_per_term];
+            let rc = cudaMemcpyAsync(
+                out.as_mut_ptr() as *mut c_void,
+                state.d_a as *const c_void,
+                bytes_per_term,
+                cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                self.stream,
+            );
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaMemcpyAsync(vram fold result D2H)",
+                    code: rc,
+                });
+            }
+            let rc = cudaStreamSynchronize(self.stream);
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaStreamSynchronize(vram fold)",
+                    code: rc,
+                });
+            }
+            Ok(out)
+        }
+    }
+
+    /// Single-term degenerate path: gather the term's cached buckets
+    /// into a host `Vec<u32>` matching the cohort `union_keys` layout.
+    /// Used by [`Self::compute_fold_vram`] when `terms.len() == 1` so
+    /// the kernel isn't invoked. Implemented as a synchronous
+    /// `cudaMemcpy` D→H to a host staging Vec, with zero-init for
+    /// missing buckets.
+    fn gather_term_to_host(
+        &self,
+        term: &Arc<VramTermEntry>,
+        union_keys: &[u16],
+    ) -> Result<Vec<u32>, CudaBitmapError> {
+        let words = union_keys.len() * BITMAP_CONTAINER_WORDS;
+        let mut out = vec![0u32; words];
+        for (high16, src_off) in term.bucket_index() {
+            let Ok(dst_idx) = union_keys.binary_search(high16) else {
+                continue;
+            };
+            let dst_start = dst_idx * BITMAP_CONTAINER_WORDS;
+            let dst_end = dst_start + BITMAP_CONTAINER_WORDS;
+            // SAFETY: cudaMemcpy synchronously copies BITMAP_CONTAINER_WORDS
+            // u32 = 8 KiB from the term's device buffer at offset
+            // `src_off * 4` bytes to the corresponding host slice.
+            // Bounds: src_off + BITMAP_CONTAINER_WORDS ≤ term.total_words
+            // by construction in [`VramCht::build_entry`]; dst_end ≤
+            // out.len() because `dst_idx < union_keys.len()`.
+            unsafe {
+                let src_ptr = (term.device_ptr() as *const u8)
+                    .add((*src_off as usize) * std::mem::size_of::<u32>());
+                let dst_ptr = out[dst_start..dst_end].as_mut_ptr() as *mut c_void;
+                let rc = ferro_compress::nvcomp_sys::cuda::cudaMemcpy(
+                    dst_ptr,
+                    src_ptr as *const c_void,
+                    BITMAP_CONTAINER_WORDS * std::mem::size_of::<u32>(),
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                );
+                if rc != CUDA_SUCCESS {
+                    return Err(CudaBitmapError::Cuda {
+                        what: "cudaMemcpy(gather single-term D2H)",
+                        code: rc,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Run `out = a OP b` on host slices, returning a fresh `Vec<u32>`.
     /// Same byte-equal semantics as the wgpu `BitmapOpKernel::compute`
     /// — the byte-equal CPU oracle in
@@ -614,6 +827,85 @@ fn to_inner_op(op: BoolOp) -> FcBitmapOp {
     }
 }
 
+/// Scatter a term's cached buckets onto a destination device buffer
+/// formatted for the cohort `union_keys` layout (Phase 2 D-3 v2).
+///
+/// Pre-zero-fills `dst` with [`cudaMemsetAsync`] so buckets present in
+/// other cohort members but absent in this term contribute zeros to
+/// the bitwise op. Then issues one
+/// [`cudaMemcpyAsync`]`(DeviceToDevice)` per `(high16, word_offset)`
+/// pair in `term.bucket_index()` whose `high16` is found by binary
+/// search in `union_keys`. All ops queue on `stream` and are only
+/// guaranteed visible after the caller's
+/// [`cudaStreamSynchronize`].
+///
+/// # Safety
+/// - `dst` must point to at least `dst_bytes` of writable device memory
+///   on the device that owns `stream`.
+/// - `term.device_ptr()` must point to a valid `[u32; total_words]`
+///   device allocation owned by `term` (guaranteed by
+///   [`VramCht::build_entry`]).
+/// - `union_keys` must be sorted ascending (binary-search invariant).
+/// - The caller must hold the `Arc<VramTermEntry>` alive until the
+///   stream sync completes (otherwise the term's `Drop` could
+///   `cudaFree` the source buffer mid-copy).
+unsafe fn scatter_term_to_device(
+    dst: *mut c_void,
+    dst_bytes: usize,
+    term: &Arc<VramTermEntry>,
+    union_keys: &[u16],
+    stream: cudaStream_t,
+) -> Result<(), CudaBitmapError> {
+    // Zero the destination first so missing buckets contribute zeros.
+    let rc = unsafe {
+        cudaMemsetAsync(dst, 0i32 as std::ffi::c_int, dst_bytes, stream)
+    };
+    if rc != CUDA_SUCCESS {
+        return Err(CudaBitmapError::Cuda {
+            what: "cudaMemsetAsync(scatter zero-fill)",
+            code: rc,
+        });
+    }
+    let bucket_bytes = BITMAP_CONTAINER_WORDS * std::mem::size_of::<u32>();
+    for (high16, src_word_off) in term.bucket_index() {
+        let Ok(dst_idx) = union_keys.binary_search(high16) else {
+            // Bucket not in union — skip. Defensive against malformed
+            // inputs; correct cohorts produced by union_high16_keys
+            // include every term's buckets.
+            continue;
+        };
+        let dst_word_off = dst_idx * BITMAP_CONTAINER_WORDS;
+        // SAFETY: byte offsets stay within `dst_bytes` by construction
+        // (`dst_idx < union_keys.len()` ⇒ `dst_word_off +
+        // BITMAP_CONTAINER_WORDS ≤ words_per_term`). Source: `src_word_off
+        // + BITMAP_CONTAINER_WORDS ≤ term.total_words` by [`VramCht::build_entry`]
+        // invariant.
+        let dst_ptr = unsafe {
+            (dst as *mut u8).add(dst_word_off * std::mem::size_of::<u32>())
+        };
+        let src_ptr = unsafe {
+            (term.device_ptr() as *const u8)
+                .add((*src_word_off as usize) * std::mem::size_of::<u32>())
+        };
+        let rc = unsafe {
+            cudaMemcpyAsync(
+                dst_ptr as *mut c_void,
+                src_ptr as *const c_void,
+                bucket_bytes,
+                cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream,
+            )
+        };
+        if rc != CUDA_SUCCESS {
+            return Err(CudaBitmapError::Cuda {
+                what: "cudaMemcpyAsync(scatter D2D bucket)",
+                code: rc,
+            });
+        }
+    }
+    Ok(())
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -813,5 +1105,201 @@ mod tests {
         let dbg = format!("{kernel:?}");
         assert!(dbg.contains("CudaBitmapOpKernel"));
         assert!(dbg.contains("capacity_words"));
+    }
+
+    // ============================================================
+    // VRAM fold tests (Phase 2 D-3 v2)
+    // ============================================================
+
+    /// Helper: insert a `RoaringPostings` into a fresh `VramCht` and
+    /// return the `Arc<VramTermEntry>`. Returns None if CUDA insert
+    /// fails (driver-missing host).
+    fn vram_term_entry(
+        rp: &crate::postings::roaring::encoder::RoaringPostings,
+        cache: &crate::postings::roaring::vram_cht::VramCht,
+        addr: usize,
+    ) -> Option<Arc<crate::postings::roaring::vram_cht::VramTermEntry>> {
+        let key = crate::postings::roaring::cht::ChtKey {
+            segment_id: crate::index::SegmentId::generate_random(),
+            posting_data_addr: addr,
+            posting_data_len: 100,
+        };
+        let inserted = cache.insert(key.clone(), rp).ok()?;
+        if !inserted {
+            return None;
+        }
+        cache.get(&key)
+    }
+
+    #[test]
+    fn vram_fold_empty_returns_empty() {
+        let Some(kernel) = try_kernel() else { return };
+        let union_keys: [u16; 1] = [0];
+        let res = kernel
+            .compute_fold_vram(BoolOp::And, &[], &union_keys)
+            .unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn vram_fold_empty_union_returns_empty() {
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht::VramCht::with_budget(64 * 1024 * 1024);
+        let rp = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[1, 2, 3]);
+        let Some(t1) = vram_term_entry(&rp, &cache, 0xa1) else { return };
+        let Some(t2) = vram_term_entry(&rp, &cache, 0xa2) else { return };
+        let res = kernel
+            .compute_fold_vram(BoolOp::And, &[t1, t2], &[])
+            .unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn vram_fold_single_term_round_trips_layout() {
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht::VramCht::with_budget(64 * 1024 * 1024);
+        // Two-bucket term so we cross a high16 boundary in the union.
+        let docs: Vec<u32> = (0..3).chain(std::iter::once(65540)).collect();
+        let rp = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&docs);
+        let Some(term) = vram_term_entry(&rp, &cache, 0xfeed) else { return };
+        let union_keys: [u16; 2] = [0, 1];
+        let got = kernel
+            .compute_fold_vram(BoolOp::And, &[term], &union_keys)
+            .unwrap();
+        // Build the expected flat layout via the host-side oracle (same
+        // shape as flat_buffer_for_term in gpu_dispatch.rs).
+        let mut expected = vec![0u32; union_keys.len() * BITMAP_CONTAINER_WORDS];
+        for (high16, container) in &rp.containers {
+            if container.cardinality() == 0 {
+                continue;
+            }
+            let Ok(idx) = union_keys.binary_search(high16) else {
+                continue;
+            };
+            let start = idx * BITMAP_CONTAINER_WORDS;
+            let end = start + BITMAP_CONTAINER_WORDS;
+            match container {
+                crate::postings::roaring::Container::Bitmap(bm) => {
+                    expected[start..end].copy_from_slice(bm.words.as_ref());
+                }
+                crate::postings::roaring::Container::Array(arr) => {
+                    let bm = crate::postings::roaring::BitmapContainer::from_array(arr);
+                    expected[start..end].copy_from_slice(bm.words.as_ref());
+                }
+                crate::postings::roaring::Container::Run(rc) => {
+                    let bm = crate::postings::roaring::BitmapContainer::from_run(rc);
+                    expected[start..end].copy_from_slice(bm.words.as_ref());
+                }
+            }
+        }
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn vram_fold_matches_compute_fold_oracle() {
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht::VramCht::with_budget(64 * 1024 * 1024);
+        // Three terms with overlapping bucket sets — exercises the
+        // scatter scatter-zero-fill-and-copy path for buckets present
+        // in some terms but not others.
+        let t0 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            1, 2, 3, 65540, 65541,
+        ]);
+        let t1 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            2, 3, 4, 65541, 65542,
+        ]);
+        let t2 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            3, 4, 5, 65540, 65541,
+        ]);
+        let Some(v0) = vram_term_entry(&t0, &cache, 0xa1) else { return };
+        let Some(v1) = vram_term_entry(&t1, &cache, 0xa2) else { return };
+        let Some(v2) = vram_term_entry(&t2, &cache, 0xa3) else { return };
+
+        let term_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&t0, &t1, &t2];
+        let union_keys =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &term_refs,
+            );
+
+        // Host oracle: flat buffers via flat_buffer_for_term + sequential
+        // compute() folds (same as the existing host fold path).
+        let host_bufs: Vec<Vec<u32>> = term_refs
+            .iter()
+            .map(|t| {
+                crate::postings::roaring::gpu_dispatch::flat_buffer_for_term_for_test(
+                    t,
+                    &union_keys,
+                )
+            })
+            .collect();
+        let host_refs: Vec<&[u32]> = host_bufs.iter().map(|v| v.as_slice()).collect();
+        let oracle = kernel.compute_fold(BoolOp::And, &host_refs).unwrap();
+
+        let vram_terms = vec![v0, v1, v2];
+        let got = kernel
+            .compute_fold_vram(BoolOp::And, &vram_terms, &union_keys)
+            .unwrap();
+
+        assert_eq!(
+            got, oracle,
+            "VRAM fold result must equal host-fold oracle byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn vram_fold_or_xor_match_oracle() {
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht::VramCht::with_budget(64 * 1024 * 1024);
+        let t0 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[1, 2, 3]);
+        let t1 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[3, 4, 5]);
+        let Some(v0) = vram_term_entry(&t0, &cache, 0xb1) else { return };
+        let Some(v1) = vram_term_entry(&t1, &cache, 0xb2) else { return };
+        let term_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&t0, &t1];
+        let union_keys =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &term_refs,
+            );
+
+        for op in [BoolOp::Or, BoolOp::Xor] {
+            let host_bufs: Vec<Vec<u32>> = term_refs
+                .iter()
+                .map(|t| {
+                    crate::postings::roaring::gpu_dispatch::flat_buffer_for_term_for_test(
+                        t,
+                        &union_keys,
+                    )
+                })
+                .collect();
+            let host_refs: Vec<&[u32]> = host_bufs.iter().map(|v| v.as_slice()).collect();
+            let oracle = kernel.compute_fold(op, &host_refs).unwrap();
+            let got = kernel
+                .compute_fold_vram(op, &vec![Arc::clone(&v0), Arc::clone(&v1)], &union_keys)
+                .unwrap();
+            assert_eq!(got, oracle, "{op:?} VRAM fold must match host oracle");
+        }
+    }
+
+    #[test]
+    fn vram_fold_capacity_growth_on_large_union() {
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht::VramCht::with_budget(1 << 30);
+        // Build terms whose union covers many buckets, forcing the
+        // kernel buffers to grow past INITIAL_CAPACITY_WORDS.
+        // 24 buckets × BITMAP_CONTAINER_WORDS = 49 152 words > initial
+        // 24 576 — triggers reallocate_buffers.
+        let docs1: Vec<u32> = (0..24).map(|b| b * 65536).collect();
+        let docs2: Vec<u32> = (0..24).map(|b| b * 65536 + 1).collect();
+        let rp1 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&docs1);
+        let rp2 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&docs2);
+        let Some(v1) = vram_term_entry(&rp1, &cache, 0xc1) else { return };
+        let Some(v2) = vram_term_entry(&rp2, &cache, 0xc2) else { return };
+        let union_keys: Vec<u16> = (0..24).collect();
+        let res = kernel
+            .compute_fold_vram(BoolOp::Or, &[v1, v2], &union_keys)
+            .unwrap();
+        assert_eq!(res.len(), 24 * BITMAP_CONTAINER_WORDS);
+        // Sanity: at least the doc-id 0 (bit 0) and doc-id 1 (bit 1) of
+        // bucket 0 are set after OR.
+        assert!(res[0] & 0b11 == 0b11, "OR result must have bits 0 and 1 set in bucket 0");
     }
 }

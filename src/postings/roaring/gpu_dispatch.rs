@@ -373,6 +373,112 @@ pub fn try_gpu_bool(
 }
 
 // ============================================================
+// Phase 2 D-3 v2 — VRAM-resident fold dispatch.
+// ============================================================
+//
+// `try_gpu_bool_vram` is the device-resident equivalent of
+// `try_gpu_bool`: instead of `&[&RoaringPostings]` (host) it takes
+// `&[Arc<VramTermEntry>]` (device-resident, cached). Used by
+// `try_gpu_intersect` when every cohort member has a VRAM CHT v2 hit.
+// Skips the entire `flat_buffer_for_term` + H→D step in favour of
+// per-bucket DtD scatter from the cached entries.
+
+/// Like [`try_gpu_bool`], but with device-resident inputs from the
+/// VRAM CHT v2 cache. Returns the same `RoaringPostings` shape so the
+/// dispatch caller (`try_gpu_intersect`) is layout-agnostic.
+///
+/// Caller invariants (caller-checked, not re-validated here):
+/// - `terms.len() ≥ 2` (single-term cohorts are handled by the caller
+///   via `compute_fold_vram`'s degenerate gather path or by skipping
+///   the GPU entirely).
+/// - All terms refer to the same segment (same `SegmentReader`).
+/// - The planner has already approved the cohort via [`should_dispatch_gpu`]
+///   above; we don't re-check.
+///
+/// # GPU init failure semantics
+///
+/// Identical to [`try_gpu_bool`]: the kernel is reused from the
+/// process-lifetime `GPU_RESOURCES` cache. Init failure is sticky —
+/// callers receive `None` and bump the CPU fallback counter.
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub fn try_gpu_bool_vram(
+    op: BoolOp,
+    terms: &[std::sync::Arc<crate::postings::roaring::vram_cht::VramTermEntry>],
+) -> Option<RoaringPostings> {
+    if terms.len() < 2 {
+        CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let kernel = match gpu_resources() {
+        Some(k) => k,
+        None => {
+            CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    // Build the union of all `high16` keys across the cohort. Each
+    // `VramTermEntry`'s `bucket_index` is sorted ascending by `high16`,
+    // so the union is just a merge — but for simplicity we re-use the
+    // BTreeSet path from the host fold code (same one-shot allocation).
+    let mut set: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for term in terms {
+        for (high16, _) in term.bucket_index() {
+            set.insert(*high16);
+        }
+    }
+    if set.is_empty() {
+        // Pathological case: cached entries with all-empty buckets.
+        // Match the host fold's empty-cohort short-circuit.
+        GPU_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        return Some(RoaringPostings::default());
+    }
+    let union_keys: Vec<u16> = set.into_iter().collect();
+    let num_words = union_keys.len() * BITMAP_CONTAINER_WORDS;
+
+    let acc = match kernel.compute_fold_vram(op, terms, &union_keys) {
+        Ok(v) => {
+            debug_assert_eq!(v.len(), num_words);
+            v
+        }
+        Err(_) => {
+            CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    GPU_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Decode the flat result back to a RoaringPostings (identical to
+    // `try_gpu_bool`'s tail). Empty containers (all-zero post-AND) drop
+    // out via the cardinality == 0 check.
+    let mut out = Vec::with_capacity(union_keys.len());
+    for (i, &high16) in union_keys.iter().enumerate() {
+        let start = i * BITMAP_CONTAINER_WORDS;
+        let end = start + BITMAP_CONTAINER_WORDS;
+        let chunk = &acc[start..end];
+        let mut words: Box<[u32; BITMAP_CONTAINER_WORDS]> =
+            Box::new([0u32; BITMAP_CONTAINER_WORDS]);
+        words.copy_from_slice(chunk);
+        let bm = BitmapContainer::from_words(words);
+        if bm.cardinality() == 0 {
+            continue;
+        }
+        let optimized = Container::Bitmap(bm).optimize();
+        out.push((high16, optimized));
+    }
+    Some(RoaringPostings { containers: out })
+}
+
+/// Stub for the no-feature / no-cuda path so call sites compile.
+#[cfg(not(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel")))]
+pub fn try_gpu_bool_vram(
+    _op: BoolOp,
+    _terms: &[std::sync::Arc<()>],
+) -> Option<RoaringPostings> {
+    CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+// ============================================================
 // Internal helpers.
 // ============================================================
 
@@ -434,6 +540,30 @@ fn flat_buffer_for_term(term: &RoaringPostings, union_keys: &[u16]) -> Vec<u32> 
         term_iter.next();
     }
     out
+}
+
+// ============================================================
+// Test-only cross-module exports
+// ============================================================
+//
+// `compute_fold_vram` in `cuda_dispatch::tests` needs the same
+// `union_high16_keys` / `flat_buffer_for_term` helpers as the host
+// fold path so the VRAM fold can be byte-equally compared against the
+// host oracle without re-implementing the helpers. These two
+// functions re-export the private helpers under `pub(crate)` and only
+// compile in test builds.
+
+#[cfg(all(test, feature = "gpu", feature = "ferro-compress"))]
+pub(crate) fn union_high16_keys_for_test(terms: &[&RoaringPostings]) -> Vec<u16> {
+    union_high16_keys(terms)
+}
+
+#[cfg(all(test, feature = "gpu", feature = "ferro-compress"))]
+pub(crate) fn flat_buffer_for_term_for_test(
+    term: &RoaringPostings,
+    union_keys: &[u16],
+) -> Vec<u32> {
+    flat_buffer_for_term(term, union_keys)
 }
 
 // ============================================================

@@ -66,6 +66,8 @@ pub mod ferro_compress_bridge;
 pub mod from_block_segment;
 pub mod gpu_dispatch;
 pub mod planner;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub mod vram_cht;
 
 pub use container::{
     ArrayContainer, BitmapContainer, Container, ContainerError, Run, RunContainer,
@@ -81,6 +83,8 @@ pub use gpu_dispatch::{
     cpu_fallback_count, gpu_dispatch_count, record_cpu_fallback, reset_dispatch_counters,
     try_gpu_bool, BoolOp,
 };
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub use gpu_dispatch::try_gpu_bool_vram;
 pub use planner::{
     should_dispatch_gpu, TermStat, MIN_COHORT_DOCS, MIN_PER_TERM_CARDINALITY, MIN_RATIO,
 };

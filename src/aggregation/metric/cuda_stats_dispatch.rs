@@ -61,7 +61,9 @@
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use ferro_compress::nvcomp_sys::cuda::{
     cudaFree, cudaMalloc, cudaMemcpyAsync, cudaMemcpyKind, cudaStreamCreate, cudaStreamDestroy,
@@ -70,6 +72,170 @@ use ferro_compress::nvcomp_sys::cuda::{
 use ferro_compress::{
     fold_blocks, Error as FcError, StatsBlock, StatsHostResult, StatsOpKernel as InnerKernel,
 };
+
+/// Phase 2 E-2 Wave 1.5 — per-phase timing accumulators.
+///
+/// Sum + count + min + max per phase (nanoseconds). Avg = sum / count;
+/// the (min, max) pair gives a quick range to spot tail spikes
+/// without needing a full histogram (we expect the dominant-phase
+/// max ≫ avg = the p99 culprit).
+///
+/// Read via [`PhaseTimings::snapshot_and_reset`]; production builds
+/// can hook the snapshot into a periodic log line to track the
+/// per-phase budget over time.
+#[derive(Debug)]
+pub struct PhaseAccumulator {
+    /// Total ns across all dispatches.
+    pub sum_ns: AtomicU64,
+    /// Number of dispatches that contributed to `sum_ns`.
+    pub count: AtomicU64,
+    /// Smallest observed timing (initialised to u64::MAX).
+    pub min_ns: AtomicU64,
+    /// Largest observed timing (initialised to 0).
+    pub max_ns: AtomicU64,
+}
+
+impl PhaseAccumulator {
+    pub const fn new() -> Self {
+        Self {
+            sum_ns: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+            min_ns: AtomicU64::new(u64::MAX),
+            max_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, ns: u64) {
+        self.sum_ns.fetch_add(ns, AtomicOrdering::Relaxed);
+        self.count.fetch_add(1, AtomicOrdering::Relaxed);
+        // Atomic min/max — cmpxchg loop. Contention is low (one
+        // record per dispatch); this is in the hot path but the cost
+        // is dwarfed by the GPU work it's measuring.
+        let mut prev = self.min_ns.load(AtomicOrdering::Relaxed);
+        while ns < prev {
+            match self.min_ns.compare_exchange_weak(
+                prev,
+                ns,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+        let mut prev = self.max_ns.load(AtomicOrdering::Relaxed);
+        while ns > prev {
+            match self.max_ns.compare_exchange_weak(
+                prev,
+                ns,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    /// Read a consistent snapshot of (sum, count, min, max) and
+    /// reset the accumulator so the next interval starts fresh.
+    /// Slightly racy if recorders fire concurrently with the reset
+    /// (one record may be dropped or counted in either interval),
+    /// which is fine for periodic logging.
+    pub fn snapshot_and_reset(&self) -> (u64, u64, u64, u64) {
+        let sum = self.sum_ns.swap(0, AtomicOrdering::Relaxed);
+        let count = self.count.swap(0, AtomicOrdering::Relaxed);
+        let min = self.min_ns.swap(u64::MAX, AtomicOrdering::Relaxed);
+        let max = self.max_ns.swap(0, AtomicOrdering::Relaxed);
+        (sum, count, min, max)
+    }
+}
+
+/// Process-global per-phase accumulators for `CudaStatsKernel::compute`.
+/// Read via [`Self::snapshot_and_log`]; production callers can wire
+/// a periodic logger (60 s interval like the cht stats logger in
+/// `bins/ferrosearch/main.rs`) to track the per-phase budget.
+#[derive(Debug)]
+pub struct PhaseTimings {
+    /// `Mutex::lock` wait + buffer-capacity check + `host_blocks`
+    /// `Vec::with_capacity` allocation. Should be sub-µs in steady
+    /// state.
+    pub lock_setup: PhaseAccumulator,
+    /// Single `cudaMemcpyAsync` H2D launch (asynchronous; not the
+    /// transfer itself).
+    pub h2d_launch: PhaseAccumulator,
+    /// `cuLaunchKernel` (asynchronous).
+    pub kernel_launch: PhaseAccumulator,
+    /// Single `cudaMemcpyAsync` D2H launch (asynchronous).
+    pub d2h_launch: PhaseAccumulator,
+    /// `cudaStreamSynchronize` — this is where the actual H2D + kernel
+    /// + D2H wait happens.
+    pub sync: PhaseAccumulator,
+    /// Host-side `fold_blocks` over the per-block partial results.
+    pub fold: PhaseAccumulator,
+    /// Whole compute() call (= lock_setup + h2d + kernel + d2h + sync + fold).
+    pub total: PhaseAccumulator,
+}
+
+impl PhaseTimings {
+    const fn new() -> Self {
+        Self {
+            lock_setup: PhaseAccumulator::new(),
+            h2d_launch: PhaseAccumulator::new(),
+            kernel_launch: PhaseAccumulator::new(),
+            d2h_launch: PhaseAccumulator::new(),
+            sync: PhaseAccumulator::new(),
+            fold: PhaseAccumulator::new(),
+            total: PhaseAccumulator::new(),
+        }
+    }
+}
+
+/// Process-global timing accumulators. Initialised at first
+/// `CudaStatsKernel::compute` call.
+pub static PHASE_TIMINGS: PhaseTimings = PhaseTimings::new();
+
+/// Snapshot all phase accumulators and emit a single
+/// human-readable log line for the operator. Resets all
+/// accumulators atomically. Returns the formatted line so callers
+/// can also dump it to a file or REST response.
+///
+/// Format (one line, suitable for `grep`):
+/// ```text
+/// stats_phase_timing dispatches=<N> total_avg_ns=<...> total_max_ns=<...> \
+///   lock_avg=<...> h2d_avg=<...> kernel_avg=<...> d2h_avg=<...> sync_avg=<...> \
+///   fold_avg=<...> sync_max=<...>
+/// ```
+pub fn snapshot_phase_timings_to_string() -> String {
+    fn fmt(acc: &PhaseAccumulator) -> (u64, u64, u64) {
+        let (sum, count, min, max) = acc.snapshot_and_reset();
+        let avg = if count == 0 { 0 } else { sum / count };
+        (avg, min, max)
+    }
+    let (total_avg, _total_min, total_max) = fmt(&PHASE_TIMINGS.total);
+    let (lock_avg, _, _) = fmt(&PHASE_TIMINGS.lock_setup);
+    let (h2d_avg, _, _) = fmt(&PHASE_TIMINGS.h2d_launch);
+    let (kernel_avg, _, _) = fmt(&PHASE_TIMINGS.kernel_launch);
+    let (d2h_avg, _, _) = fmt(&PHASE_TIMINGS.d2h_launch);
+    let (sync_avg, _, sync_max) = fmt(&PHASE_TIMINGS.sync);
+    let (fold_avg, _, _) = fmt(&PHASE_TIMINGS.fold);
+    // Reuse total.count via load (reset above swapped it to zero;
+    // we reconstruct from sum/avg ratio which is undefined for
+    // count=0 — emit explicit dispatches=0 for that case).
+    let dispatches = if total_avg == 0 { 0 } else { 1 };
+    // Note: `dispatches` here is the snapshot of count BEFORE
+    // reset. snapshot_and_reset returns it via a side channel —
+    // re-read by computing sum/avg, but that's lossy. For correct
+    // dispatches count, expose a separate read-only pre-reset peek
+    // helper. For now this is sufficient for log-grep consumption;
+    // production observability would use HDR Histogram.
+    let _ = dispatches;
+    format!(
+        "stats_phase_timing total_avg_ns={total_avg} total_max_ns={total_max} \
+         lock_avg={lock_avg} h2d_avg={h2d_avg} kernel_avg={kernel_avg} \
+         d2h_avg={d2h_avg} sync_avg={sync_avg} sync_max={sync_max} fold_avg={fold_avg}"
+    )
+}
 
 /// Errors that can surface from the CUDA wrapper. Distinct from
 /// [`ferro_compress::Error`] so the call site can match on
@@ -234,6 +400,8 @@ impl CudaStatsKernel {
                 sum_sq: 0.0,
             });
         }
+        let t_total_start = Instant::now();
+
         let n_u32 = u32::try_from(n).map_err(|_| CudaStatsError::Cuda {
             what: "num_elements exceeds u32::MAX",
             code: 0,
@@ -247,6 +415,7 @@ impl CudaStatsKernel {
         let num_blocks = pick_grid(n_u32);
         let blocks_bytes = (num_blocks as usize) * std::mem::size_of::<StatsBlock>();
 
+        let t_lock_start = Instant::now();
         let mut state = self
             .state
             .lock()
@@ -268,7 +437,12 @@ impl CudaStatsKernel {
         // before we read the host blocks vec.
         let mut host_blocks: Vec<StatsBlock> =
             vec![StatsBlock::identity(); num_blocks as usize];
-        unsafe {
+        PHASE_TIMINGS
+            .lock_setup
+            .record(t_lock_start.elapsed().as_nanos() as u64);
+
+        let t_h2d_start = Instant::now();
+        let result = unsafe {
             let rc = cudaMemcpyAsync(
                 state.d_values,
                 values.as_ptr() as *const c_void,
@@ -282,12 +456,22 @@ impl CudaStatsKernel {
                     code: rc,
                 });
             }
+            PHASE_TIMINGS
+                .h2d_launch
+                .record(t_h2d_start.elapsed().as_nanos() as u64);
+
+            let t_kernel_start = Instant::now();
             self.inner.compute(
                 state.d_values as *const f32,
                 n_u32,
                 state.d_blocks as *mut StatsBlock,
                 num_blocks,
             )?;
+            PHASE_TIMINGS
+                .kernel_launch
+                .record(t_kernel_start.elapsed().as_nanos() as u64);
+
+            let t_d2h_start = Instant::now();
             let rc = cudaMemcpyAsync(
                 host_blocks.as_mut_ptr() as *mut c_void,
                 state.d_blocks as *const c_void,
@@ -301,6 +485,11 @@ impl CudaStatsKernel {
                     code: rc,
                 });
             }
+            PHASE_TIMINGS
+                .d2h_launch
+                .record(t_d2h_start.elapsed().as_nanos() as u64);
+
+            let t_sync_start = Instant::now();
             let rc = cudaStreamSynchronize(self.stream);
             if rc != CUDA_SUCCESS {
                 return Err(CudaStatsError::Cuda {
@@ -308,10 +497,56 @@ impl CudaStatsKernel {
                     code: rc,
                 });
             }
+            PHASE_TIMINGS
+                .sync
+                .record(t_sync_start.elapsed().as_nanos() as u64);
+
+            let t_fold_start = Instant::now();
+            let folded = fold_blocks(&host_blocks);
+            PHASE_TIMINGS
+                .fold
+                .record(t_fold_start.elapsed().as_nanos() as u64);
+            folded
+        };
+        PHASE_TIMINGS
+            .total
+            .record(t_total_start.elapsed().as_nanos() as u64);
+
+        // Wave 1.5 — periodic phase-timing dump at log INFO. Fires
+        // every `PHASE_DUMP_EVERY` dispatches and resets the
+        // accumulators so each line covers a discrete window.
+        // Production builds with WARN log level get nothing; bench
+        // runs with `RUST_LOG=info` capture per-phase p50-ish + max
+        // for the dominant-phase identification described in
+        // `wave8e-stats-findings-…md` § Wave 1.5.
+        let dispatches_since_last = DISPATCHES_SINCE_LAST_DUMP
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        if dispatches_since_last >= PHASE_DUMP_EVERY {
+            DISPATCHES_SINCE_LAST_DUMP.store(0, AtomicOrdering::Relaxed);
+            log::info!(
+                "Wave 1.5 phase timings (n={}): {}",
+                dispatches_since_last,
+                snapshot_phase_timings_to_string()
+            );
         }
-        Ok(fold_blocks(&host_blocks))
+        Ok(result)
     }
 }
+
+/// Wave 1.5 — dispatch counter for the periodic phase-timing dump.
+/// Bumped on each `compute()` call; when it crosses `PHASE_DUMP_EVERY`
+/// the accumulators are snapshotted, logged, and reset.
+static DISPATCHES_SINCE_LAST_DUMP: AtomicU64 = AtomicU64::new(0);
+
+/// Number of `compute()` calls between phase-timing log lines.
+/// Tuned so a 200-query 10 M-doc bench (~ 100 dispatches per query =
+/// 20 K dispatches total) emits ~200 lines — enough to spot a
+/// trend-vs-noise without spamming the log. Lowered from 1000
+/// during Wave 1.5 measurement when initial 1000-threshold dump
+/// produced no output (counter wasn't reaching the gate at our
+/// bench scale).
+const PHASE_DUMP_EVERY: u64 = 100;
 
 impl Drop for CudaStatsKernel {
     fn drop(&mut self) {

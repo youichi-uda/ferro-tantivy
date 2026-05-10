@@ -209,22 +209,58 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        // FerroSearch (Wave 15 / Wave 18-1): eagerly load any auxiliary
-        // sort cursors listed in segment meta. Each file's version byte
-        // is peeked at open time so v1 (single-field) and v2 (multi-
-        // field) cursors land in their respective maps. Missing files
-        // are surfaced as errors because the meta entry advertises
-        // them as part of the segment contract.
+        // FerroSearch (Wave 15 / Wave 18-1 / Wave 15 Phase H-5b): eagerly
+        // load any auxiliary sort cursors listed in segment meta. Each
+        // file's version byte is peeked at open time so v1 (single-field)
+        // and v2 (multi-field) cursors land in their respective maps.
+        //
+        // **Wave 15 Phase H-5b.** Missing or corrupt cursor files are
+        // logged as warnings instead of erroring the whole SegmentReader
+        // open. The Phase E dispatch gate naturally degrades to the
+        // legacy `SortByStaticFastValue` path (single-field) or to the
+        // Wave 18-2 `EarlyTermOrFallbackCollectorMulti` per-segment
+        // fallback (multi-field) when `sort_cursor()` /
+        // `sort_cursor_v2()` returns `None`.
+        //
+        // Phase H-4 EC2 stress-bench (c7gd.8xlarge, Rally http_logs
+        // append-no-conflicts with `bulk_indexing_clients=8`,
+        // `index.sort.field=@timestamp desc`) observed ~0.2% of segments
+        // (1 in 516) reach the reader with `sort_cursor_fields`
+        // advertised in `meta.json` but the `.sortcursor` file absent
+        // on disk. The H-5 `sync_directory()` fix in
+        // `build_and_write_sort_cursors` handles 99.8% of segments
+        // correctly; the remaining edge case (root cause not yet fully
+        // identified) caused `bulk_auto_soft_refresh` to fail with
+        // `OpenReadError(FileDoesNotExist)` ~12+ times/sec until that
+        // segment was dropped from the committed list, blocking
+        // production indexing under load.
         let mut sort_cursors: HashMap<String, Arc<SortCursorIndex>> = HashMap::new();
         let mut sort_cursors_v2: HashMap<String, Arc<SortCursorIndexV2>> = HashMap::new();
         for field in segment.meta().sort_cursor_fields() {
-            let slice = segment.open_sort_cursor_read(field)?;
-            match SortCursorAny::open(slice)? {
-                SortCursorAny::V1(c) => {
-                    sort_cursors.insert(field.clone(), Arc::new(c));
-                }
-                SortCursorAny::V2(c) => {
-                    sort_cursors_v2.insert(field.clone(), Arc::new(c));
+            match segment.open_sort_cursor_read(field) {
+                Ok(slice) => match SortCursorAny::open(slice) {
+                    Ok(SortCursorAny::V1(c)) => {
+                        sort_cursors.insert(field.clone(), Arc::new(c));
+                    }
+                    Ok(SortCursorAny::V2(c)) => {
+                        sort_cursors_v2.insert(field.clone(), Arc::new(c));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Wave 15: sort cursor for segment {} field {} failed to parse, falling back to legacy sort path: {}",
+                            segment.id().uuid_string(),
+                            field,
+                            e
+                        );
+                    }
+                },
+                Err(e) => {
+                    log::warn!(
+                        "Wave 15: sort cursor file missing for segment {} field {}, falling back to legacy sort path: {}",
+                        segment.id().uuid_string(),
+                        field,
+                        e
+                    );
                 }
             }
         }

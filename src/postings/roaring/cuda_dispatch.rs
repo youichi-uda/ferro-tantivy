@@ -196,6 +196,160 @@ impl CudaBitmapOpKernel {
         })
     }
 
+    /// Run `out = TERMS[0] OP TERMS[1] OP … OP TERMS[N-1]` as a single
+    /// device-resident fold, with one `cudaStreamSynchronize` at the
+    /// end and zero host roundtrips between fold steps. This is the
+    /// production hot path for [`super::gpu_dispatch::try_gpu_bool`] —
+    /// see Wave 8 / B / 3 findings for why per-step `compute`
+    /// + sync was bottlenecked at 11 × ~700 µs ≈ 7.7 ms / 12-term
+    /// cohort.
+    ///
+    /// Pattern (N terms):
+    /// 1. H→D `term[0]` → `d_acc` (initially aliased to `d_a`)
+    /// 2. For `i in 1..N`:
+    ///    a. H→D `term[i]` → `d_b`
+    ///    b. launch `d_acc OP d_b → d_out`
+    ///    c. pointer-swap `d_acc` ↔ `d_out` (no memcpy)
+    /// 3. `cudaStreamSynchronize` (single, end-of-fold)
+    /// 4. D→H `d_acc` → host `Vec<u32>`
+    ///
+    /// Wallclock budget: 12 × `cudaMemcpyAsync` H→D + 11 ×
+    /// `cuLaunchKernel` + 1 × sync + 1 × `cudaMemcpyAsync` D→H.
+    /// Each async op is ~50 µs at PCIe 4.0 × 16 for the mega_cohort
+    /// 96 KiB working set; total ≈ 1-2 ms, well under the 8.18 ms
+    /// 11-step Wave 8 / B baseline.
+    ///
+    /// Empty / single-term short-circuit:
+    /// - `terms.is_empty()` → returns `Ok(Vec::new())`.
+    /// - `terms.len() == 1` → returns `Ok(terms[0].to_vec())` without
+    ///   touching the GPU. Matches the semantics of folding a single
+    ///   element with no binary op applied.
+    pub fn compute_fold(
+        &self,
+        op: BoolOp,
+        terms: &[&[u32]],
+    ) -> Result<Vec<u32>, CudaBitmapError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        if terms.len() == 1 {
+            return Ok(terms[0].to_vec());
+        }
+        let n = terms[0].len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        for t in terms.iter().skip(1) {
+            if t.len() != n {
+                return Err(CudaBitmapError::LenMismatch {
+                    a: n,
+                    b: t.len(),
+                });
+            }
+        }
+        let bytes = n.checked_mul(std::mem::size_of::<u32>()).ok_or(
+            CudaBitmapError::Cuda {
+                what: "byte-size overflow",
+                code: 0,
+            },
+        )?;
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("CudaBitmapOpKernel state mutex poisoned");
+        if n > state.capacity_words {
+            // SAFETY: we hold the state mutex; no other caller can
+            // observe the intermediate (freed) pointers.
+            unsafe { reallocate_buffers(&mut state, n.next_power_of_two())? };
+        }
+
+        let cuda_op = to_inner_op(op);
+        let n_u32 = u32::try_from(n).map_err(|_| CudaBitmapError::Cuda {
+            what: "num_words exceeds u32::MAX",
+            code: 0,
+        })?;
+
+        // SAFETY: state.d_a / state.d_b / state.d_out are all valid
+        // device pointers sized for state.capacity_words ≥ n u32s. We
+        // hold the state mutex for the whole fold so the pointers are
+        // stable across iterations. The async chain is queued on a
+        // single stream, terminated by a single sync before D→H.
+        unsafe {
+            // Step 1: upload terms[0] into d_a (the initial accumulator).
+            let rc = cudaMemcpyAsync(
+                state.d_a,
+                terms[0].as_ptr() as *const c_void,
+                bytes,
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                self.stream,
+            );
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaMemcpyAsync(fold init H2D)",
+                    code: rc,
+                });
+            }
+            // Step 2: per-term upload + launch + pointer-swap.
+            for term in terms.iter().skip(1) {
+                let rc = cudaMemcpyAsync(
+                    state.d_b,
+                    term.as_ptr() as *const c_void,
+                    bytes,
+                    cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    self.stream,
+                );
+                if rc != CUDA_SUCCESS {
+                    return Err(CudaBitmapError::Cuda {
+                        what: "cudaMemcpyAsync(fold term H2D)",
+                        code: rc,
+                    });
+                }
+                self.inner.compute(
+                    cuda_op,
+                    state.d_a as *const u32,
+                    state.d_b as *const u32,
+                    state.d_out as *mut u32,
+                    n_u32,
+                )?;
+                // Pointer-swap d_a ↔ d_out so the next iteration reads
+                // the just-written result as its accumulator. No
+                // memcpy. Both slots remain valid device buffers of
+                // identical capacity; the role assignment is purely
+                // logical. Manual swap (vs `std::mem::swap` on two
+                // fields of the same struct) sidesteps the borrow
+                // checker's two-mutable-borrow-of-state objection.
+                let tmp = state.d_a;
+                state.d_a = state.d_out;
+                state.d_out = tmp;
+            }
+            // Step 3 + 4: single sync, then D→H from d_a (which holds
+            // the final result after the last swap above).
+            let mut out = vec![0u32; n];
+            let rc = cudaMemcpyAsync(
+                out.as_mut_ptr() as *mut c_void,
+                state.d_a as *const c_void,
+                bytes,
+                cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                self.stream,
+            );
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaMemcpyAsync(fold result D2H)",
+                    code: rc,
+                });
+            }
+            let rc = cudaStreamSynchronize(self.stream);
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaStreamSynchronize(fold)",
+                    code: rc,
+                });
+            }
+            Ok(out)
+        }
+    }
+
     /// Run `out = a OP b` on host slices, returning a fresh `Vec<u32>`.
     /// Same byte-equal semantics as the wgpu `BitmapOpKernel::compute`
     /// — the byte-equal CPU oracle in
@@ -210,6 +364,13 @@ impl CudaBitmapOpKernel {
     /// too, but only because we need a stable view of the device
     /// pointers — the lock release happens immediately after
     /// `cudaStreamSynchronize` returns).
+    ///
+    /// **Prefer [`Self::compute_fold`] for multi-term reductions** —
+    /// it eliminates the per-step `cudaStreamSynchronize` floor by
+    /// batching the whole fold on the device with a single end-of-
+    /// fold sync. This `compute` entry point is retained for one-shot
+    /// pairwise ops and as the byte-equal oracle that fold tests
+    /// compare against.
     pub fn compute(
         &self,
         op: BoolOp,
@@ -564,6 +725,84 @@ mod tests {
         let b2 = pseudo_random(4, mid);
         let got2 = kernel.compute(BoolOp::Xor, &a2, &b2).unwrap();
         assert_eq!(got2.len(), mid);
+    }
+
+    #[test]
+    fn fold_empty_returns_empty() {
+        let Some(kernel) = try_kernel() else { return };
+        let res = kernel.compute_fold(BoolOp::And, &[]).unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn fold_single_term_round_trips_input() {
+        let Some(kernel) = try_kernel() else { return };
+        let term = pseudo_random(99, 2048);
+        let got = kernel.compute_fold(BoolOp::And, &[&term]).unwrap();
+        assert_eq!(got, term);
+    }
+
+    #[test]
+    fn fold_matches_sequential_compute_oracle() {
+        let Some(kernel) = try_kernel() else { return };
+        // 3-term cohort, large enough to exercise the swap loop.
+        let t0 = pseudo_random(1, 2048);
+        let t1 = pseudo_random(2, 2048);
+        let t2 = pseudo_random(3, 2048);
+        let terms: [&[u32]; 3] = [&t0, &t1, &t2];
+        // Sequential `compute` oracle: ((t0 AND t1) AND t2). Same
+        // wallclock-bottlenecked path that Wave 8 / B / 2 lands as the
+        // try_gpu_bool fold loop. compute_fold must produce a
+        // byte-identical result — fold is associative for
+        // bitwise AND/OR/XOR, and we apply ops in the same order.
+        let step0 = kernel.compute(BoolOp::And, &t0, &t1).unwrap();
+        let oracle = kernel.compute(BoolOp::And, &step0, &t2).unwrap();
+        let got = kernel.compute_fold(BoolOp::And, &terms).unwrap();
+        assert_eq!(got, oracle, "AND fold must match sequential compute");
+
+        let or_step0 = kernel.compute(BoolOp::Or, &t0, &t1).unwrap();
+        let or_oracle = kernel.compute(BoolOp::Or, &or_step0, &t2).unwrap();
+        let or_got = kernel.compute_fold(BoolOp::Or, &terms).unwrap();
+        assert_eq!(or_got, or_oracle, "OR fold must match sequential compute");
+
+        let xor_step0 = kernel.compute(BoolOp::Xor, &t0, &t1).unwrap();
+        let xor_oracle = kernel.compute(BoolOp::Xor, &xor_step0, &t2).unwrap();
+        let xor_got = kernel.compute_fold(BoolOp::Xor, &terms).unwrap();
+        assert_eq!(xor_got, xor_oracle, "XOR fold must match sequential compute");
+    }
+
+    #[test]
+    fn fold_length_mismatch_caught_pre_dispatch() {
+        let Some(kernel) = try_kernel() else { return };
+        let t0 = vec![0u32; 10];
+        let t1 = vec![0u32; 11]; // mismatched
+        let terms: [&[u32]; 2] = [&t0, &t1];
+        let res = kernel.compute_fold(BoolOp::And, &terms);
+        assert!(matches!(
+            res,
+            Err(CudaBitmapError::LenMismatch { a: 10, b: 11 })
+        ));
+    }
+
+    #[test]
+    fn fold_mega_cohort_correctness_on_smaller_proxy() {
+        let Some(kernel) = try_kernel() else { return };
+        // 12 terms × 1 024 words each — the same shape as
+        // try_gpu_bool's mega_cohort fold but small enough to verify
+        // byte-equality against a host-side AND oracle quickly.
+        let owned: Vec<Vec<u32>> = (0..12)
+            .map(|i| pseudo_random(0xfeed + i as u64, 1024))
+            .collect();
+        let terms: Vec<&[u32]> = owned.iter().map(|v| v.as_slice()).collect();
+        let got = kernel.compute_fold(BoolOp::And, &terms).unwrap();
+        // Host AND oracle.
+        let mut want = owned[0].clone();
+        for term in &owned[1..] {
+            for (w, t) in want.iter_mut().zip(term.iter()) {
+                *w &= *t;
+            }
+        }
+        assert_eq!(got, want, "12-term AND fold must match host oracle");
     }
 
     #[test]

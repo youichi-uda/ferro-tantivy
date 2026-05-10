@@ -276,27 +276,60 @@ pub fn try_gpu_bool(
     // could short-circuit on an all-zero result; we don't currently —
     // the kernel is fast enough at fixed flat size that a branch is
     // not worth the dispatch-count instrumentation skew.
-    let mut acc = flat_buffer_for_term(terms[0], &union_keys);
-    // Backend-specific op encoding: wgpu kernel takes
-    // `tantivy_gpu::posting::BitmapOp`; CUDA wrapper takes the local
-    // `BoolOp` directly (it converts internally to
-    // `ferro_compress::BitmapOp`). Same `compute(op, &acc, &other) ->
-    // Result<Vec<u32>>` API surface in both branches.
+    // Backend-specific dispatch:
+    //
+    // - **wgpu path** (`not(feature = "cuda-bitmap-kernel")`): per-step
+    //   `kernel.compute(...)` loop. Each step memcpys H↔D, launches a
+    //   pipeline, and `cudaStreamSynchronize`-equivalent waits before
+    //   the next iteration. This is the original Wave 6 / 7 wiring.
+    //
+    // - **CUDA path** (`feature = "cuda-bitmap-kernel"`): single
+    //   `kernel.compute_fold(...)` call. The wrapper uploads the first
+    //   term, then for each subsequent term: H→D the term, launch into
+    //   d_out, swap d_acc ↔ d_out via pointer swap (no memcpy), all
+    //   queued on the same stream with a single end-of-fold sync.
+    //   Wave 8 / B / 4 finding: the per-step `compute` path was
+    //   bottlenecked at 11 × ~700 µs ≈ 7.7 ms / 12-term cohort because
+    //   each step blocked the host on `cudaStreamSynchronize`; the
+    //   batched fold collapses that to 1 sync = ~1-2 ms estimated.
     #[cfg(not(feature = "cuda-bitmap-kernel"))]
-    let bitmap_op = op.to_gpu();
+    let acc = {
+        let mut acc = flat_buffer_for_term(terms[0], &union_keys);
+        let bitmap_op = op.to_gpu();
+        for term in terms.iter().skip(1) {
+            let other = flat_buffer_for_term(term, &union_keys);
+            match kernel.compute(bitmap_op, &acc, &other) {
+                Ok(v) => acc = v,
+                Err(_) => {
+                    CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+            debug_assert_eq!(acc.len(), num_words);
+        }
+        acc
+    };
     #[cfg(feature = "cuda-bitmap-kernel")]
-    let bitmap_op = op;
-    for term in terms.iter().skip(1) {
-        let other = flat_buffer_for_term(term, &union_keys);
-        match kernel.compute(bitmap_op, &acc, &other) {
-            Ok(v) => acc = v,
+    let acc = {
+        // Materialise all term flat buffers up front; compute_fold
+        // wants a slice-of-slices so it can iterate on the device
+        // without holding any per-iteration allocation lock.
+        let term_bufs: Vec<Vec<u32>> = terms
+            .iter()
+            .map(|t| flat_buffer_for_term(t, &union_keys))
+            .collect();
+        let term_refs: Vec<&[u32]> = term_bufs.iter().map(|v| v.as_slice()).collect();
+        match kernel.compute_fold(op, &term_refs) {
+            Ok(v) => {
+                debug_assert_eq!(v.len(), num_words);
+                v
+            }
             Err(_) => {
                 CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }
-        debug_assert_eq!(acc.len(), num_words);
-    }
+    };
     GPU_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
 
     // Decode the flat result back to a RoaringPostings. Each chunk of

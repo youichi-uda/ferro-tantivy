@@ -247,3 +247,16 @@ harness = false
 [[bench]]
 name = "sort_simd"
 harness = false
+
+# Phase 2 C-5 (Wave 7 / Plan 3) — Bool-AND query-path bench. Measures
+# end-to-end Searcher::search latency through the auto-dispatch hook
+# in BooleanWeight::complex_scorer (Plan 2). Complementary to the
+# pure-kernel bench in `crates/ferro-compress/src/bin/bitmap_bench.rs`
+# (parallel session bc1f522). Uses the criterion harness (default) so
+# the existing dev-dependency on `criterion` covers it; no new deps.
+# Intentionally NOT gated by `required-features = ["gpu", ...]` — the
+# bench routines also exercise the CPU regression path (light cohort,
+# scoring-enabled) which must stay measurable on a no-feature build.
+[[bench]]
+name = "bool_and_query_path"
+harness = false

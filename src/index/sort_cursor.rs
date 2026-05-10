@@ -327,8 +327,20 @@ pub const SORT_CURSOR_MAX_FIELDS: usize = 8;
 /// right `FastValue` variant when re-resolving against the fast-field
 /// column at search time.
 ///
-/// Numeric values 5..255 are reserved for future variants (e.g. string
-/// term ordinals — Wave 18-3). Bumping past 255 requires a v3 format.
+/// Numeric values 6..255 are reserved for future variants. Bumping past
+/// 255 requires a v3 format.
+///
+/// **Wave 18-3 (String).** `String = 5` means the per-doc encoded
+/// `u64` is a **segment-local term ordinal** into the field's
+/// [`columnar::StrColumn`] dictionary.  Within a segment, the
+/// dictionary stores terms in sorted byte order, so ord_a < ord_b
+/// ⇔ term(ord_a) < term(ord_b) lexicographically — the same
+/// invariant Lucene's `SortedDocValues` relies on.  **Across
+/// segments**, ords are not comparable — the
+/// [`EarlyTermSortByCursorCollectorMulti`](crate::collector::EarlyTermSortByCursorCollectorMulti)
+/// fruit therefore carries decoded UTF-8 bytes (resolved at harvest
+/// via the segment's dictionary) so cross-segment merge can use real
+/// byte comparison.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ValueKind {
@@ -337,25 +349,38 @@ pub enum ValueKind {
     F64 = 2,
     Date = 3,
     DateNanos = 4,
+    String = 5,
 }
 
 impl ValueKind {
-    fn to_byte(self) -> u8 {
+    /// Encodes the variant to its on-disk byte tag.
+    pub fn to_byte(self) -> u8 {
         self as u8
     }
 
-    fn from_byte(b: u8) -> crate::Result<Self> {
+    /// Decodes the on-disk byte tag, rejecting unknown values as
+    /// `DataCorruption` rather than silently mapping them to a default
+    /// (so a forward-version cursor file is rejected loudly by an
+    /// older reader).
+    pub fn from_byte(b: u8) -> crate::Result<Self> {
         match b {
             0 => Ok(ValueKind::I64),
             1 => Ok(ValueKind::U64),
             2 => Ok(ValueKind::F64),
             3 => Ok(ValueKind::Date),
             4 => Ok(ValueKind::DateNanos),
+            5 => Ok(ValueKind::String),
             other => Err(DataCorruption::comment_only(format!(
                 "sort cursor v2: invalid value_kind byte {other}"
             ))
             .into()),
         }
+    }
+
+    /// Returns `true` when the encoded `u64` is a string term ordinal
+    /// (segment-local) rather than a numeric/date `FastValue`.
+    pub fn is_string(self) -> bool {
+        matches!(self, ValueKind::String)
     }
 }
 
@@ -918,8 +943,14 @@ pub fn build_sort_cursor_v2_from_fast_fields(
 }
 
 /// Reads a fast-field column for `field`, encoding each doc's first
-/// value to a `FastValue::to_u64()` slot. Tries `i64`, `u64`, `f64`,
-/// then `DateTime` in order — same shape as the v1 helper.
+/// value to a `FastValue::to_u64()` slot.  Tries `i64`, `u64`, `f64`,
+/// `DateTime`, then string (term ordinal column) in order.
+///
+/// **Wave 18-3.** When the field resolves as a [`columnar::StrColumn`],
+/// the encoded `u64` is the **segment-local term ordinal** — within a
+/// segment, ord ordering matches lex ordering of the underlying terms
+/// (the dictionary stores terms in sorted byte order).  Cross-segment
+/// merge is byte-comparison-based; see [`ValueKind::String`].
 fn read_field_to_u64(
     readers: &crate::fastfield::FastFieldReaders,
     field: &str,
@@ -950,17 +981,36 @@ fn read_field_to_u64(
             .collect();
         return Ok((ValueKind::Date, values));
     }
+    if let Some(str_col) = readers.str(field)? {
+        // Storage is the segment-local term ordinal (already a `u64`).
+        // No `MonotonicallyMappableToU64` conversion needed — the ord
+        // **is** the encoded value.
+        let ord_col = str_col.ords();
+        let values: Vec<Option<u64>> = (0..num_docs).map(|d| ord_col.first(d)).collect();
+        return Ok((ValueKind::String, values));
+    }
     Err(crate::TantivyError::SchemaError(format!(
-        "Field `{field}` is not a numeric or date fast field; cannot build v2 cursor"
+        "Field `{field}` is not a numeric, date, or keyword fast field; cannot build v2 cursor"
     )))
 }
 
 /// Builds a sort cursor by trying common fast-field column types in order
-/// (`i64`, `u64`, `f64`, `DateTime`).
+/// (`i64`, `u64`, `f64`, `DateTime`, then string term ordinal).
 ///
 /// Returns an error if no compatible column exists for `field`. This is
 /// the function the `SegmentWriter` finalize hook calls when
 /// `IndexSettings::sort_by_field` is set.
+///
+/// **Wave 18-3.** Strings (keyword fields) are supported via the
+/// segment-local term ordinal column ([`columnar::StrColumn::ords`]).
+/// Within a segment, ord ordering matches lex byte ordering of the
+/// underlying terms (the dictionary is byte-sorted), so the v1 cursor
+/// (which stores only the doc-id permutation, no per-doc values) is
+/// faithful for single-field string sort within a segment.  Cross-
+/// segment merge through this v1 path is *not* byte-equivalent —
+/// callers that need byte-equivalent multi-segment merge should use
+/// the v2 multi-field cursor instead (which decodes ords to bytes at
+/// harvest time, see Wave 18-3 collector wiring).
 pub fn build_sort_cursor_from_fast_fields(
     readers: &crate::fastfield::FastFieldReaders,
     field: &str,
@@ -979,8 +1029,17 @@ pub fn build_sort_cursor_from_fast_fields(
     if let Some(col) = readers.column_opt::<DateTime>(field)? {
         return Ok(SortCursorIndex::build_from_column(field, order, &col, num_docs));
     }
+    if let Some(str_col) = readers.str(field)? {
+        // Within-segment ord ordering matches lex ordering — the v1
+        // cursor stores only the doc-id permutation, so we can build
+        // it by sorting on segment-local term ords as `u64`.
+        let ord_col = str_col.ords();
+        return Ok(SortCursorIndex::build_from_column(
+            field, order, ord_col, num_docs,
+        ));
+    }
     Err(crate::TantivyError::SchemaError(format!(
-        "Field `{field}` is not a numeric or date fast field; cannot build sort cursor"
+        "Field `{field}` is not a numeric, date, or keyword fast field; cannot build sort cursor"
     )))
 }
 
@@ -1914,6 +1973,150 @@ mod tests {
                 || msg.contains("trailing"),
             "expected v2-corruption error, got: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------
+    // Wave 18-3 — `ValueKind::String` round-trip + lex-order
+    // invariants on segment-local term ordinals.
+    // -------------------------------------------------------------
+
+    /// `ValueKind::String = 5` round-trips through `to_byte` /
+    /// `from_byte`, and unknown bytes (e.g. a future v3 variant) are
+    /// rejected loudly by the v2 reader.
+    #[test]
+    fn v2_value_kind_string_byte_round_trip() {
+        assert_eq!(ValueKind::String.to_byte(), 5);
+        assert_eq!(ValueKind::from_byte(5).unwrap(), ValueKind::String);
+        // Unknown byte → loud reject (forward-version cursor file
+        // must not silently downgrade).
+        let err = ValueKind::from_byte(99).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid value_kind byte"),
+            "expected reject of unknown byte, got: {err}"
+        );
+        // is_string predicate distinguishes the variant from numerics.
+        assert!(ValueKind::String.is_string());
+        assert!(!ValueKind::I64.is_string());
+        assert!(!ValueKind::F64.is_string());
+    }
+
+    /// Single-field string sort encodes the segment-local term
+    /// ordinal directly.  Ord ordering matches the lex byte ordering
+    /// of the underlying terms (the dictionary stores terms in sorted
+    /// byte order), so the cursor permutation matches what a byte-
+    /// comparing sort would produce.
+    #[test]
+    fn v2_string_field_single_sort_orders_by_term_ord() {
+        // Pretend we have 4 docs with country codes whose dictionary
+        // assigned ordinals 0..=2 in lex byte order:
+        //   ord 0 → "AR"   ord 1 → "JP"   ord 2 → "US"
+        // doc 0 → "JP" (ord 1)
+        // doc 1 → "US" (ord 2)
+        // doc 2 → "AR" (ord 0)
+        // doc 3 → missing
+        let ords: Vec<Option<u64>> = vec![Some(1), Some(2), Some(0), None];
+        let cursor = build_v2_from_values(
+            vec![("country", Order::Asc, ValueKind::String)],
+            vec![ords],
+            4,
+        );
+        // Asc lex order: AR < JP < US < missing(_last) → docs [2, 0, 1, 3]
+        assert_eq!(cursor.doc_ids(), &[2u32, 0, 1, 3]);
+        assert_eq!(cursor.fields()[0].2, ValueKind::String);
+    }
+
+    /// String + numeric multi-field cursor: lex order respects the
+    /// per-field `Order` (ASC on the string primary, DESC on the
+    /// numeric secondary tie-break).
+    #[test]
+    fn v2_string_then_numeric_multi_field_lex_walk() {
+        use columnar::MonotonicallyMappableToU64;
+        // 6 docs over a (country, score) key where the dictionary
+        // assigns ords:  AR=0, JP=1, US=2.
+        //   doc 0 → ("JP", 10)
+        //   doc 1 → ("AR", 30)
+        //   doc 2 → ("JP", 20)
+        //   doc 3 → ("US", 5)
+        //   doc 4 → ("AR", 30)   tie with doc 1 on both keys
+        //   doc 5 → ("JP", missing)
+        let country: Vec<Option<u64>> =
+            vec![Some(1), Some(0), Some(1), Some(2), Some(0), Some(1)];
+        let score: Vec<Option<u64>> = vec![
+            Some(10i64.to_u64()),
+            Some(30i64.to_u64()),
+            Some(20i64.to_u64()),
+            Some(5i64.to_u64()),
+            Some(30i64.to_u64()),
+            None,
+        ];
+        let cursor = build_v2_from_values(
+            vec![
+                ("country", Order::Asc, ValueKind::String),
+                ("score", Order::Desc, ValueKind::I64),
+            ],
+            vec![country, score],
+            6,
+        );
+        // Walk:
+        //   AR / 30   → docs {1, 4} (tie: doc-id ASC → 1, 4)
+        //   JP / 20   → 2
+        //   JP / 10   → 0
+        //   JP / missing → 5
+        //   US / 5    → 3
+        assert_eq!(cursor.doc_ids(), &[1u32, 4, 2, 0, 5, 3]);
+    }
+
+    /// Round-trips a v2 cursor whose primary is a string field.
+    /// Validates the on-disk byte format carries `ValueKind::String`
+    /// faithfully through write → read.
+    #[test]
+    fn v2_string_field_write_open_round_trip() {
+        let ords: Vec<Option<u64>> = vec![Some(2), Some(0), Some(1), None, Some(2)];
+        let cursor = build_v2_from_values(
+            vec![("country", Order::Desc, ValueKind::String)],
+            vec![ords],
+            5,
+        );
+        let restored = roundtrip_v2(&cursor);
+        assert_eq!(restored.fields().len(), 1);
+        assert_eq!(restored.fields()[0].0, "country");
+        assert_eq!(restored.fields()[0].1, Order::Desc);
+        assert_eq!(restored.fields()[0].2, ValueKind::String);
+        assert_eq!(restored.doc_ids(), cursor.doc_ids());
+    }
+
+    /// Cross-segment dictionary divergence: the *same* ord 1 maps to
+    /// "JP" in segment A and "US" in segment B.  Within each segment,
+    /// ord ordering still matches the local lex order — but cross-
+    /// segment merge must NOT compare the raw ords.  This test pins
+    /// the per-segment invariant: each cursor's permutation is a
+    /// faithful lex sort of its own segment's terms, regardless of
+    /// what the same ord means in another segment.
+    #[test]
+    fn v2_string_segment_local_ord_ordering_is_segment_safe() {
+        // Segment A's dictionary:  AR=0, JP=1, US=2
+        // doc 0 → "AR"  doc 1 → "JP"
+        let seg_a = build_v2_from_values(
+            vec![("country", Order::Asc, ValueKind::String)],
+            vec![vec![Some(0), Some(1)]],
+            2,
+        );
+        assert_eq!(seg_a.doc_ids(), &[0u32, 1]); // AR before JP
+
+        // Segment B's dictionary:  CN=0, US=1
+        // doc 0 → "US"  doc 1 → "CN"
+        let seg_b = build_v2_from_values(
+            vec![("country", Order::Asc, ValueKind::String)],
+            vec![vec![Some(1), Some(0)]],
+            2,
+        );
+        // Within segment B: CN (ord 0) precedes US (ord 1) in ASC.
+        assert_eq!(seg_b.doc_ids(), &[1u32, 0]);
+
+        // The two cursors share the *raw* ord 1, but the underlying
+        // term differs ("JP" in A vs "US" in B).  Cross-segment merge
+        // is the collector's responsibility — the on-disk cursor only
+        // promises "lex order within this segment".
     }
 
     /// `SortCursorAny::open` peeks the version byte and returns the

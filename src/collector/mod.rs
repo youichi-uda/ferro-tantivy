@@ -115,7 +115,7 @@ pub use self::early_term_sort_by_cursor::{
 /// auxiliary v2 sort cursor.
 pub mod early_term_sort_by_cursor_multi;
 pub use self::early_term_sort_by_cursor_multi::{
-    EarlyTermSortByCursorCollectorMulti, EarlyTermSortByCursorMultiSegmentCollector,
+    CursorSortVal, EarlyTermSortByCursorCollectorMulti, EarlyTermSortByCursorMultiSegmentCollector,
 };
 
 mod sort_key_top_collector;

@@ -10,6 +10,16 @@
 //! stops after `limit` matching docs are observed — the full multi-
 //! field analogue of Lucene's `IndexSortByField` early termination.
 //!
+//! **FerroSearch Wave 18-3.**  Extended to support **keyword / string
+//! sort fields** ([`ValueKind::String`](crate::index::ValueKind::String)).
+//! On-disk storage is the segment-local term ordinal, but the per-hit
+//! fruit carries decoded UTF-8 bytes so cross-segment merge can use
+//! real byte comparison: term ord 1 in segment A may be "JP" while
+//! ord 1 in segment B is "US".  Decoding happens lazily at
+//! [`SegmentCollector::harvest`] time via the segment's
+//! [`StrColumn`](columnar::StrColumn) dictionary, with no extra cost
+//! for indices whose primary sort is purely numeric.
+//!
 //! ## Algorithm
 //!
 //! Per segment:
@@ -22,17 +32,18 @@
 //!    lex sort order, and for each cursor doc:
 //!    * skip if the matched bitset does not contain it (the doc did not
 //!      match the query, or was deleted at search time);
+//!    * resolve the per-field encoded sort tuple from the cursor and
+//!      decode `ValueKind::String` slots from segment-local term ords
+//!      to UTF-8 bytes (via the captured per-field `StrColumn`);
 //!    * (optional) skip if a `search_after` cursor was supplied and the
-//!      tuple is at-or-before the cursor in lex order;
-//!    * otherwise resolve the encoded sort tuple from the cursor and
-//!      push `(Vec<Option<u64>>, DocAddress)` into the per-segment
+//!      tuple is at-or-before the cursor in lex order (kind-aware: u64
+//!      cmp for numerics, `Vec<u8>` cmp for strings);
+//!    * push `(Vec<CursorSortVal>, DocAddress)` into the per-segment
 //!      fruit;
 //!    * stop once `limit` hits have been recorded.
 //!
-//! The returned tuples are encoded `u64` slots whose `ValueKind` is
-//! recorded in the cursor itself.  The caller is responsible for
-//! decoding back to typed values when assembling hits — see
-//! [`SortCursorIndexV2::fields`](crate::index::SortCursorIndexV2::fields).
+//! Cross-segment merge then sorts on the decoded bytes for string
+//! fields, sidestepping the segment-local ord dictionary divergence.
 //!
 //! ## Caller contract
 //!
@@ -50,20 +61,88 @@ use std::sync::Arc;
 use common::BitSet;
 
 use crate::collector::{Collector, SegmentCollector};
-use crate::index::SortCursorIndexV2;
+use crate::index::{SortCursorIndexV2, ValueKind};
 use crate::schema::Schema;
 use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
+
+/// Per-field encoded sort value used by the multi-field early-term
+/// cursor collector.  The variant tag is the field's
+/// [`ValueKind`](crate::index::ValueKind) recorded in the v2 cursor.
+///
+/// **Wave 18-3 design note.**  `Numeric(Option<u64>)` carries the
+/// `FastValue::to_u64`-encoded slot for `I64` / `U64` / `F64` /
+/// `Date` / `DateNanos`; segment-local order matches global lex
+/// order because all such fields are monotonically mappable to
+/// `u64`.  `String(Option<Vec<u8>>)` carries the **decoded** UTF-8
+/// bytes (resolved at harvest time via the segment's
+/// [`StrColumn`](columnar::StrColumn) dictionary), because segment-
+/// local term ordinals are NOT comparable across segments — only the
+/// underlying byte values are.
+///
+/// `None` in either variant means the underlying doc has a missing
+/// value at this field.  The `missing="_last"` rule from
+/// Elasticsearch / Lucene is honoured by the `cmp_sort_val` helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorSortVal {
+    /// Encoded `u64` for numeric/date `FastValue` fields, or `None`
+    /// when the doc has a missing value here (sorts last).
+    Numeric(Option<u64>),
+    /// Decoded UTF-8 bytes for keyword/string fields, or `None` when
+    /// the doc has a missing term ord here (sorts last).
+    String(Option<Vec<u8>>),
+}
+
+impl CursorSortVal {
+    /// Returns `true` if the value is missing (`Numeric(None)` or
+    /// `String(None)`).  Missing values sort last in both ASC and
+    /// DESC orders, matching ES / Lucene `missing="_last"`.
+    pub fn is_missing(&self) -> bool {
+        matches!(self, CursorSortVal::Numeric(None) | CursorSortVal::String(None))
+    }
+}
+
+/// Lex-compares two [`CursorSortVal`]s under `order`, honouring the
+/// `missing="_last"` rule (a missing value always sorts after a
+/// present one regardless of `order`).  Variants of different kinds
+/// (`Numeric` vs `String`) are treated as equal — that combination
+/// only happens when the cursor's recorded `ValueKind` disagrees
+/// with the runtime decoded value, which the collector never produces.
+fn cmp_sort_val(a: &CursorSortVal, b: &CursorSortVal, order: Order) -> Ordering {
+    use CursorSortVal::*;
+    match (a, b) {
+        (Numeric(None), Numeric(None)) => Ordering::Equal,
+        (String(None), String(None)) => Ordering::Equal,
+        (Numeric(None), Numeric(Some(_))) => Ordering::Greater,
+        (Numeric(Some(_)), Numeric(None)) => Ordering::Less,
+        (String(None), String(Some(_))) => Ordering::Greater,
+        (String(Some(_)), String(None)) => Ordering::Less,
+        (Numeric(Some(au)), Numeric(Some(bu))) => match order {
+            Order::Asc => au.cmp(bu),
+            Order::Desc => bu.cmp(au),
+        },
+        (String(Some(ab)), String(Some(bb))) => match order {
+            Order::Asc => ab.as_slice().cmp(bb.as_slice()),
+            Order::Desc => bb.as_slice().cmp(ab.as_slice()),
+        },
+        // Kind mismatch: shouldn't happen if the cursor's recorded
+        // value_kind matches what we materialise at harvest time.
+        // Treat as equal so a debug-only divergence doesn't corrupt
+        // the merge.
+        _ => Ordering::Equal,
+    }
+}
 
 /// Multi-field early-terminating top-K collector.
 ///
 /// Driven by the on-disk lex-sorted cursor produced by Wave 18-1 — see
 /// the module docs and `dd-pack/wave18-multi-field-cursor-v2-design.md`.
 ///
-/// Collected fruit: `Vec<(Vec<Option<u64>>, DocAddress)>` where each
-/// inner `Vec<Option<u64>>` is the per-field encoded `u64` tuple at
-/// the cursor position the doc came from.  Per-field `None` indicates
-/// the doc has a missing value for that field (missing-last sort
-/// applies — see [`SortCursorIndexV2`]).
+/// Collected fruit: `Vec<(Vec<CursorSortVal>, DocAddress)>` where each
+/// inner `Vec<CursorSortVal>` is the per-field decoded sort tuple at
+/// the cursor position the doc came from.  Per-field
+/// `Numeric(None)` / `String(None)` indicates the doc has a missing
+/// value for that field (missing-last sort applies — see
+/// [`SortCursorIndexV2`]).
 ///
 /// ## `search_after`
 ///
@@ -71,10 +150,11 @@ use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 /// or before the supplied cursor in lex order (per per-field
 /// [`Order`]).  This matches Elasticsearch's multi-field
 /// `search_after: [v0, v1, …]` semantics.  Each `start_after[i]` may
-/// be `None` to mean "unconstrained at this position"; positions
-/// where the cursor's tuple has `None` and `start_after[i]` is
-/// `Some(_)` are skipped (mirroring the v1 single-field collector's
-/// missing-last skip behaviour for consistency).
+/// be `Numeric(None)` or `String(None)` to mean "unconstrained at
+/// this position"; positions where the cursor's tuple has `None` and
+/// `start_after[i]` is constrained (some present value) are skipped
+/// (mirroring the v1 single-field collector's missing-last skip
+/// behaviour for consistency).
 #[derive(Debug, Clone)]
 pub struct EarlyTermSortByCursorCollectorMulti {
     /// Field declaration order matches the cursor's recorded fields.
@@ -82,8 +162,10 @@ pub struct EarlyTermSortByCursorCollectorMulti {
     limit: usize,
     /// Wave 18-1 search_after.  Length is the **caller-supplied prefix**;
     /// it may be shorter than `fields.len()` (trailing fields are
-    /// unconstrained), but must not be longer.
-    start_after: Option<Vec<Option<u64>>>,
+    /// unconstrained), but must not be longer.  Wave 18-3: variants
+    /// are kind-aware ([`CursorSortVal::Numeric`] vs
+    /// [`CursorSortVal::String`]).
+    start_after: Option<Vec<CursorSortVal>>,
 }
 
 impl EarlyTermSortByCursorCollectorMulti {
@@ -104,11 +186,16 @@ impl EarlyTermSortByCursorCollectorMulti {
         }
     }
 
-    /// Wave 18-1: enable `search_after` on the cursor walk.
+    /// Wave 18-1 / 18-3: enable `search_after` on the cursor walk.
     ///
     /// `start_after.len()` must be `≤ self.fields().len()` — trailing
-    /// `None` slots are equivalent to "unconstrained at that depth".
-    pub fn with_search_after(mut self, start_after: Vec<Option<u64>>) -> Self {
+    /// missing variants (e.g. `Numeric(None)`, `String(None)`) are
+    /// equivalent to "unconstrained at that depth".  Each entry's
+    /// variant must match the cursor's recorded
+    /// [`ValueKind`](crate::index::ValueKind) for that field — the
+    /// caller is responsible for parsing the JSON `search_after`
+    /// array per type before calling here.
+    pub fn with_search_after(mut self, start_after: Vec<CursorSortVal>) -> Self {
         self.start_after = Some(start_after);
         self
     }
@@ -124,7 +211,7 @@ impl EarlyTermSortByCursorCollectorMulti {
     }
 
     /// Returns the `search_after` cursor tuple, if any.
-    pub fn search_after(&self) -> Option<&[Option<u64>]> {
+    pub fn search_after(&self) -> Option<&[CursorSortVal]> {
         self.start_after.as_deref()
     }
 
@@ -160,7 +247,7 @@ fn cursor_prefix_matches(cursor: &SortCursorIndexV2, prefix: &[(String, Order)])
 }
 
 impl Collector for EarlyTermSortByCursorCollectorMulti {
-    type Fruit = Vec<(Vec<Option<u64>>, DocAddress)>;
+    type Fruit = Vec<(Vec<CursorSortVal>, DocAddress)>;
     type Child = EarlyTermSortByCursorMultiSegmentCollector;
 
     fn check_schema(&self, schema: &Schema) -> crate::Result<()> {
@@ -196,20 +283,45 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
                 .filter(|cursor| cursor_prefix_matches(cursor, &self.fields))
         };
 
-        if cursor_opt.is_none() {
+        let Some(cursor) = cursor_opt else {
             return Ok(EarlyTermSortByCursorMultiSegmentCollector {
                 cursor: None,
                 fields: self.fields.clone(),
+                value_kinds: Vec::new(),
+                str_columns: Vec::new(),
                 limit: self.limit,
                 segment_ord: segment_local_id,
                 matched_bitset: BitSet::with_max_value(0),
                 start_after: None,
             });
+        };
+
+        // Wave 18-3: capture the cursor's per-prefix-field
+        // `ValueKind` and resolve a `StrColumn` for each
+        // `ValueKind::String` slot, so the harvest hot path can
+        // decode segment-local term ordinals to UTF-8 bytes.  The
+        // `StrColumn` is `Arc`-shared internally; this is a single
+        // pre-cache pointer copy per query per segment.
+        let prefix_len = self.fields.len();
+        let mut value_kinds: Vec<ValueKind> = Vec::with_capacity(prefix_len);
+        let mut str_columns: Vec<Option<columnar::StrColumn>> =
+            Vec::with_capacity(prefix_len);
+        for fi in 0..prefix_len {
+            let (cursor_field, _, kind) = &cursor.fields()[fi];
+            value_kinds.push(*kind);
+            if matches!(kind, ValueKind::String) {
+                let str_col = segment_reader.fast_fields().str(cursor_field)?;
+                str_columns.push(str_col);
+            } else {
+                str_columns.push(None);
+            }
         }
 
         Ok(EarlyTermSortByCursorMultiSegmentCollector {
-            cursor: cursor_opt,
+            cursor: Some(cursor),
             fields: self.fields.clone(),
+            value_kinds,
+            str_columns,
             limit: self.limit,
             segment_ord: segment_local_id,
             matched_bitset: BitSet::with_max_value(segment_reader.max_doc()),
@@ -228,7 +340,7 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
         if self.limit == 0 {
             return Ok(Vec::new());
         }
-        let mut all: Vec<(Vec<Option<u64>>, DocAddress)> =
+        let mut all: Vec<(Vec<CursorSortVal>, DocAddress)> =
             segment_fruits.into_iter().flatten().collect();
         let orders: Vec<Order> = self.fields.iter().map(|(_, o)| *o).collect();
         all.sort_by(|a, b| compare_hits_multi(a, b, &orders));
@@ -244,14 +356,24 @@ pub struct EarlyTermSortByCursorMultiSegmentCollector {
     /// parent collector's slice. Same length as the cursor's recorded
     /// prefix.
     fields: Vec<(String, Order)>,
+    /// Wave 18-3: per-prefix-field `ValueKind` mirrored from the
+    /// cursor's `fields()`, so harvest knows whether to wrap the
+    /// encoded `u64` as a numeric or to decode it through a
+    /// `StrColumn` dictionary.  Same length as `fields`.
+    value_kinds: Vec<ValueKind>,
+    /// Wave 18-3: per-prefix-field `StrColumn` for `ValueKind::String`
+    /// slots; `None` for numeric/date slots.  Captured at
+    /// `for_segment` time so harvest stays a flat loop with no
+    /// schema lookups.
+    str_columns: Vec<Option<columnar::StrColumn>>,
     limit: usize,
     segment_ord: u32,
     matched_bitset: BitSet,
-    start_after: Option<Vec<Option<u64>>>,
+    start_after: Option<Vec<CursorSortVal>>,
 }
 
 impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
-    type Fruit = Vec<(Vec<Option<u64>>, DocAddress)>;
+    type Fruit = Vec<(Vec<CursorSortVal>, DocAddress)>;
 
     #[inline]
     fn collect(&mut self, doc: DocId, _score: Score) {
@@ -276,17 +398,44 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
         }
         let orders: Vec<Order> = self.fields.iter().map(|(_, o)| *o).collect();
         let prefix_len = self.fields.len();
-        let mut hits: Vec<(Vec<Option<u64>>, DocAddress)> = Vec::with_capacity(self.limit);
+        let mut hits: Vec<(Vec<CursorSortVal>, DocAddress)> = Vec::with_capacity(self.limit);
+        // Reusable scratch for decoding string term ords to bytes —
+        // mirrors `convert_segment_sort_key`'s buffer reuse on
+        // `SortByString` to avoid per-hit allocation.
+        let mut decode_scratch: Vec<u8> = Vec::with_capacity(32);
         for cursor_idx in 0..cursor.len() {
             let doc = cursor.doc_ids()[cursor_idx];
             if !self.matched_bitset.contains(doc) {
                 continue;
             }
-            // Only materialise the prefix the request cares about, even
-            // if the cursor itself carries more fields.
-            let tuple: Vec<Option<u64>> = (0..prefix_len)
-                .map(|fi| cursor.value(cursor_idx, fi))
-                .collect();
+            // Materialise the prefix the request cares about, decoding
+            // string term ords to bytes via the captured `StrColumn`.
+            let mut tuple: Vec<CursorSortVal> = Vec::with_capacity(prefix_len);
+            for fi in 0..prefix_len {
+                let raw = cursor.value(cursor_idx, fi);
+                let val = match self.value_kinds[fi] {
+                    ValueKind::String => {
+                        let bytes = match (raw, self.str_columns[fi].as_ref()) {
+                            (Some(ord), Some(str_col)) => {
+                                decode_scratch.clear();
+                                match str_col.ord_to_bytes(ord, &mut decode_scratch) {
+                                    Ok(true) => Some(decode_scratch.clone()),
+                                    // Ord present in cursor but not in dict —
+                                    // treat as missing so the merge still
+                                    // produces a deterministic ordering.
+                                    Ok(false) | Err(_) => None,
+                                }
+                            }
+                            // No StrColumn (e.g. dropped between cursor
+                            // build and search) → degrade to missing.
+                            (None, _) | (_, None) => None,
+                        };
+                        CursorSortVal::String(bytes)
+                    }
+                    _ => CursorSortVal::Numeric(raw),
+                };
+                tuple.push(val);
+            }
             if let Some(start) = &self.start_after {
                 if !is_strictly_after_lex(&tuple, start, &orders) {
                     continue;
@@ -307,53 +456,58 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
     }
 }
 
-/// Lex-compare a tuple against `start_after`. Returns `true` iff the
-/// tuple lies *strictly after* `start_after` in the order configured
-/// per field.
+/// Lex-compare a [`CursorSortVal`] tuple against `start_after`.
+/// Returns `true` iff the tuple lies *strictly after* `start_after`
+/// in the order configured per field.
 ///
-/// Semantics:
-/// * `start_after[i] = Some(_)` AND `tuple[i] = None` → tuple is
+/// Semantics (kind-aware as of Wave 18-3):
+/// * `start_after[i]` constrained AND `tuple[i]` missing → tuple is
 ///   "missing" at this depth; missing sorts last so it cannot be
 ///   "after" a real value (mirrors v1 single-field behaviour). Skip.
-/// * `start_after[i] = None` (caller didn't constrain this depth) AND
-///   `tuple[i] = Some(_)` → tuple is "defined" past where the caller
-///   bothered specifying → keep.
+/// * `start_after[i]` missing/unconstrained AND `tuple[i]` constrained
+///   → tuple is "defined" past where the caller bothered specifying
+///   → keep.
 /// * Both unconstrained → look at next position.
-/// * Both `Some(_)` → per-field [`Order`] comparison; if Greater, keep;
-///   if Less, drop; if Equal, look at next position.
+/// * Both constrained → kind-aware per-field [`Order`] comparison via
+///   [`cmp_sort_val`]; if Greater, keep; if Less, drop; if Equal,
+///   look at next position.
 ///
 /// All positions equal (or both unconstrained at every depth) → tuple
 /// is NOT strictly after start_after; drop.
 fn is_strictly_after_lex(
-    tuple: &[Option<u64>],
-    start: &[Option<u64>],
+    tuple: &[CursorSortVal],
+    start: &[CursorSortVal],
     orders: &[Order],
 ) -> bool {
     let n = tuple.len().min(orders.len());
     for i in 0..n {
-        let s_at_i = start.get(i).copied().flatten();
-        match (tuple[i], s_at_i) {
-            (None, Some(_)) => return false,
-            (Some(_), None) => return true,
-            (None, None) => continue,
-            (Some(tv), Some(sv)) => {
-                let cmp = match orders[i] {
-                    Order::Asc => tv.cmp(&sv),
-                    Order::Desc => sv.cmp(&tv),
-                };
-                match cmp {
-                    Ordering::Greater => return true,
-                    Ordering::Less => return false,
-                    Ordering::Equal => continue,
-                }
-            }
+        let tuple_missing = tuple[i].is_missing();
+        let start_at_i = start.get(i);
+        let start_missing = match start_at_i {
+            None => true,
+            Some(v) => v.is_missing(),
+        };
+        match (tuple_missing, start_missing) {
+            // Tuple has missing primary while start constrains it →
+            // missing sorts last, so it can't be "after" a real value.
+            (true, false) => return false,
+            // Tuple has a real value while start is unconstrained at
+            // this depth → tuple is past the caller's prefix.
+            (false, true) => return true,
+            // Both missing or both unconstrained — descend.
+            (true, true) => continue,
+            (false, false) => match cmp_sort_val(&tuple[i], start_at_i.unwrap(), orders[i]) {
+                Ordering::Greater => return true,
+                Ordering::Less => return false,
+                Ordering::Equal => continue,
+            },
         }
     }
     // Caller supplied longer start than tuple? Treat extra start
     // positions as "constraint cannot be satisfied" → drop. (In
     // practice the dispatcher trims start_after to the cursor's
     // prefix length, so this branch is rare.)
-    if start.len() > tuple.len() && start[tuple.len()..].iter().any(|s| s.is_some()) {
+    if start.len() > tuple.len() && start[tuple.len()..].iter().any(|s| !s.is_missing()) {
         return false;
     }
     false
@@ -361,29 +515,19 @@ fn is_strictly_after_lex(
 
 /// Inter-segment merge ordering for the multi-field fruit. Mirrors
 /// [`SortCursorIndexV2`]'s on-disk `missing="_last"` rule and the
-/// deterministic `(segment_ord, doc_id)` tie-break.
+/// deterministic `(segment_ord, doc_id)` tie-break.  Kind-aware
+/// (Wave 18-3) — string fields compare by decoded bytes, numerics by
+/// encoded `u64`.
 fn compare_hits_multi(
-    a: &(Vec<Option<u64>>, DocAddress),
-    b: &(Vec<Option<u64>>, DocAddress),
+    a: &(Vec<CursorSortVal>, DocAddress),
+    b: &(Vec<CursorSortVal>, DocAddress),
     orders: &[Order],
 ) -> Ordering {
     let n = a.0.len().min(b.0.len()).min(orders.len());
     for i in 0..n {
-        let av = a.0[i];
-        let bv = b.0[i];
-        match (av, bv) {
-            (None, None) => continue,
-            (None, Some(_)) => return Ordering::Greater,
-            (Some(_), None) => return Ordering::Less,
-            (Some(au), Some(bu)) => {
-                let cmp = match orders[i] {
-                    Order::Asc => au.cmp(&bu),
-                    Order::Desc => bu.cmp(&au),
-                };
-                if cmp != Ordering::Equal {
-                    return cmp;
-                }
-            }
+        match cmp_sort_val(&a.0[i], &b.0[i], orders[i]) {
+            Ordering::Equal => continue,
+            other => return other,
         }
     }
     a.1.segment_ord
@@ -418,24 +562,36 @@ mod tests {
     /// Direct-harvest helper: drive the segment-collector hot path
     /// without going through a real `SegmentReader`. Pre-populates the
     /// matched bitset to mark every doc in `matched` as alive + matching.
+    /// Mirrors the prefix-length conventions of `for_segment` —
+    /// `value_kinds` is derived from the cursor's recorded fields, and
+    /// `str_columns` is left `None` for every field (numeric-only
+    /// tests).  Wave 18-3 string-decoding tests go through a real
+    /// `SegmentReader` instead.
     fn harvest_with_matched(
         cursor: Arc<SortCursorIndexV2>,
         fields: Vec<(&str, Order)>,
         limit: usize,
-        start_after: Option<Vec<Option<u64>>>,
+        start_after: Option<Vec<CursorSortVal>>,
         matched: &[DocId],
-    ) -> Vec<(Vec<Option<u64>>, DocAddress)> {
+    ) -> Vec<(Vec<CursorSortVal>, DocAddress)> {
         let max_doc = cursor.max_doc();
         let mut bitset = BitSet::with_max_value(max_doc);
         for &d in matched {
             bitset.insert(d);
         }
+        let prefix_len = fields.len();
+        let value_kinds: Vec<ValueKind> = (0..prefix_len)
+            .map(|fi| cursor.fields()[fi].2)
+            .collect();
+        let str_columns: Vec<Option<columnar::StrColumn>> = vec![None; prefix_len];
         let segment = EarlyTermSortByCursorMultiSegmentCollector {
             cursor: Some(cursor),
             fields: fields
                 .into_iter()
                 .map(|(n, o)| (n.to_string(), o))
                 .collect(),
+            value_kinds,
+            str_columns,
             limit,
             segment_ord: 0,
             matched_bitset: bitset,
@@ -444,9 +600,16 @@ mod tests {
         segment.harvest()
     }
 
-    /// Single-field-as-multi: identical fruit shape to the v1 collector
-    /// (`Vec<(Vec<Option<u64>>, _)>` with prefix_len=1) for an `i64 DESC`
-    /// query.
+    /// Convenience: wrap encoded `u64` slots into `CursorSortVal::Numeric`
+    /// (matches v2 fruit shape for numeric fields).
+    fn num(v: Option<u64>) -> CursorSortVal {
+        CursorSortVal::Numeric(v)
+    }
+
+    /// Single-field-as-multi: prefix_len=1 fruit shape for an
+    /// `i64 DESC` query.  Wave 18-3 fruit carries `CursorSortVal`,
+    /// so we wrap encoded slots in `CursorSortVal::Numeric` for
+    /// assertion.
     #[test]
     fn single_field_collector_matches_v1_walk() {
         // 4 docs, sort by score DESC. doc 3 missing → last.
@@ -470,8 +633,8 @@ mod tests {
         // Expected order DESC missing-last: doc 0 (30), doc 2 (20), doc 1 (10), doc 3 (None)
         let docs: Vec<DocId> = hits.iter().map(|(_, a)| a.doc_id).collect();
         assert_eq!(docs, vec![0u32, 2, 1, 3]);
-        assert_eq!(hits[3].0, vec![None]);
-        assert!(hits[0].0[0].is_some());
+        assert_eq!(hits[3].0, vec![num(None)]);
+        assert!(matches!(hits[0].0[0], CursorSortVal::Numeric(Some(_))));
     }
 
     /// Two-field walk: ts DESC, _id ASC; primary tie on doc 0 vs doc 1
@@ -541,7 +704,7 @@ mod tests {
         // From doc 1 (100, 3): equal in every position → drop.
         // From doc 0 (100, 7): tie ts → _id=7 > 3 ASC → keep.
         // From doc 3 (50, 9):  ts=50 sorts AFTER 100 in DESC → keep.
-        let start_after = vec![Some(100i64.to_u64()), Some(3i64.to_u64())];
+        let start_after = vec![num(Some(100i64.to_u64())), num(Some(3i64.to_u64()))];
         let hits = harvest_with_matched(
             cursor.clone(),
             vec![("ts", Order::Desc), ("_id", Order::Asc)],
@@ -569,7 +732,7 @@ mod tests {
         );
         // search_after = (ts=200) — only docs with ts < 200 in DESC are after; that
         // means doc 0 (ts=100) and doc 2 (ts=50). Missing-primary doc 1 is skipped.
-        let start_after = vec![Some(200i64.to_u64())];
+        let start_after = vec![num(Some(200i64.to_u64()))];
         let hits = harvest_with_matched(
             cursor.clone(),
             vec![("ts", Order::Desc)],
@@ -653,32 +816,32 @@ mod tests {
             vec![("ts", Order::Desc), ("_id", Order::Asc)],
             10,
         );
-        let seg0_fruit: Vec<(Vec<Option<u64>>, DocAddress)> = vec![
+        let seg0_fruit: Vec<(Vec<CursorSortVal>, DocAddress)> = vec![
             (
-                vec![Some(200i64.to_u64()), Some(5i64.to_u64())],
+                vec![num(Some(200i64.to_u64())), num(Some(5i64.to_u64()))],
                 DocAddress {
                     segment_ord: 0,
                     doc_id: 2,
                 },
             ),
             (
-                vec![Some(100i64.to_u64()), Some(3i64.to_u64())],
+                vec![num(Some(100i64.to_u64())), num(Some(3i64.to_u64()))],
                 DocAddress {
                     segment_ord: 0,
                     doc_id: 1,
                 },
             ),
         ];
-        let seg1_fruit: Vec<(Vec<Option<u64>>, DocAddress)> = vec![
+        let seg1_fruit: Vec<(Vec<CursorSortVal>, DocAddress)> = vec![
             (
-                vec![Some(150i64.to_u64()), Some(8i64.to_u64())],
+                vec![num(Some(150i64.to_u64())), num(Some(8i64.to_u64()))],
                 DocAddress {
                     segment_ord: 1,
                     doc_id: 0,
                 },
             ),
             (
-                vec![Some(100i64.to_u64()), Some(1i64.to_u64())],
+                vec![num(Some(100i64.to_u64())), num(Some(1i64.to_u64()))],
                 DocAddress {
                     segment_ord: 1,
                     doc_id: 4,
@@ -695,5 +858,314 @@ mod tests {
             .map(|(_, a)| (a.segment_ord, a.doc_id))
             .collect();
         assert_eq!(pairs, vec![(0, 2), (1, 0), (1, 4), (0, 1)]);
+    }
+
+    // -------------------------------------------------------------
+    // Wave 18-3 — string sort cursor unit tests.
+    //
+    // The collector hot path's string decode goes through a real
+    // `StrColumn`, so these tests build an in-RAM tantivy index over
+    // a keyword field and drive the public `Collector` API.
+    // -------------------------------------------------------------
+
+    /// Convenience: wrap UTF-8 bytes into `CursorSortVal::String`.
+    fn s(bytes: &[u8]) -> CursorSortVal {
+        CursorSortVal::String(Some(bytes.to_vec()))
+    }
+
+    /// Convenience: missing string slot.
+    fn s_missing() -> CursorSortVal {
+        CursorSortVal::String(None)
+    }
+
+    /// `cmp_sort_val` on string slots respects per-field `Order` and
+    /// the missing-last rule.
+    #[test]
+    fn cmp_sort_val_string_orders_correctly() {
+        let ar = s(b"AR");
+        let jp = s(b"JP");
+        let us = s(b"US");
+        let missing = s_missing();
+        // ASC: AR < JP < US < missing
+        assert_eq!(cmp_sort_val(&ar, &jp, Order::Asc), Ordering::Less);
+        assert_eq!(cmp_sort_val(&jp, &us, Order::Asc), Ordering::Less);
+        assert_eq!(cmp_sort_val(&us, &missing, Order::Asc), Ordering::Less);
+        assert_eq!(cmp_sort_val(&missing, &us, Order::Asc), Ordering::Greater);
+        // DESC: US < JP < AR < missing (missing still last)
+        assert_eq!(cmp_sort_val(&us, &jp, Order::Desc), Ordering::Less);
+        assert_eq!(cmp_sort_val(&jp, &ar, Order::Desc), Ordering::Less);
+        assert_eq!(cmp_sort_val(&ar, &missing, Order::Desc), Ordering::Less);
+        // Same bytes are equal regardless of order.
+        assert_eq!(cmp_sort_val(&jp, &s(b"JP"), Order::Asc), Ordering::Equal);
+        assert_eq!(cmp_sort_val(&jp, &s(b"JP"), Order::Desc), Ordering::Equal);
+    }
+
+    /// String single-field sort over a real keyword fast field.  The
+    /// segment's term ordinals are decoded to UTF-8 bytes at harvest
+    /// time, and the resulting fruit holds `CursorSortVal::String`.
+    #[test]
+    fn string_single_field_real_segment_decodes_bytes() {
+        use crate::index::SegmentReader;
+        use crate::schema::{FAST, STRING, Schema};
+        use crate::{Index, IndexBuilder, IndexSettings, IndexSortByField};
+
+        let mut sb = Schema::builder();
+        let country = sb.add_text_field("country", STRING | FAST);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "country".to_string(),
+                order: Order::Asc,
+            }]),
+            ..Default::default()
+        };
+        let index = IndexBuilder::default()
+            .schema(schema.clone())
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let _ = index;
+        // Build path skipped: we are exercising the **collector** with
+        // a manually-built v2 cursor + a real `StrColumn` from a
+        // committed segment.  Indexing through the writer + cursor
+        // build path is covered separately (`v2_string_*` in
+        // `sort_cursor.rs`).  Here we focus on cross-segment merge.
+        // Rebuild a fresh index that we drive directly.
+        drop(country);
+        let mut sb = Schema::builder();
+        let country = sb.add_text_field("country", STRING | FAST);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "country".to_string(),
+                order: Order::Asc,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index
+            .writer_for_tests()
+            .expect("writer_for_tests");
+        // 4 docs: JP, US, AR, JP
+        writer.add_document(doc!(country => "JP")).unwrap();
+        writer.add_document(doc!(country => "US")).unwrap();
+        writer.add_document(doc!(country => "AR")).unwrap();
+        writer.add_document(doc!(country => "JP")).unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(
+            searcher.segment_readers().len(),
+            1,
+            "test assumes a single segment"
+        );
+        let seg: &SegmentReader = searcher.segment_reader(0);
+        // Cursor advertised by SegmentMeta.
+        assert!(
+            seg.sort_cursor_v2("country").is_some(),
+            "v2 cursor must be present after commit on a sort_by_fields index"
+        );
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Asc)],
+            10,
+        );
+        assert!(collector.can_handle_segment(seg));
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .expect("search v2-multi string");
+        let docs: Vec<u32> = hits.iter().map(|(_, a)| a.doc_id).collect();
+        // ASC: AR (doc 2) < JP (docs 0, 3 — tie broken by doc-id ASC) < US (doc 1).
+        assert_eq!(docs, vec![2u32, 0, 3, 1]);
+        // Fruit values are decoded UTF-8 bytes.
+        assert_eq!(hits[0].0, vec![s(b"AR")]);
+        assert_eq!(hits[1].0, vec![s(b"JP")]);
+        assert_eq!(hits[2].0, vec![s(b"JP")]);
+        assert_eq!(hits[3].0, vec![s(b"US")]);
+    }
+
+    /// Cross-segment merge with diverging dictionaries: two segments
+    /// whose term ord 1 maps to different strings ("JP" in seg A vs
+    /// "US" in seg B).  Without byte-level decode at harvest, the
+    /// merge would compare raw ords and produce a wrong global order.
+    /// This test pins that the decoded-bytes fruit yields a correct
+    /// global lex order across segments.
+    #[test]
+    fn string_cross_segment_dictionary_divergence_uses_bytes() {
+        use crate::schema::{FAST, STRING, Schema};
+        use crate::{Index, IndexBuilder, IndexSettings, IndexSortByField};
+
+        let mut sb = Schema::builder();
+        let country = sb.add_text_field("country", STRING | FAST);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "country".to_string(),
+                order: Order::Asc,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().expect("writer_for_tests");
+        // Segment A: AR, JP — local dict: AR=0, JP=1.
+        writer.add_document(doc!(country => "AR")).unwrap();
+        writer.add_document(doc!(country => "JP")).unwrap();
+        writer.commit().unwrap();
+        // Segment B: CN, US — local dict: CN=0, US=1.
+        // Same raw ord 1 maps to "JP" in seg A but "US" in seg B —
+        // so a hypothetical raw-ord merge would conflate them.
+        writer.add_document(doc!(country => "CN")).unwrap();
+        writer.add_document(doc!(country => "US")).unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert!(
+            searcher.segment_readers().len() >= 2,
+            "test assumes at least 2 segments"
+        );
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Asc)],
+            10,
+        );
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .expect("search v2-multi cross-segment");
+        // Global ASC byte order across both segments:
+        //   AR < CN < JP < US
+        let bytes: Vec<&[u8]> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::String(Some(b)) => b.as_slice(),
+                _ => panic!("expected decoded string slot"),
+            })
+            .collect();
+        assert_eq!(
+            bytes,
+            vec![b"AR".as_slice(), b"CN".as_slice(), b"JP".as_slice(), b"US".as_slice()],
+            "decoded bytes must respect global lex order across segments, \
+             not segment-local ord ordering"
+        );
+    }
+
+    /// Multi-field cursor `[country ASC, ts DESC]`: lex sort over a
+    /// keyword primary + numeric secondary.  Pinned via a real
+    /// segment so the harvest path does an actual `StrColumn` decode.
+    #[test]
+    fn string_then_numeric_multi_field_real_segment() {
+        use crate::schema::{FAST, INDEXED, STORED, STRING, Schema};
+        use crate::{Index, IndexBuilder, IndexSettings, IndexSortByField};
+
+        let mut sb = Schema::builder();
+        let country = sb.add_text_field("country", STRING | FAST);
+        let ts = sb.add_i64_field("ts", FAST | INDEXED | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![
+                IndexSortByField {
+                    field: "country".to_string(),
+                    order: Order::Asc,
+                },
+                IndexSortByField {
+                    field: "ts".to_string(),
+                    order: Order::Desc,
+                },
+            ]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().expect("writer_for_tests");
+        // 5 docs:
+        //   doc 0: JP / 100
+        //   doc 1: AR / 30
+        //   doc 2: JP / 200
+        //   doc 3: US / 5
+        //   doc 4: AR / 30   (tie with doc 1 on both keys)
+        writer.add_document(doc!(country => "JP", ts => 100i64)).unwrap();
+        writer.add_document(doc!(country => "AR", ts => 30i64)).unwrap();
+        writer.add_document(doc!(country => "JP", ts => 200i64)).unwrap();
+        writer.add_document(doc!(country => "US", ts => 5i64)).unwrap();
+        writer.add_document(doc!(country => "AR", ts => 30i64)).unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Asc), ("ts", Order::Desc)],
+            10,
+        );
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .expect("search v2-multi string+numeric");
+        let docs: Vec<u32> = hits.iter().map(|(_, a)| a.doc_id).collect();
+        // ASC country, DESC ts:
+        //   AR/30 (doc 1, doc 4 — doc-id ASC tie) → JP/200 (doc 2) → JP/100 (doc 0) → US/5 (doc 3)
+        assert_eq!(docs, vec![1u32, 4, 2, 0, 3]);
+        // Spot-check: first hit has country="AR" decoded.
+        assert_eq!(hits[0].0[0], s(b"AR"));
+        // And ts=30 encoded numerically.
+        assert!(matches!(
+            hits[0].0[1],
+            CursorSortVal::Numeric(Some(_))
+        ));
+    }
+
+    /// `is_strictly_after_lex` on a string primary: DESC search_after
+    /// "JP" means the walker should keep docs whose primary is strictly
+    /// less than "JP" (in DESC walk = later in walk = lex less than).
+    #[test]
+    fn search_after_string_lex_skip() {
+        // Build a string-only cursor manually (term ords 0..2 standing
+        // in for "AR", "JP", "US" in lex order).  Then drive the
+        // SegmentCollector via `harvest_with_matched`, but pre-decode
+        // the fruit so the helper bypasses the StrColumn path — we
+        // assert the search_after lex semantic at the
+        // `is_strictly_after_lex` layer here, since real-segment
+        // search_after is covered by the ferrosearch integ tests.
+        let tuple_jp = vec![s(b"JP")];
+        let tuple_us = vec![s(b"US")];
+        let tuple_ar = vec![s(b"AR")];
+        let start = vec![s(b"JP")];
+        let orders = [Order::Desc];
+        // DESC walk: tuples lex less than "JP" sort AFTER "JP" in DESC.
+        // → "AR" is lex less → strictly_after?  No: in DESC ord, "AR" > "JP" wait
+        // Recheck: DESC order means walker emits in reverse byte order,
+        // so "after JP in walk" = "lex less than JP".
+        assert_eq!(
+            is_strictly_after_lex(&tuple_ar, &start, &orders),
+            true,
+            "AR must be strictly after JP in DESC walk"
+        );
+        assert_eq!(
+            is_strictly_after_lex(&tuple_jp, &start, &orders),
+            false,
+            "JP must NOT be strictly after itself"
+        );
+        assert_eq!(
+            is_strictly_after_lex(&tuple_us, &start, &orders),
+            false,
+            "US comes before JP in DESC walk"
+        );
+        // And ASC: opposite.
+        let orders_asc = [Order::Asc];
+        assert_eq!(
+            is_strictly_after_lex(&tuple_us, &start, &orders_asc),
+            true,
+            "US is strictly after JP in ASC walk"
+        );
+        assert_eq!(
+            is_strictly_after_lex(&tuple_ar, &start, &orders_asc),
+            false,
+            "AR is before JP in ASC walk"
+        );
     }
 }

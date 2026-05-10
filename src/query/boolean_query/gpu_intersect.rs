@@ -160,7 +160,19 @@ pub(crate) fn try_gpu_intersect(
     //
     // We collect into Vec<RoaringPostings>, then build a Vec of refs
     // for try_gpu_bool's `&[&RoaringPostings]` signature.
-    let mut owned_postings: Vec<RoaringPostings> = Vec::with_capacity(must_scorers.len());
+    // Phase 2 D-1 — CHT lookup before drain. The cache key is
+    // `(segment_id, posting_data_addr, posting_data_len)` (see
+    // `crate::postings::roaring::cht::ChtKey` doc); on hit we skip
+    // `drain_block_segment_to_roaring` entirely (the ~700 ms / 10 M-doc
+    // bottleneck per Wave 8 / C re-bench). On miss we drain as today,
+    // then `Arc::new` the result and insert into the cache for the
+    // next query touching the same posting list.
+    use crate::postings::roaring::cht;
+    use std::sync::Arc;
+    let segment_id = reader.segment_id();
+    let cht_handle = cht::global();
+    let mut owned_postings: Vec<Arc<RoaringPostings>> =
+        Vec::with_capacity(must_scorers.len());
     let mut term_scorers: Vec<Box<TermScorer>> = Vec::with_capacity(must_scorers.len());
     for scorer in must_scorers {
         // Infallible per gate 3. Box<dyn Scorer>::downcast moves the
@@ -170,17 +182,33 @@ pub(crate) fn try_gpu_intersect(
             .downcast::<TermScorer>()
             .map_err(|_| ())
             .expect("gate 3 should have rejected non-TermScorer");
-        // Clone the BlockSegmentPostings so the original TermScorer
-        // (re-collected below on the recovery path) keeps its read
-        // cursor. Cheap clone — see file slice / Arc pattern above.
-        let mut block_cursor = term_scorer.segment_postings().block_cursor.clone();
-        let roaring = drain_block_segment_to_roaring(&mut block_cursor);
+        let (data_addr, data_len) =
+            term_scorer.segment_postings().block_cursor.data_slice_id();
+        let key = cht::ChtKey {
+            segment_id,
+            posting_data_addr: data_addr,
+            posting_data_len: data_len,
+        };
+        let roaring = if let Some(cached) = cht_handle.get(&key) {
+            // Hit — skip the drain entirely.
+            cached
+        } else {
+            // Miss — drain (the legacy hot path) + insert into cache
+            // so subsequent queries hit. We clone the BlockSegmentPostings
+            // so the original TermScorer keeps its read cursor for the
+            // err-recovery path; cheap (file slice / Arc pattern).
+            let mut block_cursor = term_scorer.segment_postings().block_cursor.clone();
+            let drained = Arc::new(drain_block_segment_to_roaring(&mut block_cursor));
+            cht_handle.insert(key, Arc::clone(&drained));
+            drained
+        };
         owned_postings.push(roaring);
         term_scorers.push(term_scorer);
     }
 
     // ----- GPU dispatch -----
-    let term_refs: Vec<&RoaringPostings> = owned_postings.iter().collect();
+    let term_refs: Vec<&RoaringPostings> =
+        owned_postings.iter().map(|a| a.as_ref()).collect();
     let gpu_result = try_gpu_bool(BoolOp::And, &term_refs, num_docs_in_segment);
     let Some(roaring_result) = gpu_result else {
         // Driver init failed / wgpu unavailable / cohort emptied

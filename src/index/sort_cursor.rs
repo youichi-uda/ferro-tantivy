@@ -581,4 +581,126 @@ mod tests {
         assert_eq!(cursor.doc_ids(), &[4u32, 0, 2, 3, 1]);
         Ok(())
     }
+
+    /// **FerroSearch Wave 15 Phase H-1.** After force-merging multiple
+    /// segments down to one, the merged segment must carry a freshly
+    /// rebuilt sort cursor.  Without the Phase H-1 hook in
+    /// `segment_updater::merge`, post-merge segments would have an
+    /// empty `sort_cursor_fields` list (each input segment owned its
+    /// own cursor; merging produces a fresh segment from scratch) and
+    /// the Phase E dispatch gate would silently fall back to the
+    /// legacy `SortByStaticFastValue` path.
+    ///
+    /// This is exactly the http_logs Rally
+    /// `*-after-force-merge-1-seg` ES-wins case — without H-1, those
+    /// queries cannot benefit from the early-term cursor.
+    #[test]
+    fn post_force_merge_segment_carries_rebuilt_cursor() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField};
+        use crate::indexer::NoMergePolicy;
+        use crate::schema::{Schema, FAST};
+        use crate::{Index, IndexWriter, TantivyDocument};
+
+        let mut schema_builder = Schema::builder();
+        let value_field = schema_builder.add_i64_field("value", FAST);
+        let schema = schema_builder.build();
+
+        let settings = IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "value".to_string(),
+                order: Order::Desc,
+            }),
+            ..Default::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()?;
+
+        // Disable auto-merge so we can deterministically build several
+        // small segments first, then trigger an explicit force-merge.
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // Build 3 segments by committing in batches.  Insertion order is
+        // scrambled inside each batch so the per-segment cursor must do
+        // real work to recover the descending sort.
+        for batch in [&[40i64, 10, 30][..], &[20, 50][..], &[60, 5][..]] {
+            for v in batch {
+                let mut doc = TantivyDocument::default();
+                doc.add_i64(value_field, *v);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+
+        // Pre-merge sanity: the reader sees 3 segments, each with its
+        // own cursor (Phase A invariant — every fresh segment that
+        // commits with `sort_by_field` set carries a cursor).
+        let pre_merge_searcher = index.reader()?.searcher();
+        assert_eq!(
+            pre_merge_searcher.segment_readers().len(),
+            3,
+            "expected 3 pre-merge segments"
+        );
+        for sr in pre_merge_searcher.segment_readers() {
+            assert!(
+                sr.sort_cursor("value").is_some(),
+                "every pre-merge segment must carry the cursor (Phase A)"
+            );
+        }
+
+        // Trigger an in-place force-merge via `IndexWriter::merge`.
+        let segment_ids: Vec<crate::index::SegmentId> = pre_merge_searcher
+            .segment_readers()
+            .iter()
+            .map(|sr| sr.segment_id())
+            .collect();
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        // After merge: a single new segment must exist AND it must
+        // carry the rebuilt sort cursor.  Without Phase H-1 this
+        // assertion fails (`sort_cursor("value")` returns None).
+        let post_merge_searcher = index.reader()?.searcher();
+        assert_eq!(
+            post_merge_searcher.segment_readers().len(),
+            1,
+            "force-merge should collapse to a single segment"
+        );
+        let merged_sr = post_merge_searcher.segment_reader(0);
+        let cursor = merged_sr
+            .sort_cursor("value")
+            .expect("Phase H-1: merged segment must carry rebuilt cursor");
+        assert_eq!(cursor.field(), "value");
+        assert_eq!(cursor.order(), Order::Desc);
+        // Cursor enumerates exactly `max_doc` of the merged segment.
+        // We don't assert a literal count because the writer may elide
+        // documents at commit boundaries in some configurations.
+        assert_eq!(
+            cursor.len() as u32,
+            merged_sr.max_doc(),
+            "cursor must enumerate every doc in the merged segment"
+        );
+        // Walk the cursor and verify monotonicity (desc) by re-reading
+        // the value column for each emitted doc id — this validates
+        // that the cursor's permutation actually corresponds to the
+        // post-merge doc layout, not stale pre-merge doc ids.
+        let column = merged_sr
+            .fast_fields()
+            .i64("value")
+            .expect("value column must exist");
+        let mut prev: Option<i64> = None;
+        for doc_id in cursor.iter() {
+            let v = column.first(doc_id).expect("dense column has all values");
+            if let Some(p) = prev {
+                assert!(
+                    p >= v,
+                    "cursor must be non-increasing for Desc: {p} then {v} at doc {doc_id}"
+                );
+            }
+            prev = Some(v);
+        }
+        Ok(())
+    }
 }

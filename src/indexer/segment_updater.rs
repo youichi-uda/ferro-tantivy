@@ -123,7 +123,26 @@ fn merge(
 
     let merged_segment_id = merged_segment.id();
 
-    let segment_meta = index.new_segment_meta(merged_segment_id, num_docs);
+    let mut segment_meta = index.new_segment_meta(merged_segment_id, num_docs);
+    // **FerroSearch Wave 15 Phase H-1.** Rebuild the auxiliary sort
+    // cursor for the merged segment when the index advertises a sort
+    // field.  Phase A's per-segment cursors do not survive merges
+    // (each input segment had its own cursor; the merged output
+    // segment is fresh and starts with `sort_cursor_fields = []`).
+    // Without this hook the Phase E dispatch gate falls back to the
+    // legacy `SortByStaticFastValue` path on every post-merge query —
+    // exactly the http_logs `*-after-force-merge-1-seg` ES-wins case.
+    //
+    // We use the same `with_max_doc` → `build_and_write_sort_cursors`
+    // → `with_sort_cursor_fields` sequence that
+    // `IndexWriter::index_documents` runs after a fresh segment write.
+    if index.settings().sort_by_field.is_some() && num_docs > 0 {
+        let mut merged_with_max = merged_segment.clone().with_max_doc(num_docs);
+        let cursor_fields = crate::index::build_and_write_sort_cursors(&mut merged_with_max)?;
+        if !cursor_fields.is_empty() {
+            segment_meta = segment_meta.with_sort_cursor_fields(cursor_fields);
+        }
+    }
     Ok(Some(SegmentEntry::new(segment_meta, delete_cursor, None)))
 }
 
@@ -220,10 +239,22 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     let merged_segment_id = merged_segment.id();
     let merger: IndexMerger =
         IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?;
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment)?;
+    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
     let num_docs = merger.write(segment_serializer)?;
 
-    let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
+    let mut segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
+    // **FerroSearch Wave 15 Phase H-1** (cross-index merge variant).
+    // Same rebuild as the in-place `merge` path — when the target
+    // settings advertise an index sort, the merged-into-output-dir
+    // segment must also carry the auxiliary sort cursor so a post-merge
+    // searcher's Phase E dispatch can find it.
+    if target_settings.sort_by_field.is_some() && num_docs > 0 {
+        let mut merged_with_max = merged_segment.with_max_doc(num_docs);
+        let cursor_fields = crate::index::build_and_write_sort_cursors(&mut merged_with_max)?;
+        if !cursor_fields.is_empty() {
+            segment_meta = segment_meta.with_sort_cursor_fields(cursor_fields);
+        }
+    }
 
     let stats = format!(
         "Segments Merge: [{}]",

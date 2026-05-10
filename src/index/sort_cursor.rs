@@ -925,7 +925,6 @@ fn read_field_to_u64(
     field: &str,
     num_docs: u32,
 ) -> crate::Result<(ValueKind, Vec<Option<u64>>)> {
-    use crate::fastfield::FastValue;
     use columnar::MonotonicallyMappableToU64;
     if let Some(col) = readers.column_opt::<i64>(field)? {
         let values: Vec<Option<u64>> = (0..num_docs)
@@ -986,32 +985,64 @@ pub fn build_sort_cursor_from_fast_fields(
 }
 
 /// Builds and persists the auxiliary sort cursor file(s) for `segment`,
-/// based on `segment.index().settings().sort_by_field`.
+/// based on `segment.index().settings().sort_by_field` (v1, single
+/// field) or `sort_by_fields` (v2, multi field).
 ///
-/// **FerroSearch extension (Wave 15).** Called by `index_documents` and
-/// `SingleSegmentIndexWriter::finalize` after the main segment files have
-/// been laid out on disk and `with_max_doc` has been applied. Returns
-/// the field names whose cursor was successfully written, so the caller
-/// can advertise them in `SegmentMeta::sort_cursor_fields` via
+/// **FerroSearch extension (Wave 15 / Wave 18-1).** Called by
+/// `index_documents` and `SingleSegmentIndexWriter::finalize` after
+/// the main segment files have been laid out on disk and `with_max_doc`
+/// has been applied. Returns the field names whose cursor was
+/// successfully written (single-field name for v1; the **primary**
+/// field name for v2), so the caller can advertise them in
+/// `SegmentMeta::sort_cursor_fields` via
 /// [`crate::index::Segment::with_sort_cursor_fields`].
 ///
-/// A no-op (`Ok(Vec::new())`) when the index has no `sort_by_field`
-/// configured — keeps the indexing path zero-cost for indices that do
-/// not opt in.
+/// A no-op (`Ok(Vec::new())`) when neither `sort_by_field` nor
+/// `sort_by_fields` is configured — keeps the indexing path zero-cost
+/// for indices that do not opt in.
+///
+/// `IndexSettings::validate_sort_settings()` (called from
+/// `IndexBuilder::create`) guarantees `sort_by_field` and
+/// `sort_by_fields` are mutually exclusive — this function trusts that
+/// invariant and prefers `sort_by_fields` when both happen to be set
+/// at runtime (via direct struct mutation).
 pub fn build_and_write_sort_cursors(
     segment: &mut crate::index::Segment,
 ) -> crate::Result<Vec<String>> {
     use common::TerminatingWrite;
 
-    let sort_by = match segment.index().settings().sort_by_field.clone() {
-        Some(sb) => sb,
-        None => return Ok(Vec::new()),
-    };
+    let settings = segment.index().settings().clone();
     let max_doc = segment.meta().max_doc();
     if max_doc == 0 {
         // An empty segment carries no doc ids; skip writing a cursor.
         return Ok(Vec::new());
     }
+
+    // Wave 18-1: prefer multi-field (v2) when configured.
+    if let Some(fields) = settings.sort_by_fields.as_ref() {
+        if fields.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reader = crate::index::SegmentReader::open(segment)?;
+        let pairs: Vec<(String, Order)> =
+            fields.iter().map(|f| (f.field.clone(), f.order)).collect();
+        let cursor = build_sort_cursor_v2_from_fast_fields(reader.fast_fields(), &pairs, max_doc)?;
+        // The on-disk file is keyed by the **primary** field name so a
+        // later reader's `Segment::meta().sort_cursor_fields()` listing
+        // (which carries field names verbatim) finds it.
+        let primary_field = pairs[0].0.clone();
+        let mut writer = segment.open_sort_cursor_write(&primary_field)?;
+        cursor.write(&mut writer)?;
+        writer.terminate()?;
+        // Same Phase H-5 reasoning as the v1 path below.
+        segment.index().directory().sync_directory()?;
+        return Ok(vec![primary_field]);
+    }
+
+    let sort_by = match settings.sort_by_field {
+        Some(sb) => sb,
+        None => return Ok(Vec::new()),
+    };
     let reader = crate::index::SegmentReader::open(segment)?;
     let cursor = build_sort_cursor_from_fast_fields(
         reader.fast_fields(),
@@ -1083,6 +1114,61 @@ pub fn build_and_write_sort_cursor_for(
     // Same Phase H-5 reasoning as `build_and_write_sort_cursors`: sync
     // the directory entry so a later reader's `MmapDirectory` open
     // doesn't race the buffered cursor file write.
+    segment.index().directory().sync_directory()?;
+    Ok(true)
+}
+
+/// Builds and persists the auxiliary **multi-field** (v2) sort cursor
+/// file for a single, caller-supplied list of `(field, order)` pairs,
+/// **bypassing** `IndexSettings::sort_by_fields`.
+///
+/// **FerroSearch Wave 18-1 backfill primitive.** This is the
+/// multi-field analogue of [`build_and_write_sort_cursor_for`] —
+/// designed to be the building block for
+/// `IndexWriter::backfill_sort_cursor_v2`, the post-creation
+/// "operator just changed `index.sort.field` to a multi-field array,
+/// please backfill the existing segments" admin path.
+///
+/// The on-disk file is keyed by the **primary** field name (the
+/// first entry in `pairs`), matching the `SegmentMeta::sort_cursor_fields`
+/// naming convention used by the v1 path.
+///
+/// Returns `Ok(true)` when a cursor file was written, `Ok(false)`
+/// when `max_doc == 0` (skipped), and an `Err` when the field list
+/// is empty / exceeds `SORT_CURSOR_MAX_FIELDS` / contains a non-fast-
+/// or non-numeric field. Returns the primary field name via
+/// [`SortCursorIndexV2::primary_field`] semantics — callers should
+/// take the first entry of `pairs`.
+pub fn build_and_write_sort_cursor_v2_for(
+    segment: &mut crate::index::Segment,
+    pairs: &[(String, crate::index::Order)],
+) -> crate::Result<bool> {
+    use common::TerminatingWrite;
+
+    if pairs.is_empty() {
+        return Err(crate::TantivyError::InvalidArgument(
+            "sort cursor v2 backfill: at least one field is required".to_string(),
+        ));
+    }
+    if pairs.len() > SORT_CURSOR_MAX_FIELDS {
+        return Err(crate::TantivyError::InvalidArgument(format!(
+            "sort cursor v2 backfill: at most {SORT_CURSOR_MAX_FIELDS} fields, got {}",
+            pairs.len()
+        )));
+    }
+    let max_doc = segment.meta().max_doc();
+    if max_doc == 0 {
+        return Ok(false);
+    }
+    let reader = crate::index::SegmentReader::open(segment)?;
+    let cursor = build_sort_cursor_v2_from_fast_fields(reader.fast_fields(), pairs, max_doc)?;
+    let primary_field = &pairs[0].0;
+    let mut writer = segment.open_sort_cursor_write(primary_field)?;
+    cursor.write(&mut writer)?;
+    writer.terminate()?;
+    // Same Phase H-5 reasoning as the v1 backfill: ensure the dirent
+    // is durably visible before the caller publishes the updated
+    // `SegmentMeta::sort_cursor_fields`.
     segment.index().directory().sync_directory()?;
     Ok(true)
 }
@@ -1868,6 +1954,171 @@ mod tests {
         assert!(
             err.to_string().contains("unsupported version"),
             "expected unsupported version error, got: {err}"
+        );
+    }
+
+    /// **Wave 18-1 Phase C.** When `IndexSettings::sort_by_fields` is
+    /// set, a commit writes a v2 cursor file to disk and the
+    /// `SegmentReader::sort_cursor_v2()` accessor returns it. Mirrors
+    /// `end_to_end_index_commit_persists_cursor` (v1) but for the
+    /// multi-field path.
+    #[test]
+    fn end_to_end_v2_commit_persists_multi_field_cursor() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField};
+        use crate::schema::{Schema, FAST};
+        use crate::{Index, IndexWriter, TantivyDocument};
+
+        let mut schema_builder = Schema::builder();
+        let ts_field = schema_builder.add_i64_field("ts", FAST);
+        let id_field = schema_builder.add_i64_field("id", FAST);
+        let schema = schema_builder.build();
+
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![
+                IndexSortByField {
+                    field: "ts".to_string(),
+                    order: Order::Desc,
+                },
+                IndexSortByField {
+                    field: "id".to_string(),
+                    order: Order::Asc,
+                },
+            ]),
+            ..Default::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        // (ts, id) docs:
+        //   doc 0: (100, 7)
+        //   doc 1: (100, 3)   ← ties with doc 0 on ts; id=3 < 7 → doc 1 first
+        //   doc 2: (200, 5)
+        //   doc 3: (50,  9)
+        for (ts, id) in [(100i64, 7i64), (100, 3), (200, 5), (50, 9)] {
+            let mut doc = TantivyDocument::default();
+            doc.add_i64(ts_field, ts);
+            doc.add_i64(id_field, id);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let sr = searcher.segment_reader(0);
+
+        // Meta should advertise the cursor under the PRIMARY field name.
+        let cursor_fields: Vec<&str> = sr.sort_cursor_fields().collect();
+        assert_eq!(cursor_fields, vec!["ts"]);
+
+        // v1 accessor returns None — this is a v2 cursor.
+        assert!(sr.sort_cursor("ts").is_none());
+
+        // v2 accessor returns the cursor.
+        let cursor = sr
+            .sort_cursor_v2("ts")
+            .expect("v2 cursor should be present after commit");
+        assert_eq!(cursor.fields().len(), 2);
+        assert_eq!(cursor.fields()[0].0, "ts");
+        assert_eq!(cursor.fields()[0].1, Order::Desc);
+        assert_eq!(cursor.fields()[1].0, "id");
+        assert_eq!(cursor.fields()[1].1, Order::Asc);
+        // Lex sort order: doc 2 (200,5), doc 1 (100,3), doc 0 (100,7), doc 3 (50,9).
+        assert_eq!(cursor.doc_ids(), &[2u32, 1, 0, 3]);
+        Ok(())
+    }
+
+    /// **Wave 18-1 Phase C.** `IndexSettings::validate_sort_settings`
+    /// rejects setting both `sort_by_field` and `sort_by_fields`.
+    #[test]
+    fn index_settings_rejects_both_sort_by_field_and_fields_set() {
+        use crate::index::{IndexSettings, IndexSortByField};
+
+        let settings = IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "a".to_string(),
+                order: Order::Asc,
+            }),
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "b".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        let err = settings.validate_sort_settings().unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    /// **Wave 18-1 Phase C.** Cap is enforced on multi-field sort: an
+    /// empty `sort_by_fields` returns an error (use `None` instead),
+    /// and 9 fields exceeds the `SORT_CURSOR_MAX_FIELDS=8` cap.
+    #[test]
+    fn index_settings_rejects_empty_or_too_many_fields() {
+        use crate::index::{IndexSettings, IndexSortByField};
+
+        let empty = IndexSettings {
+            sort_by_fields: Some(vec![]),
+            ..Default::default()
+        };
+        let err = empty.validate_sort_settings().unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be empty"),
+            "expected empty-fields error, got: {err}"
+        );
+
+        let too_many = IndexSettings {
+            sort_by_fields: Some(
+                (0..9)
+                    .map(|i| IndexSortByField {
+                        field: format!("f{i}"),
+                        order: Order::Asc,
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let err = too_many.validate_sort_settings().unwrap_err();
+        assert!(
+            err.to_string().contains("at most"),
+            "expected cap error, got: {err}"
+        );
+    }
+
+    /// **Wave 18-1 Phase C.** `IndexBuilder::create` propagates the
+    /// validation error so misuse is caught at index-create time
+    /// rather than at commit time.
+    #[test]
+    fn index_builder_propagates_sort_settings_validation_error() {
+        use crate::index::{IndexSettings, IndexSortByField};
+        use crate::schema::Schema;
+        use crate::Index;
+
+        let schema = Schema::builder().build();
+        let bad = IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "a".to_string(),
+                order: Order::Asc,
+            }),
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "b".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        let err = Index::builder()
+            .schema(schema)
+            .settings(bad)
+            .create_in_ram()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "expected mutual-exclusion error from IndexBuilder, got: {err}"
         );
     }
 }

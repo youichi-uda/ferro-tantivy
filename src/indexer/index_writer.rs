@@ -612,6 +612,102 @@ impl<D: Document> IndexWriter<D> {
     /// but the segment manager / meta.json are not updated — the
     /// caller can retry safely (the per-segment `with_sort_cursor_fields`
     /// add is idempotent).
+    /// **FerroSearch Wave 18-1 backfill** (multi-field v2). Mirrors
+    /// [`Self::backfill_sort_cursor`] but writes the v2 cursor file
+    /// for the supplied list of `(field, order)` pairs.
+    ///
+    /// Each segment that does not already advertise a cursor for the
+    /// **primary** field gets a new v2 cursor file written, and its
+    /// `SegmentMeta::sort_cursor_fields` is extended with the primary
+    /// field name. The on-disk file is keyed by the primary field
+    /// name only — the `SortCursorIndexV2` itself records the full
+    /// `(field, order)` list internally, so the secondary fields are
+    /// recoverable when the cursor is opened at search time.
+    ///
+    /// Idempotent: a re-run on a fully-backfilled set of segments is
+    /// a no-op (returns `Ok(0)`). Useful when the operator wants to
+    /// retry after a partial failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidArgument` when `pairs` is empty or has more
+    /// than [`crate::index::SORT_CURSOR_MAX_FIELDS`] entries.
+    /// Returns `SchemaError` when any field is not declared `FAST` in
+    /// the schema or its type is not numeric/date.
+    pub fn backfill_sort_cursor_v2(
+        &self,
+        pairs: &[(String, Order)],
+    ) -> crate::Result<usize> {
+        if pairs.is_empty() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "backfill_sort_cursor_v2: at least one field is required".to_string(),
+            ));
+        }
+        if pairs.len() > crate::index::SORT_CURSOR_MAX_FIELDS {
+            return Err(crate::TantivyError::InvalidArgument(format!(
+                "backfill_sort_cursor_v2: at most {} fields, got {}",
+                crate::index::SORT_CURSOR_MAX_FIELDS,
+                pairs.len()
+            )));
+        }
+        let primary_field = pairs[0].0.clone();
+        let segment_manager = self.segment_updater().segment_manager();
+        let original_entries = segment_manager.committed_segment_entries();
+
+        let mut updated_entries: Vec<SegmentEntry> = Vec::with_capacity(original_entries.len());
+        let mut backfilled_count: usize = 0;
+
+        for entry in &original_entries {
+            let meta = entry.meta();
+            if meta.max_doc() == 0 {
+                updated_entries.push(entry.clone());
+                continue;
+            }
+            // We key idempotency on the PRIMARY field name, matching the
+            // `SegmentMeta::sort_cursor_fields` listing convention. When
+            // a v1 cursor already exists for the primary field, the
+            // operator must call `_rebuild_sort_cursor` after deleting
+            // the old listing — Wave 18-1 does NOT silently downgrade
+            // v2 over an existing v1 entry. (The existing meta still
+            // points at a v1 file; the file's bytes would change to v2
+            // and a v1 reader would now see "unsupported version 2".)
+            let already_present = meta
+                .sort_cursor_fields()
+                .iter()
+                .any(|f| f == &primary_field);
+            if already_present {
+                updated_entries.push(entry.clone());
+                continue;
+            }
+
+            let mut segment = self.index.segment(meta.clone());
+            let written =
+                crate::index::build_and_write_sort_cursor_v2_for(&mut segment, pairs)?;
+            if !written {
+                updated_entries.push(entry.clone());
+                continue;
+            }
+
+            let mut all_cursor_fields: Vec<String> = meta.sort_cursor_fields().to_vec();
+            all_cursor_fields.push(primary_field.clone());
+            let new_meta = meta.clone().with_sort_cursor_fields(all_cursor_fields);
+
+            let mut new_entry = entry.clone();
+            new_entry.set_meta(new_meta);
+            updated_entries.push(new_entry);
+            backfilled_count += 1;
+        }
+
+        if backfilled_count == 0 {
+            return Ok(0);
+        }
+
+        segment_manager.commit(updated_entries);
+        let opstamp = self.committed_opstamp;
+        self.segment_updater().save_metas(opstamp, None)?;
+        Ok(backfilled_count)
+    }
+
     pub fn backfill_sort_cursor(&self, field: &str, order: Order) -> crate::Result<usize> {
         let segment_manager = self.segment_updater().segment_manager();
         let original_entries = segment_manager.committed_segment_entries();
@@ -3168,6 +3264,111 @@ mod tests {
             assert_eq!(seg.sort_cursor("v2").unwrap().order(), Order::Asc);
         }
         let _ = (v1, v2);
+        Ok(())
+    }
+
+    /// **Wave 18-1 Phase C.** Backfill writes a v2 multi-field cursor
+    /// across existing segments and the v2 accessor returns the cursor
+    /// after `reader.reload()`. Mirrors
+    /// `test_backfill_sort_cursor_on_existing_segments` (v1) but for
+    /// the multi-field path.
+    #[test]
+    fn test_backfill_sort_cursor_v2_on_existing_segments() -> crate::Result<()> {
+        use crate::index::Order;
+        use crate::schema::FAST;
+        let mut schema_builder = Schema::builder();
+        let ts_field = schema_builder.add_i64_field("ts", FAST);
+        let id_field = schema_builder.add_i64_field("id", FAST);
+        // No `IndexSettings::sort_by_fields` — segments are committed
+        // without a cursor; backfill is the post-creation entry point.
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        for (ts, id) in [(100i64, 7i64), (100, 3), (200, 5), (50, 9)] {
+            let mut doc = TantivyDocument::default();
+            doc.add_i64(ts_field, ts);
+            doc.add_i64(id_field, id);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        // Second segment with overlapping ts so the multi-field
+        // tie-breaker on `id` actually has work to do.
+        for (ts, id) in [(100i64, 1i64), (300, 2)] {
+            let mut doc = TantivyDocument::default();
+            doc.add_i64(ts_field, ts);
+            doc.add_i64(id_field, id);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+
+        // Pre-backfill: 2 segments, no cursor.
+        let reader_pre = index.reader()?;
+        for seg in reader_pre.searcher().segment_readers() {
+            assert!(seg.sort_cursor_fields().next().is_none());
+        }
+
+        let pairs = vec![
+            ("ts".to_string(), Order::Desc),
+            ("id".to_string(), Order::Asc),
+        ];
+        let count = writer.backfill_sort_cursor_v2(&pairs)?;
+        assert_eq!(count, 2, "every populated segment should be backfilled");
+
+        // Idempotent re-run.
+        let count2 = writer.backfill_sort_cursor_v2(&pairs)?;
+        assert_eq!(count2, 0, "second backfill must be a no-op");
+
+        let reader = index.reader()?;
+        reader.reload()?;
+        for seg in reader.searcher().segment_readers() {
+            let advertised: Vec<&str> = seg.sort_cursor_fields().collect();
+            // Listing carries the PRIMARY field name only.
+            assert_eq!(advertised, vec!["ts"]);
+            // v1 accessor returns None (the file is v2 format).
+            assert!(seg.sort_cursor("ts").is_none());
+            // v2 accessor returns the multi-field cursor.
+            let cursor = seg
+                .sort_cursor_v2("ts")
+                .expect("backfilled v2 cursor must be readable");
+            assert_eq!(cursor.fields().len(), 2);
+            assert_eq!(cursor.fields()[0].0, "ts");
+            assert_eq!(cursor.fields()[0].1, Order::Desc);
+            assert_eq!(cursor.fields()[1].0, "id");
+            assert_eq!(cursor.fields()[1].1, Order::Asc);
+            assert!(!cursor.is_empty());
+        }
+        let _ = (ts_field, id_field);
+        Ok(())
+    }
+
+    /// **Wave 18-1 Phase C.** `backfill_sort_cursor_v2` rejects an
+    /// empty pairs slice and a >8 fields slice at the API boundary.
+    #[test]
+    fn test_backfill_v2_validation_errors() -> crate::Result<()> {
+        use crate::index::Order;
+        use crate::schema::FAST;
+
+        let mut schema_builder = Schema::builder();
+        let _ts = schema_builder.add_i64_field("ts", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let writer: IndexWriter = index.writer_for_tests()?;
+        let err_empty = writer
+            .backfill_sort_cursor_v2(&Vec::<(String, Order)>::new())
+            .unwrap_err();
+        assert!(
+            err_empty.to_string().contains("at least one field"),
+            "expected empty-pairs error, got: {err_empty}"
+        );
+
+        let too_many: Vec<(String, Order)> = (0..9)
+            .map(|i| (format!("f{i}"), Order::Asc))
+            .collect();
+        let err_cap = writer.backfill_sort_cursor_v2(&too_many).unwrap_err();
+        assert!(
+            err_cap.to_string().contains("at most"),
+            "expected cap error, got: {err_cap}"
+        );
         Ok(())
     }
 }

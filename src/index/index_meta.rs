@@ -308,6 +308,56 @@ pub struct IndexSettings {
     /// that do not opt in byte-identical to the upstream tantivy format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_by_field: Option<IndexSortByField>,
+
+    /// Optional multi-field index-time sort.
+    ///
+    /// **FerroSearch Wave 18-1.** When set, a `SortCursorIndexV2` auxiliary
+    /// file (multi-field, v2 wire format) is built per segment at commit
+    /// time. Mutually exclusive with [`Self::sort_by_field`] (single-field
+    /// v1) — at most one of the two may be set. Order matters: `[ts DESC,
+    /// _id ASC]` builds a cursor that lex-sorts by `ts` first, then by
+    /// `_id` to break ties (matching ES's `index.sort.field=[ts, _id]`,
+    /// `index.sort.order=[desc, asc]` semantics).
+    ///
+    /// Skipped at serialization when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by_fields: Option<Vec<IndexSortByField>>,
+}
+
+impl IndexSettings {
+    /// Returns `Err(InvalidArgument)` when both [`Self::sort_by_field`]
+    /// (single-field v1) and [`Self::sort_by_fields`] (multi-field v2)
+    /// are set, since they configure incompatible cursor formats. The
+    /// builder calls this from `IndexBuilder::settings()` so misuse is
+    /// caught at index-create time rather than at commit / search time.
+    ///
+    /// Wave 18-1: also enforces the `≤ 8` cap on multi-field sort.
+    pub fn validate_sort_settings(&self) -> crate::Result<()> {
+        if self.sort_by_field.is_some() && self.sort_by_fields.is_some() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "IndexSettings: sort_by_field and sort_by_fields are mutually exclusive; \
+                 set exactly one or neither"
+                    .to_string(),
+            ));
+        }
+        if let Some(fields) = &self.sort_by_fields {
+            if fields.is_empty() {
+                return Err(crate::TantivyError::InvalidArgument(
+                    "IndexSettings::sort_by_fields cannot be empty when set; use \
+                     `None` instead, or supply at least one field"
+                        .to_string(),
+                ));
+            }
+            if fields.len() > crate::index::SORT_CURSOR_MAX_FIELDS {
+                return Err(crate::TantivyError::InvalidArgument(format!(
+                    "IndexSettings::sort_by_fields supports at most {} fields, got {}",
+                    crate::index::SORT_CURSOR_MAX_FIELDS,
+                    fields.len()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Index-time sort configuration (FerroSearch Wave 15).
@@ -336,6 +386,7 @@ impl Default for IndexSettings {
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
             sort_by_field: None,
+            sort_by_fields: None,
         }
     }
 }
@@ -573,6 +624,7 @@ mod tests {
                 docstore_compress_dedicated_thread: true,
                 docstore_blocksize: 16_384,
                 sort_by_field: None,
+                sort_by_fields: None,
             }
         );
         {

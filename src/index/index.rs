@@ -235,6 +235,9 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
+        // Wave 18-1: enforce sort_by_field / sort_by_fields mutual exclusion
+        // and the multi-field cap at index-create time.
+        self.index_settings.validate_sort_settings()?;
         if let Some(_schema) = self.schema.as_ref() {
             Ok(())
         } else {

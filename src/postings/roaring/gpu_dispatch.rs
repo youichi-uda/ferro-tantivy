@@ -41,6 +41,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::postings::roaring::encoder::RoaringPostings;
 
 #[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+use std::sync::OnceLock;
+
+#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
 use crate::postings::roaring::container::{BitmapContainer, Container};
 #[cfg(all(feature = "gpu", feature = "ferro-compress"))]
 use crate::postings::roaring::planner::{should_dispatch_gpu, TermStat};
@@ -108,6 +111,40 @@ pub fn reset_dispatch_counters() {
 }
 
 // ============================================================
+// Process-lifetime GPU resource cache.
+// ============================================================
+//
+// `findings_4070_ti_super_20260510.md` § "Wave 8" #1 / first-run root
+// cause 1: every call to `try_gpu_bool` was constructing a fresh
+// `GpuContext` (wgpu adapter + device + queue) plus a
+// `BitmapOpKernel` (3 pipeline modules), then dropping both. wgpu
+// device init dominates ~100-500 ms on first call and stays in the
+// tens-of-ms range warm because criterion's iter loop did not
+// amortise across samples. Caching once per process eliminates the
+// per-call overhead so the dispatch path measures kernel launch +
+// PCIe traffic only.
+//
+// `BitmapOpKernel::new(&ctx)` (gpu/src/posting/bitmap_op.rs:216)
+// internally clones the `GpuContext`'s `Arc<dyn GpuDevice>` (line
+// 207), so the kernel keeps the device alive for its own lifetime —
+// we therefore only cache the kernel here. The `Result<_, ()>` arm
+// pins a permanent init failure so we don't retry wgpu adapter
+// discovery on every call when the host has no compatible backend
+// (e.g. headless CI).
+
+#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+static GPU_RESOURCES: OnceLock<Result<BitmapOpKernel, ()>> = OnceLock::new();
+
+#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+fn gpu_resources() -> Option<&'static BitmapOpKernel> {
+    let entry = GPU_RESOURCES.get_or_init(|| {
+        let ctx = GpuContext::init().map_err(|_| ())?;
+        BitmapOpKernel::new(&ctx).map_err(|_| ())
+    });
+    entry.as_ref().ok()
+}
+
+// ============================================================
 // Dispatch entry point.
 // ============================================================
 
@@ -150,19 +187,13 @@ pub fn try_gpu_bool(
         return None;
     }
 
-    // Below this point, we promised the caller a GPU dispatch. Any
-    // construction failure is reported as `None` (CPU fallback) so the
-    // call site stays correct under driver / runtime errors.
-    let ctx = match GpuContext::init() {
-        Ok(c) => c,
-        Err(_) => {
-            CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-    };
-    let kernel = match BitmapOpKernel::new(&ctx) {
-        Ok(k) => k,
-        Err(_) => {
+    // Below this point, we promised the caller a GPU dispatch. We pull
+    // the kernel from the process-lifetime cache; first-call init
+    // failure is sticky (see `gpu_resources` / GPU_RESOURCES) so we
+    // never retry adapter discovery on every query.
+    let kernel = match gpu_resources() {
+        Some(k) => k,
+        None => {
             CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
             return None;
         }
@@ -398,6 +429,59 @@ mod tests {
                 "if GPU path didn't return Some, dispatch counter must stay 0"
             );
         }
+    }
+
+    /// Sanity-check that the process-lifetime `GPU_RESOURCES` cache is
+    /// populated by `try_gpu_bool` and that a second call reuses the
+    /// already-initialised entry rather than re-running
+    /// `GpuContext::init` / `BitmapOpKernel::new`. We can't observe the
+    /// init time directly without timing infrastructure, so we use the
+    /// `OnceLock::get` post-condition (Some after first init) as the
+    /// witness.
+    ///
+    /// The fixture is two synthetic 12-term cohorts that pass the new
+    /// planner threshold (per-term cardinality + cohort doc-count gates,
+    /// see `planner.rs`). Each call goes through the full dispatch
+    /// path; only the second call is allowed to read from the cache.
+    #[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+    #[test]
+    fn gpu_resources_caches_init() {
+        let _g = COUNTER_LOCK.lock().unwrap();
+        reset_dispatch_counters();
+        // 12 × 100_000 doc-ids = 1.2M cohort total — clears
+        // `MIN_PER_TERM_CARDINALITY` and `MIN_COHORT_DOCS` together.
+        // Build the cohort twice (independent allocations) so each call
+        // gets fresh inputs.
+        let make_cohort = || -> Vec<RoaringPostings> {
+            (0..12)
+                .map(|i| {
+                    let start = i as u32 * 10;
+                    let ids: Vec<u32> = (start..start + 100_000).collect();
+                    RoaringEncoder::from_doc_ids(&ids)
+                })
+                .collect()
+        };
+        let cohort_a = make_cohort();
+        let refs_a: Vec<&RoaringPostings> = cohort_a.iter().collect();
+        let res_a = try_gpu_bool(BoolOp::And, &refs_a, 1_000_000);
+        if res_a.is_none() {
+            // Sandbox without a working wgpu backend: GPU_RESOURCES is
+            // populated with `Err(())`, but the dispatch counter does
+            // not bump and the cache test below is vacuous. Don't
+            // assert further on a feature-off / driver-missing host.
+            return;
+        }
+        // Cache must now be populated; second call must reuse it.
+        assert!(GPU_RESOURCES.get().is_some(), "first call must populate cache");
+        let cohort_b = make_cohort();
+        let refs_b: Vec<&RoaringPostings> = cohort_b.iter().collect();
+        let res_b = try_gpu_bool(BoolOp::And, &refs_b, 1_000_000);
+        assert!(res_b.is_some(), "second call must succeed via cache");
+        assert_eq!(
+            gpu_dispatch_count(),
+            2,
+            "two heavy-cohort dispatches should both bump the counter"
+        );
     }
 
     #[cfg(all(feature = "gpu", feature = "ferro-compress"))]

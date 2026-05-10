@@ -213,6 +213,19 @@ impl BlockSegmentPostings {
     ///
     /// This `doc_freq` is simply the sum of the length of all of the blocks
     /// length, and it does not take in account deleted documents.
+    /// Phase 2 D-1 — stable (address, length) pair identifying the
+    /// underlying compressed posting-list bytes for CHT cache keying.
+    /// Stable for the lifetime of the owning `SegmentReader` (the
+    /// `OwnedBytes` is a `Arc<FileSlice>` view, so the pointer
+    /// doesn't move while the reader is alive). Across re-opens the
+    /// pointer changes — the cache treats that as a new entry,
+    /// which LRU-evicts the stale one naturally.
+    #[must_use]
+    pub fn data_slice_id(&self) -> (usize, usize) {
+        let s = self.data.as_slice();
+        (s.as_ptr() as usize, s.len())
+    }
+
     pub fn doc_freq(&self) -> u32 {
         self.doc_freq
     }

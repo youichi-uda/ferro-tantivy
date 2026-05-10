@@ -67,7 +67,8 @@ use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 
 /// Per-field encoded sort value used by the multi-field early-term
 /// cursor collector.  The variant tag is the field's
-/// [`ValueKind`](crate::index::ValueKind) recorded in the v2 cursor.
+/// [`ValueKind`](crate::index::ValueKind) recorded in the v2 cursor
+/// (or `Score`, see Wave 18-4 below).
 ///
 /// **Wave 18-3 design note.**  `Numeric(Option<u64>)` carries the
 /// `FastValue::to_u64`-encoded slot for `I64` / `U64` / `F64` /
@@ -79,10 +80,22 @@ use crate::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader};
 /// local term ordinals are NOT comparable across segments — only the
 /// underlying byte values are.
 ///
-/// `None` in either variant means the underlying doc has a missing
-/// value at this field.  The `missing="_last"` rule from
+/// **Wave 18-4 design note.**  `Score(f32)` is a synthetic variant
+/// that carries the per-doc BM25 (or whatever-the-Weight-computes)
+/// score captured during the segment scan.  It is NEVER stored in
+/// the on-disk cursor — the cursor walks only the fast-field prefix
+/// — and is appended to each fruit hit only when the collector was
+/// built with [`EarlyTermSortByCursorCollectorMulti::with_scoring`].
+/// Score comparison treats higher scores as "earlier" in the lex
+/// order (same convention as ES / Lucene `_score DESC`).  NaN
+/// scores fall back to `Ordering::Equal` rather than panicking.
+///
+/// `None` (in `Numeric` / `String`) means the underlying doc has a
+/// missing value at this field.  The `missing="_last"` rule from
 /// Elasticsearch / Lucene is honoured by the `cmp_sort_val` helper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Score` is never "missing" — every matched doc has a score (0.0
+/// when scoring was disabled).
+#[derive(Debug, Clone, PartialEq)]
 pub enum CursorSortVal {
     /// Encoded `u64` for numeric/date `FastValue` fields, or `None`
     /// when the doc has a missing value here (sorts last).
@@ -90,14 +103,26 @@ pub enum CursorSortVal {
     /// Decoded UTF-8 bytes for keyword/string fields, or `None` when
     /// the doc has a missing term ord here (sorts last).
     String(Option<Vec<u8>>),
+    /// **Wave 18-4.** Per-doc score captured during the scoring
+    /// scan.  Only present when the collector was built with
+    /// [`EarlyTermSortByCursorCollectorMulti::with_scoring`] and
+    /// the request sort had `_score` as a tie-break.  Order: higher
+    /// score sorts earlier (matches `_score DESC` semantics — for a
+    /// sort entry that explicitly requests `_score ASC`, callers
+    /// pass `Order::Asc` and `cmp_sort_val` flips the comparison).
+    Score(f32),
 }
 
 impl CursorSortVal {
     /// Returns `true` if the value is missing (`Numeric(None)` or
     /// `String(None)`).  Missing values sort last in both ASC and
-    /// DESC orders, matching ES / Lucene `missing="_last"`.
+    /// DESC orders, matching ES / Lucene `missing="_last"`.  Score
+    /// values are never "missing" (every matched doc has a score).
     pub fn is_missing(&self) -> bool {
-        matches!(self, CursorSortVal::Numeric(None) | CursorSortVal::String(None))
+        matches!(
+            self,
+            CursorSortVal::Numeric(None) | CursorSortVal::String(None)
+        )
     }
 }
 
@@ -130,6 +155,16 @@ fn cmp_sort_val(a: &CursorSortVal, b: &CursorSortVal, order: Order) -> Ordering 
         (String(Some(ab)), String(Some(bb))) => match order {
             Order::Asc => ab.as_slice().cmp(bb.as_slice()),
             Order::Desc => bb.as_slice().cmp(ab.as_slice()),
+        },
+        // Wave 18-4: score comparison.  `partial_cmp` rather than
+        // total_cmp so NaN doesn't panic; NaN-vs-anything degrades
+        // to `Equal` (consistent with ES Lucene's behaviour where a
+        // NaN score is rare but not fatal).  ES `_score DESC`
+        // semantics: higher score sorts earlier — that's
+        // `b.partial_cmp(a)` for Desc, the default convention here.
+        (Score(av), Score(bv)) => match order {
+            Order::Asc => av.partial_cmp(bv).unwrap_or(Ordering::Equal),
+            Order::Desc => bv.partial_cmp(av).unwrap_or(Ordering::Equal),
         },
         // Kind mismatch: shouldn't happen if the cursor's recorded
         // value_kind matches what we materialise at harvest time.
@@ -173,6 +208,15 @@ pub struct EarlyTermSortByCursorCollectorMulti {
     /// are kind-aware ([`CursorSortVal::Numeric`] vs
     /// [`CursorSortVal::String`]).
     start_after: Option<Vec<CursorSortVal>>,
+    /// **Wave 18-4.** When set, the collector flips
+    /// [`Collector::requires_scoring`] to `true`, captures per-doc
+    /// scores during the segment scan, and appends a trailing
+    /// [`CursorSortVal::Score`] slot to each fruit hit at harvest
+    /// time.  Use this when the request's sort has `_score` as the
+    /// **last** entry (typical: `[<fast_field> <order>, _score
+    /// DESC]`).  The trailing-`_score` order is supplied via
+    /// [`Self::with_scoring`].
+    scoring: Option<Order>,
 }
 
 impl EarlyTermSortByCursorCollectorMulti {
@@ -190,7 +234,49 @@ impl EarlyTermSortByCursorCollectorMulti {
                 .collect(),
             limit,
             start_after: None,
+            scoring: None,
         }
+    }
+
+    /// **Wave 18-4.** Enables BM25 / `Weight`-computed score capture
+    /// during the segment scan and appends a trailing
+    /// [`CursorSortVal::Score`] slot to every fruit hit.  Use when
+    /// the request sort has `_score` as a **trailing tie-break**
+    /// (e.g. `[ts DESC, _score DESC]`); the cursor walk still drives
+    /// the early-term order on the fast-field prefix, and score is
+    /// folded into the cross-segment merge as the lex-tail
+    /// comparator.
+    ///
+    /// `score_order` is the per-request sort direction for `_score`
+    /// — typically [`Order::Desc`].  Score comparison is NaN-safe
+    /// (`partial_cmp` with `Equal` fallback).
+    ///
+    /// **Caveats.**
+    /// * The cursor walk does NOT include score in its own
+    ///   early-term comparator — it walks docs in the cursor's
+    ///   recorded prefix order.  Within a primary-value tie group,
+    ///   docs are emitted in cursor-insertion order; score-aware
+    ///   ordering takes effect only at the cross-segment merge.
+    ///   Callers that need exact score-tie ordering for very large
+    ///   tie groups should over-fetch via `limit` and accept the
+    ///   well-known ES Lucene `IndexSortByField` + secondary score
+    ///   approximation.
+    /// * Setting this flag makes the segment scan compute scores
+    ///   for every matched doc (not just the K survivors).  When
+    ///   the BM25 cost dominates the query, this is the same total
+    ///   work as the legacy heap-based collector — the cursor's
+    ///   early-term win is in the heap-insert path, not in the
+    ///   scoring pass itself.
+    pub fn with_scoring(mut self, score_order: Order) -> Self {
+        self.scoring = Some(score_order);
+        self
+    }
+
+    /// Returns the `_score` sort direction if scoring is enabled
+    /// (Wave 18-4), or `None` when this collector won't compute
+    /// scores.
+    pub fn score_order(&self) -> Option<Order> {
+        self.scoring
     }
 
     /// Wave 18-1 / 18-3: enable `search_after` on the cursor walk.
@@ -300,6 +386,8 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
                 segment_ord: segment_local_id,
                 matched_bitset: BitSet::with_max_value(0),
                 start_after: None,
+                scoring: None,
+                scores: Vec::new(),
             });
         };
 
@@ -324,6 +412,17 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
             }
         }
 
+        // Wave 18-4: pre-allocate per-doc score slot Vec<f32> when
+        // scoring is enabled.  Sized at max_doc so `collect(doc,
+        // score)` is a flat indexed write.  When scoring is off we
+        // leave the Vec empty so the collector pays no per-doc
+        // memory.
+        let scores: Vec<f32> = if self.scoring.is_some() {
+            vec![0.0_f32; segment_reader.max_doc() as usize]
+        } else {
+            Vec::new()
+        };
+
         Ok(EarlyTermSortByCursorMultiSegmentCollector {
             cursor: Some(cursor),
             fields: self.fields.clone(),
@@ -333,11 +432,16 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
             segment_ord: segment_local_id,
             matched_bitset: BitSet::with_max_value(segment_reader.max_doc()),
             start_after: self.start_after.clone(),
+            scoring: self.scoring,
+            scores,
         })
     }
 
     fn requires_scoring(&self) -> bool {
-        false
+        // Wave 18-4: only compute scores when explicitly opted in
+        // via `with_scoring`.  Defaults to `false` so the existing
+        // Wave 18-1 / 18-3 paths stay zero-cost.
+        self.scoring.is_some()
     }
 
     fn merge_fruits(
@@ -349,7 +453,13 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
         }
         let mut all: Vec<(Vec<CursorSortVal>, DocAddress)> =
             segment_fruits.into_iter().flatten().collect();
-        let orders: Vec<Order> = self.fields.iter().map(|(_, o)| *o).collect();
+        // Wave 18-4: extend the orders slice with the trailing
+        // `_score` order when scoring is enabled, so `compare_hits_multi`
+        // honours it as the lex-tail tie-break across segments.
+        let mut orders: Vec<Order> = self.fields.iter().map(|(_, o)| *o).collect();
+        if let Some(score_order) = self.scoring {
+            orders.push(score_order);
+        }
         all.sort_by(|a, b| compare_hits_multi(a, b, &orders));
         all.truncate(self.limit);
         Ok(all)
@@ -377,6 +487,15 @@ pub struct EarlyTermSortByCursorMultiSegmentCollector {
     segment_ord: u32,
     matched_bitset: BitSet,
     start_after: Option<Vec<CursorSortVal>>,
+    /// Wave 18-4: trailing `_score` sort direction, or `None` when
+    /// scoring is disabled.  Drives `requires_scoring()` upstream
+    /// and the `Score(_)` slot append at harvest.
+    scoring: Option<Order>,
+    /// Wave 18-4: per-doc score buffer indexed by `DocId`.  Empty
+    /// when scoring is disabled; otherwise sized at `max_doc` and
+    /// written by `collect(doc, score)`.  We deliberately avoid
+    /// `HashMap` so the hot path stays a single indexed store.
+    scores: Vec<f32>,
 }
 
 impl EarlyTermSortByCursorMultiSegmentCollector {
@@ -405,6 +524,39 @@ impl EarlyTermSortByCursorMultiSegmentCollector {
             segment_ord,
             matched_bitset,
             start_after,
+            scoring: None,
+            scores: Vec::new(),
+        }
+    }
+
+    /// **Wave 18-4** crate-public constructor used by the mix
+    /// dispatcher when scoring is opted in on the parent collector.
+    /// Mirrors `new_for_test_or_mix` but accepts pre-allocated
+    /// `scores` and the `scoring` direction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_test_or_mix_with_scoring(
+        cursor: Option<Arc<SortCursorIndexV2>>,
+        fields: Vec<(String, Order)>,
+        value_kinds: Vec<ValueKind>,
+        str_columns: Vec<Option<columnar::StrColumn>>,
+        limit: usize,
+        segment_ord: u32,
+        matched_bitset: BitSet,
+        start_after: Option<Vec<CursorSortVal>>,
+        scoring: Option<Order>,
+        scores: Vec<f32>,
+    ) -> Self {
+        Self {
+            cursor,
+            fields,
+            value_kinds,
+            str_columns,
+            limit,
+            segment_ord,
+            matched_bitset,
+            start_after,
+            scoring,
+            scores,
         }
     }
 }
@@ -413,9 +565,20 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
     type Fruit = Vec<(Vec<CursorSortVal>, DocAddress)>;
 
     #[inline]
-    fn collect(&mut self, doc: DocId, _score: Score) {
+    fn collect(&mut self, doc: DocId, score: Score) {
         if self.cursor.is_some() {
             self.matched_bitset.insert(doc);
+            // Wave 18-4: record the per-doc score when scoring was
+            // requested.  `requires_scoring()` triggers the runtime
+            // to dispatch through `Weight::for_each` (with score)
+            // rather than `for_each_no_score`, so this branch only
+            // sees real scores when `self.scoring.is_some()`.
+            if self.scoring.is_some() {
+                let idx = doc as usize;
+                if idx < self.scores.len() {
+                    self.scores[idx] = score;
+                }
+            }
         }
     }
 
@@ -423,6 +586,14 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
     fn collect_block(&mut self, docs: &[DocId]) {
         if self.cursor.is_some() {
             self.matched_bitset.insert_docs_batch(docs);
+            // Wave 18-4: `collect_block` is invoked only on the
+            // no-score path (see `default_collect_segment_impl`);
+            // when scoring is enabled, the runtime fans out through
+            // `collect(doc, score)` instead and this branch never
+            // runs.  Defensive: if a future caller routes a block
+            // here while scoring is on, leave per-doc scores at
+            // their zero default so the merge still produces
+            // deterministic output.
         }
     }
 
@@ -433,8 +604,19 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
         if self.limit == 0 {
             return Vec::new();
         }
-        let orders: Vec<Order> = self.fields.iter().map(|(_, o)| *o).collect();
+        // Wave 18-4: extend the orders slice with the trailing
+        // `_score` order so `is_strictly_after_lex` (search_after
+        // skip predicate) can compare the score slot when the caller
+        // supplied a search_after entry that constrains it.
+        let mut orders: Vec<Order> = self.fields.iter().map(|(_, o)| *o).collect();
+        if let Some(score_order) = self.scoring {
+            orders.push(score_order);
+        }
         let prefix_len = self.fields.len();
+        // Wave 18-4: when scoring is enabled, every fruit row carries
+        // an extra trailing slot — `tuple_capacity` reserves space
+        // for it up-front so harvest doesn't reallocate.
+        let tuple_capacity = prefix_len + usize::from(self.scoring.is_some());
         let mut hits: Vec<(Vec<CursorSortVal>, DocAddress)> = Vec::with_capacity(self.limit);
         // Reusable scratch for decoding string term ords to bytes —
         // mirrors `convert_segment_sort_key`'s buffer reuse on
@@ -447,7 +629,7 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
             }
             // Materialise the prefix the request cares about, decoding
             // string term ords to bytes via the captured `StrColumn`.
-            let mut tuple: Vec<CursorSortVal> = Vec::with_capacity(prefix_len);
+            let mut tuple: Vec<CursorSortVal> = Vec::with_capacity(tuple_capacity);
             for fi in 0..prefix_len {
                 let raw = cursor.value(cursor_idx, fi);
                 let val = match self.value_kinds[fi] {
@@ -472,6 +654,15 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
                     _ => CursorSortVal::Numeric(raw),
                 };
                 tuple.push(val);
+            }
+            // Wave 18-4: append the trailing score slot when scoring
+            // was opted in.  `start_after` length follows the same
+            // convention — when the caller populated a 5-element
+            // start_after for a 4-field cursor + score, the 5th
+            // entry constrains the score axis.
+            if self.scoring.is_some() {
+                let s = self.scores.get(doc as usize).copied().unwrap_or(0.0);
+                tuple.push(CursorSortVal::Score(s));
             }
             if let Some(start) = &self.start_after {
                 if !is_strictly_after_lex(&tuple, start, &orders) {
@@ -633,6 +824,8 @@ mod tests {
             segment_ord: 0,
             matched_bitset: bitset,
             start_after,
+            scoring: None,
+            scores: Vec::new(),
         };
         segment.harvest()
     }
@@ -1206,6 +1399,212 @@ mod tests {
             is_strictly_after_lex(&tuple_ar, &start, &orders_asc),
             false,
             "AR is before JP in ASC walk"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Wave 18-4 — `_score` as trailing tie-break.
+    // -------------------------------------------------------------
+
+    /// `cmp_sort_val` on `Score(_)` slots respects per-entry `Order`
+    /// and degrades NaN-safe to `Equal`.
+    #[test]
+    fn cmp_sort_val_score_orders_correctly() {
+        let high = CursorSortVal::Score(2.5);
+        let mid = CursorSortVal::Score(1.0);
+        let low = CursorSortVal::Score(0.1);
+        // DESC: higher score is "earlier" in sort.
+        assert_eq!(cmp_sort_val(&high, &mid, Order::Desc), Ordering::Less);
+        assert_eq!(cmp_sort_val(&mid, &low, Order::Desc), Ordering::Less);
+        assert_eq!(cmp_sort_val(&low, &high, Order::Desc), Ordering::Greater);
+        // ASC: lower score is "earlier".
+        assert_eq!(cmp_sort_val(&low, &high, Order::Asc), Ordering::Less);
+        // Equal scores → Ordering::Equal (regardless of direction).
+        assert_eq!(
+            cmp_sort_val(&CursorSortVal::Score(1.0), &CursorSortVal::Score(1.0), Order::Desc),
+            Ordering::Equal
+        );
+        // NaN safety: NaN-vs-anything (or NaN-vs-NaN) → Equal,
+        // never panic.  This matches `partial_cmp` semantics.
+        let nan = CursorSortVal::Score(f32::NAN);
+        assert_eq!(cmp_sort_val(&nan, &mid, Order::Desc), Ordering::Equal);
+        assert_eq!(cmp_sort_val(&mid, &nan, Order::Desc), Ordering::Equal);
+        assert_eq!(cmp_sort_val(&nan, &nan, Order::Desc), Ordering::Equal);
+    }
+
+    /// `with_scoring` flips `requires_scoring()` to `true`, so the
+    /// runtime dispatches through `Weight::for_each` (with score)
+    /// and the collector captures per-doc scores.
+    #[test]
+    fn with_scoring_toggles_requires_scoring() {
+        let plain = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("ts", Order::Desc)],
+            10,
+        );
+        assert!(!plain.requires_scoring());
+        assert!(plain.score_order().is_none());
+
+        let scored = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("ts", Order::Desc)],
+            10,
+        )
+        .with_scoring(Order::Desc);
+        assert!(scored.requires_scoring());
+        assert_eq!(scored.score_order(), Some(Order::Desc));
+    }
+
+    /// End-to-end: a real query against a real segment, with scoring
+    /// enabled.  The fruit must carry a trailing `Score(_)` slot per
+    /// hit, populated with the BM25 score the runtime computed.
+    #[test]
+    fn cursor_walk_with_scoring_appends_score_slot() {
+        use crate::index::IndexSortByField;
+        use crate::query::QueryParser;
+        use crate::schema::{FAST, INDEXED, STORED, Schema, TEXT};
+        use crate::{Index, IndexBuilder, IndexSettings};
+
+        let mut sb = Schema::builder();
+        let body = sb.add_text_field("body", TEXT);
+        let ts = sb.add_i64_field("ts", FAST | INDEXED | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "ts".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema.clone())
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().unwrap();
+        // 4 docs: doc 0 mentions "rust" once, doc 1 thrice (higher BM25),
+        // doc 2 once but at later ts, doc 3 zero hits (filtered out).
+        writer
+            .add_document(doc!(body => "rust", ts => 100i64))
+            .unwrap();
+        writer
+            .add_document(doc!(body => "rust rust rust", ts => 50i64))
+            .unwrap();
+        writer
+            .add_document(doc!(body => "rust", ts => 200i64))
+            .unwrap();
+        writer.add_document(doc!(body => "java", ts => 150i64)).unwrap();
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let qp = QueryParser::for_index(&index, vec![body]);
+        let q = qp.parse_query("rust").expect("parse rust");
+
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("ts", Order::Desc)],
+            10,
+        )
+        .with_scoring(Order::Desc);
+        assert!(collector.requires_scoring());
+        let hits = searcher.search(&*q, &collector).expect("search scored");
+        // Three docs match "rust" (0, 1, 2). Cursor walks ts DESC
+        // with score appended → expected doc-id order [2, 0, 1]
+        // (ts 200, 100, 50). Score is non-zero for every hit
+        // (BM25 with positive idf), and doc 1 (3× term) > doc 0
+        // (1× term).
+        let docs: Vec<u32> = hits.iter().map(|(_, a)| a.doc_id).collect();
+        assert_eq!(docs, vec![2u32, 0, 1]);
+        for (i, (tuple, _)) in hits.iter().enumerate() {
+            // Tuple shape: [Numeric(ts_u64), Score(f32)].
+            assert_eq!(tuple.len(), 2, "hit {i} tuple must carry score slot");
+            assert!(matches!(tuple[0], CursorSortVal::Numeric(Some(_))));
+            match &tuple[1] {
+                CursorSortVal::Score(s) => assert!(
+                    *s > 0.0,
+                    "hit {i} score must be > 0 for a matching BM25 doc, got {s}"
+                ),
+                other => panic!("hit {i} expected Score slot, got {other:?}"),
+            }
+        }
+        // Sanity: doc 1 (term frequency 3) has higher score than doc
+        // 0 / doc 2 (frequency 1).  Pull the scores by doc-id to
+        // verify.
+        let score_by_doc: std::collections::HashMap<u32, f32> = hits
+            .iter()
+            .map(|(t, a)| {
+                let s = match &t[1] {
+                    CursorSortVal::Score(s) => *s,
+                    _ => unreachable!(),
+                };
+                (a.doc_id, s)
+            })
+            .collect();
+        assert!(
+            score_by_doc[&1] > score_by_doc[&0],
+            "doc 1 (3× term) BM25 must exceed doc 0 (1× term): {:?}",
+            score_by_doc
+        );
+    }
+
+    /// `merge_fruits` extends the orders array with the trailing
+    /// score order and uses it as the lex-tail tie-break across
+    /// segments.  Pinned via two synthetic fruit lists for a
+    /// `[ts DESC, _score DESC]` request.
+    #[test]
+    fn merge_fruits_uses_score_as_lex_tail_when_scoring_enabled() {
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("ts", Order::Desc)],
+            10,
+        )
+        .with_scoring(Order::Desc);
+        // Both fruit lists have docs that share ts=100 — the
+        // tie-break should be by score DESC (higher first).
+        let seg0_fruit: Vec<(Vec<CursorSortVal>, DocAddress)> = vec![
+            (
+                vec![num(Some(100i64.to_u64())), CursorSortVal::Score(0.5)],
+                DocAddress {
+                    segment_ord: 0,
+                    doc_id: 1,
+                },
+            ),
+            (
+                vec![num(Some(200i64.to_u64())), CursorSortVal::Score(0.3)],
+                DocAddress {
+                    segment_ord: 0,
+                    doc_id: 2,
+                },
+            ),
+        ];
+        let seg1_fruit: Vec<(Vec<CursorSortVal>, DocAddress)> = vec![
+            (
+                vec![num(Some(100i64.to_u64())), CursorSortVal::Score(2.0)],
+                DocAddress {
+                    segment_ord: 1,
+                    doc_id: 0,
+                },
+            ),
+            (
+                vec![num(Some(50i64.to_u64())), CursorSortVal::Score(1.5)],
+                DocAddress {
+                    segment_ord: 1,
+                    doc_id: 4,
+                },
+            ),
+        ];
+        let merged = collector
+            .merge_fruits(vec![seg0_fruit, seg1_fruit])
+            .expect("merge");
+        // Lex DESC ts, DESC score:
+        //   ts=200 score=0.3 (seg 0, doc 2)
+        //   ts=100 score=2.0 (seg 1, doc 0)   ← higher score within ts=100 tie group
+        //   ts=100 score=0.5 (seg 0, doc 1)
+        //   ts=50  score=1.5 (seg 1, doc 4)
+        let pairs: Vec<(u32, u32)> = merged
+            .iter()
+            .map(|(_, a)| (a.segment_ord, a.doc_id))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![(0, 2), (1, 0), (0, 1), (1, 4)],
+            "ts=100 tie group must be ordered by score DESC, with seg 1 doc 0 (score 2.0) before seg 0 doc 1 (score 0.5)"
         );
     }
 }

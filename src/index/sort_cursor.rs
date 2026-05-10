@@ -17,7 +17,7 @@ use std::io::{self, Write};
 use columnar::Column;
 use common::{BinarySerializable, DateTime};
 
-use crate::directory::FileSlice;
+use crate::directory::{Directory, FileSlice};
 use crate::error::DataCorruption;
 use crate::index::Order;
 use crate::DocId;
@@ -365,6 +365,23 @@ pub fn build_and_write_sort_cursors(
     let mut writer = segment.open_sort_cursor_write(&sort_by.field)?;
     cursor.write(&mut writer)?;
     writer.terminate()?;
+    // **FerroSearch Wave 15 Phase H-5.** Sync the directory so the cursor
+    // file's directory entry is durably visible before the caller
+    // publishes `SegmentMeta::sort_cursor_fields = [<field>]`.  Phase H-4
+    // EC2 stress-bench (Rally http_logs `bulk_indexing_clients=8` over
+    // 8 indices × 5 shards) hit 2,968 `FileDoesNotExist` errors in 5
+    // minutes because the auto-refresh that follows each bulk commit
+    // tried to load segments whose meta advertised the cursor before
+    // the cursor file's `dirent` was visible to a fresh `MmapDirectory`
+    // open.  Without the sync, `terminate()`'s buffered writes can sit
+    // in the page cache while the SegmentMeta is published — readers
+    // then fail with `OpenReadError(FileDoesNotExist)`.
+    //
+    // The sync cost is bounded (one fsync of the segment dir per
+    // segment commit when an index sort is configured), and aligns
+    // with how `save_metas` already syncs the dir before the atomic
+    // meta.json swap.
+    segment.index().directory().sync_directory()?;
     Ok(vec![sort_by.field])
 }
 

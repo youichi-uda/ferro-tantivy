@@ -1128,6 +1128,112 @@ mod tests {
         Ok(())
     }
 
+    /// FerroSearch Wave 15 Phase H-1 regression test: when an index
+    /// configures `IndexSettings::sort_by_field`, both the in-place
+    /// `merge` path and the `merge_filtered_segments` path must rebuild
+    /// the auxiliary `SortCursorIndex` for the merged output segment.
+    /// Without the rebuild, the Phase E dispatch gate falls back to the
+    /// legacy `SortByStaticFastValue` path on every post-force-merge
+    /// query and the http_logs `*-after-force-merge-1-seg` benchmarks
+    /// silently regress to ES-faster.
+    #[test]
+    fn test_merge_filtered_segments_rebuilds_sort_cursor() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField, Order};
+
+        let value_field;
+        let first_index = {
+            let mut schema_builder = Schema::builder();
+            value_field = schema_builder.add_i64_field("value", FAST);
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .settings(IndexSettings {
+                    sort_by_field: Some(IndexSortByField {
+                        field: "value".to_string(),
+                        order: Order::Desc,
+                    }),
+                    ..Default::default()
+                })
+                .create_in_ram()?;
+            let mut writer = index.writer_for_tests()?;
+            writer.add_document(doc!(value_field=>40i64))?;
+            writer.add_document(doc!(value_field=>10i64))?;
+            writer.commit()?;
+            index
+        };
+
+        let second_index = {
+            let mut schema_builder = Schema::builder();
+            schema_builder.add_i64_field("value", FAST);
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .settings(IndexSettings {
+                    sort_by_field: Some(IndexSortByField {
+                        field: "value".to_string(),
+                        order: Order::Desc,
+                    }),
+                    ..Default::default()
+                })
+                .create_in_ram()?;
+            let mut writer = index.writer_for_tests()?;
+            let v = index.schema().get_field("value")?;
+            writer.add_document(doc!(v=>30i64))?;
+            writer.add_document(doc!(v=>20i64))?;
+            writer.commit()?;
+            index
+        };
+
+        let mut segments: Vec<Segment> = Vec::new();
+        segments.extend(first_index.searchable_segments()?);
+        segments.extend(second_index.searchable_segments()?);
+
+        let target_settings = first_index.settings().clone();
+        let non_filter = segments.iter().map(|_| None).collect::<Vec<_>>();
+
+        let merged_index = merge_filtered_segments(
+            &segments,
+            target_settings,
+            non_filter,
+            RamDirectory::default(),
+        )?;
+
+        // Single merged segment must advertise the sort cursor for the
+        // configured sort field, walk all 4 docs in Desc order.
+        let merged_segments = merged_index.searchable_segments()?;
+        assert_eq!(merged_segments.len(), 1);
+        let merged_meta = merged_segments[0].meta();
+        let advertised: Vec<&str> = merged_meta.sort_cursor_fields().iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            advertised,
+            vec!["value"],
+            "merged segment must advertise the rebuilt sort cursor"
+        );
+
+        let reader = merged_index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let seg = searcher.segment_reader(0);
+        let cursor = seg
+            .sort_cursor("value")
+            .expect("rebuilt sort cursor must be readable");
+        assert_eq!(cursor.order(), Order::Desc);
+        assert_eq!(cursor.len(), 4);
+
+        // Verify the cursor walks docs in Desc value order. The values
+        // are {40, 10, 30, 20} from the two input segments; merged DocId
+        // assignment is not stable across runs, so we assert via the
+        // value column rather than DocId equality.
+        let column = seg
+            .fast_fields()
+            .i64("value")?;
+        let mut values: Vec<i64> = Vec::new();
+        for doc in cursor.iter() {
+            values.push(column.first(doc).expect("value present"));
+        }
+        assert_eq!(values, vec![40, 30, 20, 10], "cursor walks Desc by value");
+
+        Ok(())
+    }
+
     #[test]
     fn test_merge_single_filtered_segments() -> crate::Result<()> {
         let first_index = {

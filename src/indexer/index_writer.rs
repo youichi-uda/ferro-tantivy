@@ -2843,4 +2843,81 @@ mod tests {
         let count_eph = reader.searcher().search(&q_eph, &Count).unwrap();
         assert_eq!(count_eph, 0, "ephemeral (soft-only) doc must not survive reopen");
     }
+
+    /// FerroSearch Wave 15 Phase H-1 in-place regression test.
+    /// Companion to `segment_updater::tests::test_merge_filtered_segments_rebuilds_sort_cursor`
+    /// — exercises the `IndexWriter::merge` path that LogMergePolicy and
+    /// `force_merge`-style flows reach. Without the rebuild hook, calling
+    /// `merge` on an index with `IndexSettings::sort_by_field` would leave
+    /// the merged segment without a `SortCursorIndex`, silently regressing
+    /// every Phase E early-term query that follows.
+    #[test]
+    fn test_in_place_merge_rebuilds_sort_cursor() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField, Order};
+        use crate::schema::FAST;
+
+        let mut schema_builder = Schema::builder();
+        let value_field = schema_builder.add_i64_field("value", FAST);
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .settings(IndexSettings {
+                sort_by_field: Some(IndexSortByField {
+                    field: "value".to_string(),
+                    order: Order::Desc,
+                }),
+                ..Default::default()
+            })
+            .create_in_ram()?;
+
+        // 3 segments, each with 2 docs at distinct value tiers so the
+        // merged-cursor walk has a deterministic Desc ordering across
+        // input segments.
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.add_document(doc!(value_field=>10i64))?;
+        writer.add_document(doc!(value_field=>15i64))?;
+        writer.commit()?;
+        writer.add_document(doc!(value_field=>40i64))?;
+        writer.add_document(doc!(value_field=>30i64))?;
+        writer.commit()?;
+        writer.add_document(doc!(value_field=>20i64))?;
+        writer.add_document(doc!(value_field=>5i64))?;
+        writer.commit()?;
+
+        let segment_ids = index.searchable_segment_ids()?;
+        assert_eq!(segment_ids.len(), 3);
+        let merged = writer.merge(&segment_ids).wait()?.expect("merge produced a segment");
+        writer.wait_merging_threads()?;
+
+        // Merged meta must advertise the rebuilt cursor.
+        let advertised: Vec<&str> = merged.sort_cursor_fields().iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            advertised,
+            vec!["value"],
+            "in-place merge must rebuild the sort cursor"
+        );
+
+        // End-to-end: open a reader on the post-merge index and verify
+        // the merged segment's cursor walks all 6 docs in Desc order.
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let seg = searcher.segment_reader(0);
+        let cursor = seg
+            .sort_cursor("value")
+            .expect("rebuilt sort cursor must be readable");
+        assert_eq!(cursor.order(), Order::Desc);
+        assert_eq!(cursor.len(), 6);
+        let column = seg.fast_fields().i64("value")?;
+        let mut values: Vec<i64> = Vec::new();
+        for doc in cursor.iter() {
+            values.push(column.first(doc).expect("value present"));
+        }
+        assert_eq!(
+            values,
+            vec![40, 30, 20, 15, 10, 5],
+            "rebuilt cursor must walk Desc by value across all merged docs"
+        );
+
+        Ok(())
+    }
 }

@@ -82,10 +82,6 @@ use crate::query::Scorer;
 /// - `Err(must_scorers)` — same as `Ok(None)` semantically; we use the
 ///   `Result<Option<…>, Vec<…>>` shape to make the move-vs-keep
 ///   contract explicit at the call site.
-/// `allow(dead_code)`: lands in this commit (Wave 7/Plan2/3) and is
-/// hooked from `boolean_weight::complex_scorer` in the next commit
-/// (Wave 7/Plan2/4). The lint clears at that point.
-#[allow(dead_code)]
 pub(crate) fn try_gpu_intersect(
     must_scorers: Vec<Box<dyn Scorer>>,
     reader: &SegmentReader,

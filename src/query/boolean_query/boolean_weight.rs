@@ -252,6 +252,39 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             return Ok(SpecializedScorer::Other(Box::new(EmptyScorer)));
         }
 
+        // ----- Phase 2 C-5 (Wave 7) AND-only GPU fast path -----
+        //
+        // Hook condition: a pure Bool-AND cohort, scoring disabled, no
+        // AllScorer / EmptyScorer side-effects, no SHOULD or MustNot
+        // clauses. This is the narrowest cohort shape we can route to
+        // try_gpu_intersect without risking semantic drift from the
+        // legacy CPU path. Wider shapes (Required-SHOULD + AND,
+        // mixed-type cohorts, scoring-enabled) stay on the CPU
+        // legacy path bytewise-identical to pre-Wave-7 behaviour.
+        //
+        // try_gpu_intersect itself runs four more gates inside —
+        // see crate::query::boolean_query::gpu_intersect doc.
+        if !self.scoring_enabled
+            && should_scorers.is_empty()
+            && exclude_scorers.is_empty()
+            && must_special_scorer_counts.num_all_scorers == 0
+            && should_special_scorer_counts.num_all_scorers == 0
+            && must_scorers.len() >= 2
+        {
+            match super::gpu_intersect::try_gpu_intersect(
+                must_scorers,
+                reader,
+                self.scoring_enabled,
+            ) {
+                Ok(gpu_scorer) => return Ok(SpecializedScorer::Other(gpu_scorer)),
+                Err(recovered) => {
+                    // Recover the original cohort and fall through to
+                    // the legacy CPU path below.
+                    must_scorers = recovered;
+                }
+            }
+        }
+
         let effective_minimum_number_should_match = self
             .minimum_number_should_match
             .saturating_sub(should_special_scorer_counts.num_all_scorers);

@@ -101,13 +101,7 @@ impl TermScorer {
     /// behind `cfg(any(feature = "gpu", test))` so the adapter surface
     /// only exists when it can be exercised — production builds that
     /// disable the `gpu` feature don't pay for the visibility leak.
-    ///
-    /// `allow(dead_code)` exists because Wave 7/Plan2 lands the
-    /// accessor in commit 2 and consumes it in commit 3; until commit
-    /// 3 the lint would fail clippy `-D warnings`. Removed when
-    /// `gpu_intersect.rs` lands.
     #[cfg(any(feature = "gpu", test))]
-    #[allow(dead_code)]
     #[inline]
     #[must_use]
     pub(crate) fn segment_postings(&self) -> &SegmentPostings {
@@ -116,10 +110,9 @@ impl TermScorer {
 
     /// Mutable borrow of the underlying [`SegmentPostings`].
     ///
-    /// The drain bridge ([`crate::postings::roaring::drain_block_segment_to_roaring`])
-    /// consumes its `BlockSegmentPostings` by `&mut`, so the GPU
-    /// dispatch helper needs a `&mut SegmentPostings` to clone the
-    /// underlying cursor before draining. Same gating as
+    /// Reserved for future drain-by-consumption variants (the current
+    /// Wave 7 hook clones the cursor; a Wave 8+ refactor that consumes
+    /// the original may use this). Gated identically to
     /// [`Self::segment_postings`].
     #[cfg(any(feature = "gpu", test))]
     #[allow(dead_code)]

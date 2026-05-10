@@ -5,6 +5,7 @@ mod block_wand;
 pub mod block_wand_scorer;
 mod boolean_query;
 mod boolean_weight;
+#[cfg(feature = "gpu")]
 mod gpu_intersect;
 mod max_score_block_wand;
 

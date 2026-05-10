@@ -264,6 +264,13 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         //
         // try_gpu_intersect itself runs four more gates inside —
         // see crate::query::boolean_query::gpu_intersect doc.
+        //
+        // Cargo feature `gpu` gates the whole hook out — without GPU
+        // available, try_gpu_bool would always return None, so the
+        // pre-check + drain-clone overhead is pure cost. The
+        // gpu_intersect module itself is also `cfg(feature = "gpu")`,
+        // so it is not compiled when the feature is off.
+        #[cfg(feature = "gpu")]
         if !self.scoring_enabled
             && should_scorers.is_empty()
             && exclude_scorers.is_empty()

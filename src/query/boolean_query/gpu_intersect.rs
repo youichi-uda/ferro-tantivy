@@ -199,12 +199,11 @@ pub(crate) fn try_gpu_intersect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc;
     use crate::index::Index;
     use crate::postings::roaring::gpu_dispatch::{
         cpu_fallback_count, gpu_dispatch_count, reset_dispatch_counters,
     };
-    use crate::query::{Bm25Weight, EnableScoring, Scorer};
+    use crate::query::{EnableScoring, Scorer};
     use crate::schema::{IndexRecordOption, Schema, Term, TEXT};
     use std::sync::Mutex;
 
@@ -274,7 +273,7 @@ mod tests {
         let segment_reader = reader.searcher().segment_reader(0).clone();
         // scoring_enabled = true → must return Err immediately.
         let res = try_gpu_intersect(cohort, &segment_reader, true);
-        assert!(matches!(res, Err(_)), "scoring_enabled gate should reject");
+        assert!(res.is_err(), "scoring_enabled gate should reject");
         if let Err(recovered) = res {
             assert_eq!(recovered.len(), 2, "cohort must be returned intact");
         }
@@ -288,7 +287,7 @@ mod tests {
         let reader = index.reader()?;
         let segment_reader = reader.searcher().segment_reader(0).clone();
         let res = try_gpu_intersect(cohort, &segment_reader, false);
-        assert!(matches!(res, Err(_)), "single-term cohort should be rejected");
+        assert!(res.is_err(), "single-term cohort should be rejected");
         Ok(())
     }
 
@@ -301,7 +300,7 @@ mod tests {
         let reader = index.reader()?;
         let segment_reader = reader.searcher().segment_reader(0).clone();
         let res = try_gpu_intersect(cohort, &segment_reader, false);
-        assert!(matches!(res, Err(_)), "mixed cohort should be rejected");
+        assert!(res.is_err(), "mixed cohort should be rejected");
         Ok(())
     }
 
@@ -317,7 +316,7 @@ mod tests {
         let reader = index.reader()?;
         let segment_reader = reader.searcher().segment_reader(0).clone();
         let res = try_gpu_intersect(cohort, &segment_reader, false);
-        assert!(matches!(res, Err(_)), "light cohort should be rejected");
+        assert!(res.is_err(), "light cohort should be rejected");
         // No GPU dispatch attempted (planner pre-check stops us before
         // try_gpu_bool).
         assert_eq!(

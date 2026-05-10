@@ -378,6 +378,77 @@ fn parity_pinned_buffer_matches_vec_path() {
     }
 }
 
+/// `compute_batches_into_pinned` (Phase 5-2 double-buffered batch
+/// path) must produce byte-identical output to the single-batch
+/// `compute_batched_into_pinned` API across a representative set of
+/// (num_batches, num_queries, num_vecs, dim_bits) shapes — including
+/// odd `num_batches` so the `i % 2` pipeline routing is exercised.
+#[test]
+fn parity_double_buffered_batches_match_single_path() {
+    let kernel = match try_build() {
+        Some(k) => k,
+        None => return,
+    };
+
+    let cases: &[(usize, usize, usize, usize)] = &[
+        // (num_batches, num_queries_per_batch, num_vecs, dim_bits)
+        (1, 4, 64, 256),     // single-batch sanity
+        (2, 1, 32, 128),     // odd small case + even batches
+        (3, 8, 1024, 512),   // odd batches → reuse stream slot 0 twice
+        (5, 16, 4096, 768),  // mid shape with odd batch count
+        (8, 32, 8192, 1024), // larger
+    ];
+
+    for &(num_batches, q, n, dim_bits) in cases {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let words_per_batch = q * dim_u32;
+        let total_queries = num_batches * q;
+        let queries_seed = 0xfeed_face_u64
+            ^ ((num_batches as u64) << 48)
+            ^ ((q as u64) << 32)
+            ^ ((n as u64) << 16)
+            ^ dim_bits as u64;
+        let corpus_seed = 0xc0de_d00d_u64
+            ^ ((num_batches as u64) << 32)
+            ^ ((n as u64) << 16)
+            ^ dim_bits as u64;
+        let mut queries_concat = random_u32_vec(num_batches * words_per_batch, queries_seed);
+        let mut corpus = random_u32_vec(n * dim_u32, corpus_seed);
+        zero_padding(&mut queries_concat, total_queries, dim_bits);
+        zero_padding(&mut corpus, n, dim_bits);
+
+        let cached = kernel
+            .prepare_corpus(&corpus, n, dim_bits)
+            .expect("prepare_corpus");
+
+        let mut pinned_db = kernel
+            .alloc_pinned_u32(num_batches * q * n)
+            .expect("alloc_pinned_u32 (double-buffered)");
+        cached
+            .compute_batches_into_pinned(&queries_concat, q, num_batches, &mut pinned_db)
+            .expect("compute_batches_into_pinned");
+
+        // Compare each batch slice to the single-batch path bit-by-bit.
+        let mut pinned_single = kernel
+            .alloc_pinned_u32(q * n)
+            .expect("alloc_pinned_u32 (single)");
+        for b in 0..num_batches {
+            let qslice =
+                &queries_concat[b * words_per_batch..(b + 1) * words_per_batch];
+            cached
+                .compute_batched_into_pinned(qslice, q, &mut pinned_single)
+                .expect("single-batch compute_batched_into_pinned");
+            let lhs = &pinned_db.as_slice()[b * q * n..(b + 1) * q * n];
+            let rhs = &pinned_single.as_slice()[..q * n];
+            assert_eq!(
+                lhs, rhs,
+                "double-buffered batch {b} != single-batch path \
+                 (num_batches={num_batches}, Q={q}, N={n}, dim={dim_bits})"
+            );
+        }
+    }
+}
+
 /// Small-but-odd shapes that probe leading-dimension and alignment
 /// edges of the IMMA path.
 #[test]

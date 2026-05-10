@@ -292,6 +292,68 @@ impl CudaBinaryCorpus {
         )
     }
 
+    /// **Phase 5-2** double-buffered batch entry point.
+    ///
+    /// Issues `num_batches` query batches against the resident corpus,
+    /// alternating between two internal CUDA streams. The next
+    /// batch's host-to-device upload + GEMM + result download
+    /// overlaps the current batch's compute, which approximately
+    /// halves the upload + download exposure on workloads where the
+    /// compute slot dominates. Used for benchmarks that score many
+    /// independent query batches against the same segment; HNSW
+    /// search loops with data-dependent next-batch selection can't
+    /// pre-issue and use the single-batch [`Self::compute_batched_into_pinned`]
+    /// instead.
+    ///
+    /// Pre-conditions:
+    /// - `queries_concat` has length `num_batches * num_queries_per_batch * dim_u32`.
+    /// - `out` has length ≥ `num_batches * num_queries_per_batch * num_vecs`.
+    /// - All batches use the same `num_queries_per_batch` (to keep
+    ///   the cuBLASLt heuristic stable across the loop).
+    ///
+    /// On return all batches have completed and `out.as_slice()` is
+    /// safe to read; row-major layout is
+    /// `[batch_0_row_0, batch_0_row_1, ..., batch_1_row_0, ...]`.
+    pub fn compute_batches_into_pinned(
+        &self,
+        queries_concat: &[u32],
+        num_queries_per_batch: usize,
+        num_batches: usize,
+        out: &mut PinnedU32Buffer,
+    ) -> GpuResult<()> {
+        if num_batches == 0 || num_queries_per_batch == 0 {
+            return Ok(());
+        }
+        let dim_u32 = self.inner.dim_bits.div_ceil(32);
+        let words_per_batch = num_queries_per_batch * dim_u32;
+        let expected_query_len = num_batches * words_per_batch;
+        if queries_concat.len() != expected_query_len {
+            return Err(GpuError::ColumnTypeMismatch {
+                expected: format!("queries_concat.len() == {expected_query_len}"),
+                actual: format!("queries_concat.len() == {}", queries_concat.len()),
+            });
+        }
+
+        // Compute per-batch popcounts in a single concatenated pass
+        // so the inner pipeline doesn't pay a host-side popcount per
+        // batch.
+        let mut pop_q_concat = Vec::with_capacity(num_batches * num_queries_per_batch);
+        for b in 0..num_batches {
+            let slice = &queries_concat[b * words_per_batch..(b + 1) * words_per_batch];
+            let mut row_pop = popcount_per_vec(slice, num_queries_per_batch, dim_u32);
+            pop_q_concat.append(&mut row_pop);
+        }
+
+        self.inner.runner.run_batches_with_cached_corpus_into_pinned(
+            queries_concat,
+            &pop_q_concat,
+            &self.inner,
+            num_queries_per_batch,
+            num_batches,
+            out,
+        )
+    }
+
     /// End-to-end CUDA k-NN search: compute the Q × N distance matrix
     /// on-device and run the bitonic-merge top-K reducer in CUDA, so
     /// only `Q × K × 8 B` crosses PCIe back regardless of `N`.

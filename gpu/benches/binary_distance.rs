@@ -717,6 +717,137 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
         }
     }
 
+    // ── Phase 5-2: double-buffered batched pipeline ──
+    //
+    // Models the "score B independent query batches against the same
+    // segment" pattern. Each batch is small enough that the GEMM
+    // alone doesn't fully cover upload + download; the double-buffered
+    // pipeline overlaps the next batch's upload with the current
+    // batch's compute and the previous batch's download.
+    println!();
+    println!("--- Phase 5-2 double-buffered batched pipeline ---");
+    println!("(B batches × Q queries × N corpus × dim 768; one prepare_corpus,");
+    println!(" then `compute_batched_into_pinned` × B serially vs `compute_batches_into_pinned`)");
+    println!(
+        "{:<40}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "shape", "serial", "doublebuf", "speedup", "match"
+    );
+    let pipeline_shapes: &[(&str, usize, usize, usize, usize)] = &[
+        // (label, num_batches, num_queries_per_batch, num_vecs, dim_bits)
+        ("B=10  Q=4   N=100000 ", 10, 4, 100_000, 768),
+        ("B=10  Q=64  N=100000 ", 10, 64, 100_000, 768),
+        ("B=10  Q=64  N=1000000", 10, 64, 1_000_000, 768),
+    ];
+    let mut pipeline_json_rows: Vec<String> = Vec::new();
+    let mut pipeline_1m_speedup: Option<f64> = None;
+    for &(label, num_batches, num_q, num_vecs, dim_bits) in pipeline_shapes {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let words_per_batch = num_q * dim_u32;
+        let queries =
+            random_u32_vec(num_batches * words_per_batch, 0x1010_2020_3030_4040);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0x5050_6060_7070_8080);
+        let cached = cuda
+            .prepare_corpus(&corpus, num_vecs, dim_bits)
+            .expect("prepare_corpus");
+
+        // Pre-allocate the two pinned buffers at the maximum sizes.
+        let mut pinned_serial = cuda
+            .alloc_pinned_u32(num_q * num_vecs)
+            .expect("alloc_pinned_u32 serial");
+        let mut pinned_db = cuda
+            .alloc_pinned_u32(num_batches * num_q * num_vecs)
+            .expect("alloc_pinned_u32 doublebuf");
+
+        // Correctness: double-buffered output must match the
+        // single-batch path bit-for-bit, batch by batch.
+        cached
+            .compute_batches_into_pinned(&queries, num_q, num_batches, &mut pinned_db)
+            .expect("compute_batches_into_pinned");
+        let mut matches = true;
+        for b in 0..num_batches {
+            let qslice = &queries[b * words_per_batch..(b + 1) * words_per_batch];
+            cached
+                .compute_batched_into_pinned(qslice, num_q, &mut pinned_serial)
+                .expect("compute_batched_into_pinned");
+            let lhs =
+                &pinned_db.as_slice()[b * num_q * num_vecs..(b + 1) * num_q * num_vecs];
+            let rhs = &pinned_serial.as_slice()[..num_q * num_vecs];
+            if lhs != rhs {
+                matches = false;
+                break;
+            }
+        }
+        if !matches {
+            panic!("double-buffered != single-batch on shape {label}");
+        }
+
+        let iters = if num_vecs >= 1_000_000 { 3 } else { 5 };
+        let serial_time = bench(iters, || {
+            for b in 0..num_batches {
+                let qslice = &queries[b * words_per_batch..(b + 1) * words_per_batch];
+                cached
+                    .compute_batched_into_pinned(qslice, num_q, &mut pinned_serial)
+                    .expect("serial");
+                black_box(pinned_serial.as_slice());
+            }
+        });
+        let db_time = bench(iters, || {
+            cached
+                .compute_batches_into_pinned(&queries, num_q, num_batches, &mut pinned_db)
+                .expect("doublebuf");
+            black_box(pinned_db.as_slice());
+        });
+        let speedup = serial_time.as_nanos() as f64 / db_time.as_nanos().max(1) as f64;
+        if num_vecs == 1_000_000 {
+            pipeline_1m_speedup = Some(speedup);
+        }
+        println!(
+            "{:<40}  {:>10}  {:>10}  {:>7.2}x  {:>8}",
+            label,
+            fmt_dur(serial_time),
+            fmt_dur(db_time),
+            speedup,
+            "ok"
+        );
+        pipeline_json_rows.push(format!(
+            "    {{\"shape\": \"{}\", \"num_batches\": {}, \"num_queries\": {}, \
+             \"num_vecs\": {}, \"dim_bits\": {}, \"serial_ns\": {}, \
+             \"doublebuf_ns\": {}, \"speedup\": {:.4}, \"byte_equal\": true}}",
+            label.trim(),
+            num_batches,
+            num_q,
+            num_vecs,
+            dim_bits,
+            serial_time.as_nanos(),
+            db_time.as_nanos(),
+            speedup
+        ));
+    }
+    let pipeline_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("data")
+        .join("cuda_doublebuf.json");
+    let mut pipeline_json = String::new();
+    pipeline_json.push_str("{\n");
+    pipeline_json.push_str(&format!("  \"backend\": \"{}\",\n", info.backend));
+    pipeline_json.push_str(&format!(
+        "  \"device\": \"{}\",\n",
+        info.name.replace('"', "\\\"")
+    ));
+    pipeline_json
+        .push_str("  \"calling_pattern\": \"compute_batched_into_pinned (serial) vs compute_batches_into_pinned (Phase 5-2 double-buffered)\",\n");
+    pipeline_json.push_str("  \"results\": [\n");
+    pipeline_json.push_str(&pipeline_json_rows.join(",\n"));
+    pipeline_json.push_str("\n  ]\n}\n");
+    if let Err(e) = std::fs::write(&pipeline_path, &pipeline_json) {
+        eprintln!("failed to write {}: {e}", pipeline_path.display());
+    } else {
+        println!("wrote {}", pipeline_path.display());
+    }
+    if let Some(s) = pipeline_1m_speedup {
+        println!("(N=1M tracking): double-buffer speedup = {s:.2}x serial");
+    }
+
     if let Some(s) = assert_speedup {
         let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
         if !assert_off {

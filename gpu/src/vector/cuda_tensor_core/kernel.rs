@@ -21,7 +21,7 @@
 //! inputs.
 
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::cublaslt::{result as blas_result, sys as blas_sys};
 use cudarc::driver::{
@@ -200,10 +200,25 @@ pub(super) struct CudaGemmRunner {
     correction_func: CudaFunction,
     top_k_func: CudaFunction,
     stream: Arc<CudaStream>,
+    // Phase 5-2: lazily-built ping-pong streams + their dedicated
+    // workspaces, used by `compute_batches_*` to overlap the next
+    // batch's upload + download with the current batch's GEMM. Each
+    // pipeline slot needs its own workspace because cuBLASLt's
+    // matmul writes into the workspace concurrently across streams.
+    pipeline_slots: OnceLock<[PipelineSlot; 2]>,
     // Hold the context so the device isn't dropped while we still own
     // the cuBLASLt handle / workspace, and so the parent module can
     // allocate user-visible pinned host buffers tied to it.
     ctx: Arc<CudaContext>,
+}
+
+/// One stream + workspace pair used by the double-buffered batch
+/// pipeline (Phase 5-2). The two pipeline slots run independently of
+/// the runner's `stream` field, which stays the default stream so the
+/// existing single-call entry points retain their original ordering.
+pub(super) struct PipelineSlot {
+    pub(super) stream: Arc<CudaStream>,
+    pub(super) workspace: CudaSlice<u8>,
 }
 
 impl CudaGemmRunner {
@@ -266,8 +281,42 @@ impl CudaGemmRunner {
             correction_func,
             top_k_func,
             stream,
+            pipeline_slots: OnceLock::new(),
             ctx,
         })
+    }
+
+    /// Lazily build (or borrow) the two-stream pipeline used by
+    /// [`Self::run_batches_with_cached_corpus_into_pinned`]. Building
+    /// twin streams is O(1) on a quiescent device but we still defer
+    /// it so the cost is paid only by callers that actually use the
+    /// double-buffered path.
+    fn pipeline_slots(&self) -> GpuResult<&[PipelineSlot; 2]> {
+        if let Some(slots) = self.pipeline_slots.get() {
+            return Ok(slots);
+        }
+        let mut built: [Option<PipelineSlot>; 2] = [None, None];
+        for slot in built.iter_mut() {
+            let stream = self.ctx.new_stream().map_err(map_drv)?;
+            let workspace =
+                unsafe { stream.alloc::<u8>(self.workspace_size) }.map_err(|e| {
+                    GpuError::CpuFallback {
+                        reason: format!(
+                            "pipeline workspace alloc {} bytes failed: {e}",
+                            self.workspace_size
+                        ),
+                    }
+                })?;
+            *slot = Some(PipelineSlot { stream, workspace });
+        }
+        let slots = [built[0].take().unwrap(), built[1].take().unwrap()];
+        // Race-tolerant init — if another thread won the race we drop
+        // ours and use theirs.
+        let _ = self.pipeline_slots.set(slots);
+        Ok(self
+            .pipeline_slots
+            .get()
+            .expect("pipeline_slots set above"))
     }
 
     /// Borrow of the underlying CUDA context, exposed so the parent
@@ -288,10 +337,22 @@ impl CudaGemmRunner {
         num_rows: usize,
         dim_bits: usize,
     ) -> GpuResult<CudaSlice<i8>> {
+        self.unpack_to_device_on(&self.stream, bits, num_rows, dim_bits)
+    }
+
+    /// Stream-parameterized variant of [`Self::unpack_to_device`].
+    /// Used by the Phase 5-2 double-buffered pipeline so each pipeline
+    /// slot's upload + unpack happens on its own dedicated stream.
+    fn unpack_to_device_on(
+        &self,
+        stream: &Arc<CudaStream>,
+        bits: &[u32],
+        num_rows: usize,
+        dim_bits: usize,
+    ) -> GpuResult<CudaSlice<i8>> {
         let dim_u32 = dim_bits.div_ceil(32);
         debug_assert_eq!(bits.len(), num_rows * dim_u32);
 
-        let stream = &self.stream;
         let packed_dev = stream.clone_htod(bits).map_err(map_drv)?;
         let mut unpacked_dev =
             unsafe { stream.alloc::<i8>(num_rows * dim_bits) }.map_err(map_drv)?;
@@ -329,8 +390,35 @@ impl CudaGemmRunner {
         n: usize,
         k: usize,
     ) -> GpuResult<CudaSlice<u32>> {
-        let stream = &self.stream;
+        self.gemm_and_correct_dev_on(
+            &self.stream,
+            &self.workspace,
+            q_i8_dev,
+            d_i8_dev,
+            pop_q_dev,
+            pop_d_dev,
+            m,
+            n,
+            k,
+        )
+    }
 
+    /// Stream-and-workspace-parameterized variant of
+    /// [`Self::gemm_and_correct_dev`]. Used by the Phase 5-2
+    /// double-buffered pipeline.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_and_correct_dev_on(
+        &self,
+        stream: &Arc<CudaStream>,
+        workspace: &CudaSlice<u8>,
+        q_i8_dev: &CudaSlice<i8>,
+        d_i8_dev: &CudaSlice<i8>,
+        pop_q_dev: &CudaSlice<i32>,
+        pop_d_dev: &CudaSlice<i32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> GpuResult<CudaSlice<u32>> {
         let mut inner_dev = unsafe { stream.alloc::<i32>(m * n) }.map_err(map_drv)?;
         let mut out_dev = unsafe { stream.alloc::<u32>(m * n) }.map_err(map_drv)?;
 
@@ -347,8 +435,12 @@ impl CudaGemmRunner {
             let (b_ptr, _record_b) = q_i8_dev.device_ptr(stream);
             let (c_ptr, _record_c) = inner_dev.device_ptr_mut(stream);
             unsafe {
-                self.matmul_int8_int32(
-                    a_ptr, b_ptr, c_ptr,
+                self.matmul_int8_int32_on(
+                    stream,
+                    workspace,
+                    a_ptr,
+                    b_ptr,
+                    c_ptr,
                     /* m_p */ n as u64,
                     /* n_p */ m as u64,
                     /* k_p */ k as u64,
@@ -553,6 +645,119 @@ impl CudaGemmRunner {
         )
     }
 
+    /// **Phase 5-2** double-buffered batch entry point.
+    ///
+    /// Issues `num_batches` query batches against the cached corpus,
+    /// alternating between two internal CUDA streams so the
+    /// next-batch upload + GEMM + download overlaps the current
+    /// batch's compute. Each batch's `num_queries × num_vecs` distance
+    /// matrix is written into the matching slice of `out` (offset
+    /// `batch_idx * num_queries * num_vecs`); the slice ranges do not
+    /// overlap, so the host-visible buffer is well-defined when the
+    /// final stream synchronisation returns.
+    ///
+    /// All batches must use the same `num_queries` so the cuBLASLt
+    /// algorithm heuristic, query-unpack tiling and per-stream
+    /// per-call allocations stay homogeneous and simple. Variable
+    /// batch sizes can be emulated by zero-padding queries; the test
+    /// suite covers `num_queries = 1` so a degenerate "one query per
+    /// batch" pattern works.
+    ///
+    /// `pop_q_concat` must equal `popcount_per_vec(queries_concat)`
+    /// flattened, length `num_batches * num_queries`. The bench
+    /// harness is the only caller today; production HNSW search loops
+    /// have data-dependent batches and use the single-batch entry
+    /// points.
+    pub(super) fn run_batches_with_cached_corpus_into_pinned(
+        &self,
+        queries_concat: &[u32],
+        pop_q_concat: &[i32],
+        corpus: &CachedCorpus,
+        num_queries_per_batch: usize,
+        num_batches: usize,
+        out: &mut PinnedU32Buffer,
+    ) -> GpuResult<()> {
+        let dim_u32 = corpus.dim_bits.div_ceil(32);
+        let queries_per_batch_words = num_queries_per_batch * dim_u32;
+        let result_per_batch = num_queries_per_batch * corpus.num_vecs;
+        debug_assert_eq!(queries_concat.len(), num_batches * queries_per_batch_words);
+        debug_assert_eq!(pop_q_concat.len(), num_batches * num_queries_per_batch);
+        if out.len() < num_batches * result_per_batch {
+            return Err(GpuError::ColumnTypeMismatch {
+                expected: format!(
+                    "pinned out buffer len ≥ {}",
+                    num_batches * result_per_batch
+                ),
+                actual: format!("pinned out buffer len = {}", out.len()),
+            });
+        }
+
+        let slots = self.pipeline_slots()?;
+
+        // Hold per-batch device-side intermediates alive until both
+        // streams have finished. Without this the `CudaSlice`s would
+        // drop at end of iteration and could free GPU memory before
+        // the device's stream-ordered work completes.
+        let mut q_devs: Vec<CudaSlice<i8>> = Vec::with_capacity(num_batches);
+        let mut pop_q_devs: Vec<CudaSlice<i32>> = Vec::with_capacity(num_batches);
+        let mut dist_devs: Vec<CudaSlice<u32>> = Vec::with_capacity(num_batches);
+
+        for batch_idx in 0..num_batches {
+            let slot = &slots[batch_idx & 1];
+            let q_offset = batch_idx * queries_per_batch_words;
+            let queries_slice =
+                &queries_concat[q_offset..q_offset + queries_per_batch_words];
+            let pop_q_slice = &pop_q_concat
+                [batch_idx * num_queries_per_batch..(batch_idx + 1) * num_queries_per_batch];
+
+            // Stage 1: upload + unpack (slot.stream).
+            let q_i8_dev =
+                self.unpack_to_device_on(&slot.stream, queries_slice, num_queries_per_batch, corpus.dim_bits)?;
+            let pop_q_dev = slot.stream.clone_htod(pop_q_slice).map_err(map_drv)?;
+
+            // Stage 2: GEMM + correction on slot.stream / slot.workspace.
+            let dist_dev = self.gemm_and_correct_dev_on(
+                &slot.stream,
+                &slot.workspace,
+                &q_i8_dev,
+                &corpus.unpacked_dev,
+                &pop_q_dev,
+                &corpus.pop_dev,
+                num_queries_per_batch,
+                corpus.num_vecs,
+                corpus.dim_bits,
+            )?;
+
+            // Stage 3: D2H into the matching slice of the pinned
+            // output buffer. We use the raw memcpy_dtoh_async so we
+            // can pass the exact destination subrange (cudarc's
+            // safe `memcpy_dtoh` requires a `HostSlice` which doesn't
+            // expose subranges of `PinnedHostSlice` cleanly).
+            unsafe {
+                let dst_ptr = out.as_mut_ptr().add(batch_idx * result_per_batch);
+                let dst_slice = std::slice::from_raw_parts_mut(dst_ptr, result_per_batch);
+                let (src_ptr, _record) = dist_dev.device_ptr(&slot.stream);
+                drv_result::memcpy_dtoh_async(dst_slice, src_ptr, slot.stream.cu_stream())
+                    .map_err(map_drv)?;
+            }
+
+            q_devs.push(q_i8_dev);
+            pop_q_devs.push(pop_q_dev);
+            dist_devs.push(dist_dev);
+        }
+
+        // Synchronise both pipeline streams so the host-visible
+        // output buffer is consistent before returning.
+        for slot in slots.iter() {
+            slot.stream.synchronize().map_err(map_drv)?;
+        }
+        // Now safe to drop the device-side intermediates.
+        drop(q_devs);
+        drop(pop_q_devs);
+        drop(dist_devs);
+        Ok(())
+    }
+
     /// Run an end-to-end k-NN search against a cached corpus —
     /// distance matrix + on-device top-K reduction. Only `Q × K × 8 B`
     /// crosses PCIe back, regardless of N.
@@ -618,7 +823,8 @@ impl CudaGemmRunner {
         Ok((dists_host, ids_host))
     }
 
-    /// Lower-level cuBLASLt INT8 → INT32 matmul.
+    /// Stream-and-workspace-parameterized cuBLASLt INT8 → INT32
+    /// matmul.
     ///
     /// This bypasses the `Matmul<T>` trait in `cudarc::cublaslt::safe`
     /// because that trait only ships `Matmul` impls for `f32` (and
@@ -633,8 +839,10 @@ impl CudaGemmRunner {
     /// dimensions. The caller is responsible for the lifetime of those
     /// allocations through to `stream.synchronize()`.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn matmul_int8_int32(
+    unsafe fn matmul_int8_int32_on(
         &self,
+        stream: &Arc<CudaStream>,
+        workspace: &CudaSlice<u8>,
         a_ptr: drv_sys::CUdeviceptr,
         b_ptr: drv_sys::CUdeviceptr,
         c_ptr: drv_sys::CUdeviceptr,
@@ -708,9 +916,9 @@ impl CudaGemmRunner {
 
         let alpha: i32 = 1;
         let beta: i32 = 0;
-        let (w_ptr, _record_w) = self.workspace.device_ptr(&self.stream);
+        let (w_ptr, _record_w) = workspace.device_ptr(stream);
 
-        let stream_raw = self.stream.cu_stream() as blas_sys::cudaStream_t;
+        let stream_raw = stream.cu_stream() as blas_sys::cudaStream_t;
         let res = blas_result::matmul(
             self.handle,
             matmul_desc,

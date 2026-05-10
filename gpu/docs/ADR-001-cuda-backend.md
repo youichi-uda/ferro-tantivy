@@ -156,12 +156,41 @@ post-correction.
   representative shapes; pinned bytes byte-equal to the CPU oracle and
   to the `Vec<u32>` path; buffer reuse across shrinking batches also
   exercised).
-- Phase 5 still on the table: 5-2 double-buffered query upload for
-  HNSW search loops (overlap next batch's query upload with current
-  GEMM), 5-3 BMMA 1-bit tensor-core PoC (eliminates the unpack to
-  one-byte-per-bit and lifts arithmetic throughput by 8× if the
-  inline-PTX path holds), and 5-4 real-data SIFT1M / GIST1M recall@k
-  in `ferro-bench-runner`.
+- **Phase 5-2 — double-buffered batched pipeline
+  (`compute_batches_into_pinned`)**: a new entry point on
+  `CudaBinaryCorpus` issues `B` query batches across two internal
+  CUDA streams + workspaces, so the next batch's upload + GEMM +
+  download overlaps the current batch's compute. Each batch lands in
+  its own slice of one large pinned output buffer (offset
+  `batch_idx × Q × N`), and the call returns once both pipeline
+  streams have synchronised. The per-batch byte-equivalence vs the
+  single-batch entry point is asserted in
+  `parity_double_buffered_batches_match_single_path` (5 cases
+  including odd batch counts so the `i % 2` slot routing flips on the
+  final batch).
+  Measured on RTX 4070 Ti SUPER at `B = 10` batches:
+  | shape | serial pinned | double-buf | speedup |
+  |-------|---------------|------------|---------|
+  | Q=4  N=100k    | 3.01 ms   | 2.40 ms   | 1.25× |
+  | Q=64 N=100k    | 22.05 ms  | 20.11 ms  | 1.10× |
+  | Q=64 N=1M      | 271.69 ms | 206.09 ms | **1.32×** |
+  Raw timings: `gpu/benches/data/cuda_doublebuf.json`. The gain is
+  bounded by how much of the per-batch wall-clock isn't already
+  in the GEMM — at the headline `Q = 64, N = 1 M, dim = 768` shape
+  GEMM is ≈ 60-70 % of the per-batch budget, leaving only the
+  remaining 30-40 % (upload + correction + download) available for
+  overlap, so the realistic ceiling is ≈ 1.5×; we land at 1.32×
+  steady-state (the first and last batches don't pipeline). For
+  workloads with a smaller per-batch compute slot (low Q, low N)
+  the same pipeline produces less absolute time saved but a
+  similar ratio. There is no Go-threshold assertion on this number
+  because pipeline gain is hardware-sensitive (PCIe gen, DRAM
+  speed, SM count); the JSON is consumed only for regression
+  tracking.
+- Phase 5 still on the table: 5-3 BMMA 1-bit tensor-core PoC
+  (eliminates the unpack to one-byte-per-bit and lifts arithmetic
+  throughput by 8× if the inline-PTX path holds), and 5-4 real-data
+  SIFT1M / GIST1M recall@k in `ferro-bench-runner`.
 - **Phase C — `knn_search` end-to-end CUDA path**: the WGSL
   `top_k_select.wgsl` bitonic-merge top-K shader has been ported to
   CUDA (NVRTC, same algorithm, same tie-break), and

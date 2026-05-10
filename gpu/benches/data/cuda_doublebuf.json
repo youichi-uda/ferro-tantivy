@@ -1,0 +1,10 @@
+{
+  "backend": "Vulkan",
+  "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "calling_pattern": "compute_batched_into_pinned (serial) vs compute_batches_into_pinned (Phase 5-2 double-buffered)",
+  "results": [
+    {"shape": "B=10  Q=4   N=100000", "num_batches": 10, "num_queries": 4, "num_vecs": 100000, "dim_bits": 768, "serial_ns": 3006322, "doublebuf_ns": 2398334, "speedup": 1.2535, "byte_equal": true},
+    {"shape": "B=10  Q=64  N=100000", "num_batches": 10, "num_queries": 64, "num_vecs": 100000, "dim_bits": 768, "serial_ns": 22054694, "doublebuf_ns": 20106745, "speedup": 1.0969, "byte_equal": true},
+    {"shape": "B=10  Q=64  N=1000000", "num_batches": 10, "num_queries": 64, "num_vecs": 1000000, "dim_bits": 768, "serial_ns": 271688109, "doublebuf_ns": 206089567, "speedup": 1.3183, "byte_equal": true}
+  ]
+}

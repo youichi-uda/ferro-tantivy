@@ -74,9 +74,12 @@ pub use ferro_compress_bridge::{
 };
 pub use from_block_segment::drain_block_segment_to_roaring;
 pub use gpu_dispatch::{
-    cpu_fallback_count, gpu_dispatch_count, reset_dispatch_counters, try_gpu_bool, BoolOp,
+    cpu_fallback_count, gpu_dispatch_count, record_cpu_fallback, reset_dispatch_counters,
+    try_gpu_bool, BoolOp,
 };
-pub use planner::{should_dispatch_gpu, TermStat, MIN_CONTAINERS, MIN_RATIO};
+pub use planner::{
+    should_dispatch_gpu, TermStat, MIN_COHORT_DOCS, MIN_PER_TERM_CARDINALITY, MIN_RATIO,
+};
 
 #[cfg(feature = "ferro-compress")]
 pub use ferro_compress_bridge::FerroBitcompCodec;

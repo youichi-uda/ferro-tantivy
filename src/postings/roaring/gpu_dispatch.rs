@@ -103,6 +103,17 @@ pub fn cpu_fallback_count() -> usize {
     CPU_FALLBACK_COUNT.load(Ordering::Relaxed)
 }
 
+/// Record a CPU fallback from a higher-level call site (e.g. the
+/// `try_gpu_intersect` pre-dispatch gates that early-out before
+/// reaching `try_gpu_bool`). Mirrors the bump that `try_gpu_bool`
+/// does internally so observers (auto_dispatch_test, the bench
+/// harness) see a consistent signal whenever the dispatch helper
+/// was reached but did not fire to GPU. Encapsulates the
+/// `AtomicUsize` so callers don't need direct access to the static.
+pub fn record_cpu_fallback() {
+    CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Reset both observable counters. Test-only.
 #[doc(hidden)]
 pub fn reset_dispatch_counters() {
@@ -399,16 +410,16 @@ mod tests {
     fn heavy_cohort_dispatches_to_gpu() {
         let _g = COUNTER_LOCK.lock().unwrap();
         reset_dispatch_counters();
-        // Build 12 high-cardinality posting lists, each spanning ≥ 1
-        // bucket and reaching > 5 % field-doc ratio. Each term has
-        // 70_000 ids → 1.07 buckets → ceil(1.07) = 2 estimated
-        // containers, so 12 terms × 2 = 24 estimated containers ≥
-        // MIN_CONTAINERS = 10. Segment doc count = 1_000_000;
-        // 70_000 / 1_000_000 = 7 % > 5 %.
+        // Build 12 high-cardinality posting lists. Each term has
+        // 100_000 ids = exactly `MIN_PER_TERM_CARDINALITY`; cohort
+        // total = 12 × 100_000 = 1.2 M ≥ `MIN_COHORT_DOCS`. Segment
+        // doc count = 1_000_000 → ratio = 10 % > `MIN_RATIO`. All
+        // three Wave 8 / A / 2 gates clear; the dispatch fires unless
+        // wgpu init fails on the host.
         let terms_owned: Vec<RoaringPostings> = (0..12)
             .map(|i| {
                 let start = i as u32 * 10;
-                let ids: Vec<u32> = (start..start + 70_000).collect();
+                let ids: Vec<u32> = (start..start + 100_000).collect();
                 RoaringEncoder::from_doc_ids(&ids)
             })
             .collect();
@@ -492,11 +503,12 @@ mod tests {
         let _g = COUNTER_LOCK.lock().unwrap();
         reset_dispatch_counters();
         // 12 high-cardinality terms with overlapping ranges, large
-        // enough to clear the planner gate.
+        // enough to clear the Wave 8 / A / 2 planner gate
+        // (per-term ≥ 100 K, cohort total ≥ 1 M, ratio ≥ 5 %).
         let terms_owned: Vec<RoaringPostings> = (0..12)
             .map(|i| {
                 let start = i as u32 * 100;
-                let ids: Vec<u32> = (start..start + 80_000).collect();
+                let ids: Vec<u32> = (start..start + 100_000).collect();
                 RoaringEncoder::from_doc_ids(&ids)
             })
             .collect();

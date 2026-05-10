@@ -46,7 +46,9 @@
 use crate::index::SegmentReader;
 use crate::postings::roaring::encoder::RoaringPostings;
 use crate::postings::roaring::planner::{should_dispatch_gpu, TermStat};
-use crate::postings::roaring::{drain_block_segment_to_roaring, try_gpu_bool, BoolOp};
+use crate::postings::roaring::{
+    drain_block_segment_to_roaring, record_cpu_fallback, try_gpu_bool, BoolOp,
+};
 use crate::query::roaring_materialised_scorer::RoaringMaterialisedScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
@@ -91,16 +93,19 @@ pub(crate) fn try_gpu_intersect(
     // Roaring drains drop term frequencies. If the caller wants BM25
     // contributions we cannot satisfy them; punt to CPU.
     if scoring_enabled {
+        record_cpu_fallback();
         return Err(must_scorers);
     }
 
     // ----- Gate 2: cohort size -----
     // try_gpu_bool itself returns None for < 2 terms (single-scorer
-    // queries don't need an intersection at all), and the planner
-    // gates on cohort-wide container counts that require ≥ 10
-    // containers to clear MIN_CONTAINERS. We early-out here for
-    // clarity; the planner is the authoritative gate below.
+    // queries don't need an intersection at all). The Wave 8 / A / 2
+    // planner gates on per-term cardinality (≥ 100 K), cohort-total
+    // doc-freq (≥ 1 M), and field-doc ratio (≥ 5 %) further down. We
+    // early-out here for clarity; the planner is the authoritative
+    // gate below.
     if must_scorers.len() < 2 {
+        record_cpu_fallback();
         return Err(must_scorers);
     }
 
@@ -114,6 +119,7 @@ pub(crate) fn try_gpu_intersect(
     // sizes the planner approves; leave it for Wave 8 if the bench
     // demands it.
     if !must_scorers.iter().all(|s| s.is::<TermScorer>()) {
+        record_cpu_fallback();
         return Err(must_scorers);
     }
 
@@ -140,6 +146,7 @@ pub(crate) fn try_gpu_intersect(
         })
         .collect();
     if !should_dispatch_gpu(&stats) {
+        record_cpu_fallback();
         return Err(must_scorers);
     }
 
@@ -307,7 +314,7 @@ mod tests {
     #[test]
     fn returns_err_when_planner_rejects_light_cohort() -> crate::Result<()> {
         // 3 short documents, 3-term cohort = light query, planner should
-        // reject (sub-MIN_CONTAINERS, sub-MIN_RATIO).
+        // reject (per-term doc_freq ≤ 3 « MIN_PER_TERM_CARDINALITY).
         let _g = COUNTER_LOCK.lock().unwrap();
         reset_dispatch_counters();
         let (index, text_field) =
@@ -347,24 +354,24 @@ mod tests {
     #[cfg(all(feature = "gpu", feature = "ferro-compress"))]
     #[test]
     fn heavy_cohort_dispatches_or_falls_back_cleanly() -> crate::Result<()> {
-        // Build an index with 1_000 docs, where 12 terms each appear
-        // in ≥ 70 % of docs. This pushes well past MIN_CONTAINERS and
-        // MIN_RATIO. The dispatch may still return None on a CI box
-        // without working wgpu, in which case the err arm fires
-        // cleanly.
+        // Build an index with 100_000 docs, where 12 terms each appear
+        // in 100 % of docs. This pushes well past Wave 8 / A / 2 gates
+        // (`MIN_PER_TERM_CARDINALITY = 100_000`, `MIN_COHORT_DOCS =
+        // 1_000_000`, `MIN_RATIO = 0.05`). The dispatch may still
+        // return None on a CI box without working wgpu, in which case
+        // the err arm fires cleanly.
         let _g = COUNTER_LOCK.lock().unwrap();
         reset_dispatch_counters();
 
-        // We need a synthetic term distribution. Each doc gets a fixed
-        // string with the same 12 high-frequency terms, so doc_freq ==
-        // num_docs for each. That gives field_doc_ratio = 1.0 (>>
-        // 5 %). Cardinality 1000 × 12 = 12 000 ids → 1000 < 65536, so
-        // each term has 1 estimated container, 12 terms × 1 = 12 ≥
-        // MIN_CONTAINERS = 10. Both gates clear.
-        let mut docs: Vec<String> = Vec::with_capacity(1000);
+        // Each doc gets a fixed string with the same 12 high-frequency
+        // terms, so doc_freq == num_docs for each. That gives
+        // field_doc_ratio = 1.0. doc_freq = 100_000 = MIN_PER_TERM
+        // boundary; cohort total = 1_200_000 > MIN_COHORT_DOCS. All
+        // three planner gates clear.
+        let mut docs: Vec<String> = Vec::with_capacity(100_000);
         let term_list: Vec<String> = (0..12).map(|i| format!("term{i}")).collect();
         let doc_text = term_list.join(" ");
-        for _ in 0..1000 {
+        for _ in 0..100_000 {
             docs.push(doc_text.clone());
         }
         let docs_refs: Vec<&str> = docs.iter().map(String::as_str).collect();

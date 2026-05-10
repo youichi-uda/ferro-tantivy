@@ -1,47 +1,77 @@
 //! GPU dispatch planner threshold for Bool queries — Phase 2 C-4
-//! (Wave 6).
+//! (Wave 6) / Phase 2 C-5 (Wave 8 / A / 2 raised threshold).
 //!
 //! ## Problem statement
 //!
 //! Roaring Bitmap container AND/OR/XOR on the GPU is a 22-38× win over
-//! AVX2 CPU at warm path on a 100-term Bool AND across 1 M-doc segments
-//! (`docs/phase2_c_gpu_roaring_design.md` § 3.2; `gpu/src/posting/
-//! bitmap_op.rs` measured numbers). At small N the GPU **loses**
-//! because the wgpu dispatch pipeline (~3 ms) dominates over the
-//! few-microsecond CPU galloping AVX2 path. A query planner that
-//! always dispatches to GPU regresses light-query latency by ~30×.
+//! AVX2 CPU at warm path on a **100-term × 1 M-docs/term** Bool AND
+//! across stopword-class cohorts (`docs/phase2_c_gpu_roaring_design.md`
+//! § 3.2; kernel-only numbers in
+//! `crates/ferro-compress/src/bin/bitmap_bench.rs` / `bc1f522`).
+//! At small N the GPU **loses** because the wgpu dispatch pipeline
+//! (~1-3 ms even with the `OnceLock` cache landed in Wave 8 / A / 1)
+//! dominates over the few-microsecond CPU galloping AVX2 path. A query
+//! planner that always dispatches to GPU regresses light-query latency
+//! by orders of magnitude.
 //!
-//! ## Threshold
+//! Wave 7 Plan 3 first-run on RTX 4070 Ti SUPER recorded 9 870-42 000 ×
+//! regressions on the 12-term × 1 000-doc bench fixtures because the
+//! Wave 6 thresholds (`MIN_CONTAINERS = 10`, `MIN_RATIO = 0.05`) were
+//! too permissive — 12 containers × 8 KiB = 96 KiB working set is
+//! 6 300 × below the design's 600 MiB win-zone. Wave 8 / A / 2 raises
+//! the gates so only stopword-class cohorts dispatch.
 //!
-//! Per the Phase 2 C design (§ 3.3 + § 5.2):
+//! ## Threshold (Wave 8 / A / 2)
 //!
-//! 1. **Container-count floor** (`MIN_CONTAINERS = 10`):
-//!    `total_postings_bits = sum_terms(doc_freq[t] / 65 536)` is the
-//!    estimated per-term Bitmap-container count. We dispatch to GPU
-//!    only when the *sum across terms* is ≥ 10.
-//! 2. **Field-doc-ratio floor** (`MIN_RATIO = 0.05`): the maximum
+//! Three conditions, all must hold:
+//!
+//! 1. **Per-term cardinality floor** (`MIN_PER_TERM_CARDINALITY = 100 000`):
+//!    every term's `doc_freq` must be ≥ 100 000. Because Bool-AND result
+//!    cardinality is bounded by the smallest term, a single small term
+//!    in the cohort caps the work the GPU has to do and cripples
+//!    amortisation. (For OR/XOR — added in later waves — this becomes a
+//!    cohort-wide max test instead.)
+//! 2. **Cohort-total floor** (`MIN_COHORT_DOCS = 1 000 000`): the sum
+//!    of per-term `doc_freq` must be ≥ 1 M. Defends against the "many
+//!    not-quite-100 K terms" case where each just barely passes the
+//!    per-term gate but the cohort total is still small enough that
+//!    AVX2 wins.
+//! 3. **Field-doc-ratio floor** (`MIN_RATIO = 0.05`): the maximum
 //!    `doc_freq / num_docs_in_segment` across the cohort must be at
-//!    least 5 %. This proxies "is at least one term high-cardinality
-//!    enough to live in Bitmap form" — sub-5 % terms are dominated
-//!    by Array containers (cardinality ≤ 4096) and the GPU bit-op
-//!    path doesn't help them.
+//!    least 5 %. Proxies "is at least one term high-cardinality enough
+//!    to live in Bitmap form" — sub-5 % terms are dominated by Array
+//!    containers (cardinality ≤ 4 096) and the GPU bit-op path doesn't
+//!    help them.
 //!
-//! Both conditions must hold. Either one failing routes to the legacy
-//! CPU galloping AVX2 path.
+//! Either condition failing routes to the legacy CPU galloping AVX2
+//! path.
 //!
-//! ## Why the AND of two conditions?
+//! ## Why three conditions?
 //!
-//! - 10 large containers × 1 % field ratio = 10 high-cardinality terms
-//!   on a tiny segment. The container count alone says "yes" but the
-//!   absolute term-doc work is small enough that the CPU AVX2 wins.
-//!   The ratio gate keeps us off-GPU.
-//! - 1 huge container × 90 % field ratio = single stopword on a
-//!   gigantic segment. Ratio says "yes" but a single bit-op is
-//!   trivially CPU-bound and the wgpu dispatch overhead loses. The
-//!   container-count gate keeps us off-GPU.
+//! - 100 small terms × 95 % field ratio = stopwords on a tiny segment.
+//!   Ratio passes, cohort total may pass, but per-term gate rejects
+//!   because each term is a few thousand docs.
+//! - 12 huge terms × 1 % field ratio = high-cardinality terms on a
+//!   gigantic segment. Per-term and cohort gates pass but the bit-op
+//!   doesn't help (most terms in Array form). Ratio gate keeps us off.
+//! - 1 huge term × 90 % field ratio = single stopword. Per-term passes
+//!   but cohort total = single term's doc_freq; need cohort minimum to
+//!   stay above the wgpu break-even.
 //!
-//! Both real-world query patterns are protected; only the genuine
-//! "many high-cardinality terms" cohort dispatches to GPU.
+//! All three production-relevant query patterns are protected; only the
+//! genuine "many high-cardinality terms across a substantial segment"
+//! cohort dispatches to GPU.
+//!
+//! ## Wave 6 → Wave 8 transition
+//!
+//! Wave 6 used `MIN_CONTAINERS = 10` (cohort estimated container count)
+//! plus the same `MIN_RATIO`. The container-count formulation conflates
+//! two distinct concerns (per-term work + cohort work) and admits
+//! 12 × 1 000-doc cohorts whose per-term work is too small. Wave 8 / A
+//! splits it into the per-term + cohort-total pair. The
+//! `estimated_containers` helper is retained for callers that still
+//! want the old metric (e.g. log instrumentation), but the dispatch
+//! decision no longer consults it.
 
 /// Per-term statistic the planner consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +87,9 @@ pub struct TermStat {
 
 impl TermStat {
     /// Estimated number of Roaring Bitmap containers this term
-    /// occupies = `ceil(doc_freq / 65_536)`. The Phase 2 C-4 dispatch
-    /// floor sums this across the cohort.
+    /// occupies = `ceil(doc_freq / 65_536)`. Retained from Wave 6 for
+    /// callers / instrumentation that still want the cohort container
+    /// count; the Wave 8 / A / 2 dispatch decision no longer uses it.
     #[inline]
     #[must_use]
     pub fn estimated_containers(self) -> u64 {
@@ -87,32 +118,62 @@ impl TermStat {
 /// bucket.
 const BUCKET_SIZE: u64 = 65_536;
 
-/// Minimum cohort-wide estimated container count for GPU dispatch.
-pub const MIN_CONTAINERS: u64 = 10;
+/// Minimum per-term `doc_freq` for GPU dispatch (Wave 8 / A / 2).
+///
+/// Below this, the term's posting list is small enough that the CPU
+/// galloping AVX2 path is cheaper than the wgpu dispatch overhead +
+/// drain + `RoaringMaterialisedScorer` wrap. Bool-AND result cardinality
+/// is bounded by the smallest term, so a single sub-threshold term in
+/// the cohort caps the work the GPU has to do and forfeits the
+/// amortisation that justified the dispatch.
+pub const MIN_PER_TERM_CARDINALITY: u32 = 100_000;
+
+/// Minimum cohort-wide total `doc_freq` for GPU dispatch (Wave 8 / A / 2).
+///
+/// Sum across all terms. Defends against the "many just-above-floor
+/// terms" case where each individual term passes the per-term gate
+/// but the cohort total is still small enough that AVX2 wins. Set so
+/// the GPU dispatch only fires when the work to be done is at least
+/// 1 M doc-id-comparisons across the cohort.
+pub const MIN_COHORT_DOCS: u64 = 1_000_000;
 
 /// Minimum maximum-per-term field-doc ratio for GPU dispatch.
+/// (Unchanged from Wave 6.)
 pub const MIN_RATIO: f32 = 0.05;
 
 /// Decide whether a Bool query cohort should dispatch to the GPU
 /// Roaring path.
 ///
-/// Returns `true` iff **both** thresholds hold:
+/// Returns `true` iff **all three** thresholds hold:
 ///
-/// - `sum(estimated_containers) >= MIN_CONTAINERS`, and
-/// - `max(field_doc_ratio) >= MIN_RATIO`.
+/// - every `term.doc_freq >= MIN_PER_TERM_CARDINALITY`,
+/// - `sum(term.doc_freq) >= MIN_COHORT_DOCS`, and
+/// - `max(term.field_doc_ratio()) >= MIN_RATIO`.
 ///
-/// Empty cohort → `false`. A single zero-frequency term in the cohort
-/// drops the cohort cardinality but doesn't auto-disable GPU — the
-/// other terms dominate.
+/// Empty cohort → `false`. A single zero-frequency or sub-floor term
+/// disables dispatch (consistent with Bool-AND semantics: the result
+/// is bounded by the smallest term).
 #[must_use]
 pub fn should_dispatch_gpu(terms: &[TermStat]) -> bool {
     if terms.is_empty() {
         return false;
     }
-    let total_containers: u64 = terms.iter().map(|t| t.estimated_containers()).sum();
-    if total_containers < MIN_CONTAINERS {
+    // Per-term cardinality gate: any term below the floor caps the
+    // AND result and forfeits amortisation. Bool-AND specific; Bool-OR
+    // (Wave 8.B+) will need a different reduction over per-term stats.
+    if terms
+        .iter()
+        .any(|t| t.doc_freq < MIN_PER_TERM_CARDINALITY)
+    {
         return false;
     }
+    // Cohort-total gate: cumulative doc-id comparisons must justify
+    // the wgpu pipeline cost.
+    let cohort_total: u64 = terms.iter().map(|t| u64::from(t.doc_freq)).sum();
+    if cohort_total < MIN_COHORT_DOCS {
+        return false;
+    }
+    // Field-doc-ratio gate: the densest term must be Bitmap-shaped.
     let max_ratio = terms
         .iter()
         .map(|t| t.field_doc_ratio())
@@ -132,7 +193,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------
-    // Boundary table from the C-4 spec.
+    // Boundary table for the Wave 8 / A / 2 threshold.
     // ------------------------------------------------------------
 
     #[test]
@@ -142,68 +203,76 @@ mod tests {
 
     #[test]
     fn three_terms_hundred_doc_segment_stays_cpu() {
-        // Spec example: 3-term × 100-doc cohort → false.
-        // Each term has doc_freq up to 100 → 0 containers each
-        // (100 < 65 536) → fails MIN_CONTAINERS gate immediately.
+        // 3-term × 100-doc cohort → false (per-term floor: 100 << 100K).
         let terms = [ts(100, 100), ts(50, 100), ts(80, 100)];
         assert!(!should_dispatch_gpu(&terms));
     }
 
     #[test]
     fn hundred_term_million_doc_high_cardinality_dispatches() {
-        // Spec example: 100-term × 1M-doc cohort with high cardinality
-        // → true.
+        // 100-term × 1M-doc cohort with high cardinality → true.
+        // doc_freq = 500 K > MIN_PER_TERM_CARDINALITY,
+        // cohort total = 50 M > MIN_COHORT_DOCS,
+        // ratio = 50 % > MIN_RATIO.
         let terms: Vec<TermStat> = (0..100).map(|_| ts(500_000, 1_000_000)).collect();
         assert!(should_dispatch_gpu(&terms));
     }
 
     #[test]
-    fn just_under_five_percent_ratio_stays_cpu() {
-        // Big container count BUT no term reaches 5% ratio → CPU.
-        // doc_freq = 49_500 / num_docs = 1_000_000 → 4.95 %.
-        // 100 terms × 49_500 = 4_950_000 ids → 100 estimated
-        // containers (>= MIN_CONTAINERS), but max ratio 4.95 % <
-        // 5 %.
-        let terms: Vec<TermStat> = (0..100).map(|_| ts(49_500, 1_000_000)).collect();
-        // Sanity: container count gate passes
-        let total_c: u64 = terms.iter().map(|t| t.estimated_containers()).sum();
-        assert!(total_c >= MIN_CONTAINERS, "expected >= {MIN_CONTAINERS} containers, got {total_c}");
-        // ... but ratio gate should fail.
+    fn just_under_per_term_cardinality_stays_cpu() {
+        // 100 terms × 99 999 doc_freq each → cohort total ~10 M (passes),
+        // ratio ~10 % (passes), BUT every term is one below the per-term
+        // floor → CPU.
+        let terms: Vec<TermStat> = (0..100).map(|_| ts(99_999, 1_000_000)).collect();
+        let cohort: u64 = terms.iter().map(|t| u64::from(t.doc_freq)).sum();
+        assert!(cohort >= MIN_COHORT_DOCS, "cohort total should clear");
         assert!(!should_dispatch_gpu(&terms));
     }
 
     #[test]
-    fn just_at_five_percent_ratio_with_min_containers_dispatches() {
-        // Just-at boundary: ratio = exactly 5 % AND container count
-        // >= MIN_CONTAINERS.
-        // 10 terms × 50_000 doc_freq / 1_000_000 = 5 % each.
-        // 10 × ceil(50_000/65_536) = 10 × 1 = 10 containers.
-        let terms: Vec<TermStat> = (0..10).map(|_| ts(50_000, 1_000_000)).collect();
-        let total_c: u64 = terms.iter().map(|t| t.estimated_containers()).sum();
-        assert_eq!(total_c, 10);
+    fn just_at_per_term_cardinality_with_cohort_passes() {
+        // Every term exactly at the per-term floor (= passes), small
+        // cohort that just clears MIN_COHORT_DOCS.
+        // 10 terms × 100 000 = 1 000 000 cohort total (= MIN_COHORT_DOCS).
+        // num_docs = 1 000 000 → ratio = 10 % > 5 %.
+        let terms: Vec<TermStat> = (0..10).map(|_| ts(100_000, 1_000_000)).collect();
+        let cohort: u64 = terms.iter().map(|t| u64::from(t.doc_freq)).sum();
+        assert_eq!(cohort, MIN_COHORT_DOCS);
         assert!(should_dispatch_gpu(&terms));
     }
 
     #[test]
-    fn just_at_ten_container_boundary_only_dispatches_with_ratio() {
-        // Just-at-10-container boundary → true ONLY if ratio also passes.
-        //
-        // 10 terms with doc_freq just over one Bitmap-bucket each, and
-        // a tiny segment so the ratio is huge.
-        let terms_high_ratio: Vec<TermStat> =
-            (0..10).map(|_| ts(65_536, 70_000)).collect();
-        let total_c: u64 = terms_high_ratio
-            .iter()
-            .map(|t| t.estimated_containers())
-            .sum();
-        assert_eq!(total_c, 10);
-        assert!(should_dispatch_gpu(&terms_high_ratio));
+    fn cohort_total_just_below_min_stays_cpu() {
+        // 9 terms × 100 000 = 900 000 cohort total (= MIN_COHORT_DOCS - 100 K).
+        // Per-term floor passes; cohort gate rejects.
+        let terms: Vec<TermStat> = (0..9).map(|_| ts(100_000, 1_000_000)).collect();
+        assert!(!should_dispatch_gpu(&terms));
+    }
 
-        // Same container count but ratio < 5 % → CPU.
-        let terms_low_ratio: Vec<TermStat> =
-            (0..10).map(|_| ts(65_536, 5_000_000)).collect();
-        // 65_536 / 5_000_000 = 1.31 % < 5 %.
-        assert!(!should_dispatch_gpu(&terms_low_ratio));
+    #[test]
+    fn just_under_five_percent_ratio_stays_cpu() {
+        // Per-term and cohort gates pass, but ratio < 5 % → CPU.
+        // 10 terms × 100 000 doc_freq, num_docs = 2 100 000 → 4.76 %.
+        let terms: Vec<TermStat> = (0..10).map(|_| ts(100_000, 2_100_000)).collect();
+        let max_ratio = terms
+            .iter()
+            .map(|t| t.field_doc_ratio())
+            .fold(0.0_f32, f32::max);
+        assert!(max_ratio < MIN_RATIO, "expected ratio < 5 % for sanity, got {max_ratio}");
+        assert!(!should_dispatch_gpu(&terms));
+    }
+
+    #[test]
+    fn at_five_percent_ratio_dispatches() {
+        // Just at the 5 % ratio gate with all other gates passing.
+        // 10 × 100 000 doc_freq / 2 000 000 = 5.0 %.
+        let terms: Vec<TermStat> = (0..10).map(|_| ts(100_000, 2_000_000)).collect();
+        let max_ratio = terms
+            .iter()
+            .map(|t| t.field_doc_ratio())
+            .fold(0.0_f32, f32::max);
+        assert!((max_ratio - 0.05).abs() < 1e-4);
+        assert!(should_dispatch_gpu(&terms));
     }
 
     // ------------------------------------------------------------
@@ -211,9 +280,8 @@ mod tests {
     // ------------------------------------------------------------
 
     #[test]
-    fn single_high_cardinality_term_below_container_floor_stays_cpu() {
-        // Stopword on a small segment: 1 term × 80 % ratio. Ratio gate
-        // passes but container gate fails (only 1 term, only 1 bucket).
+    fn single_high_cardinality_term_stays_cpu() {
+        // Single stopword → per-term passes, cohort = 1 × 50 000 < 1 M → CPU.
         let terms = [ts(50_000, 60_000)];
         assert!(!should_dispatch_gpu(&terms));
     }
@@ -221,33 +289,41 @@ mod tests {
     #[test]
     fn empty_segment_treated_as_zero_ratio() {
         // num_docs_in_segment = 0 → ratio clamped to 0 → CPU.
+        // (Per-term + cohort gates pass on the inputs.)
         let terms: Vec<TermStat> = (0..20).map(|_| ts(100_000, 0)).collect();
         assert!(!should_dispatch_gpu(&terms));
     }
 
     #[test]
     fn doc_freq_exceeding_segment_is_clamped() {
-        // Defensive: doc_freq > num_docs_in_segment gets clamped to
-        // ratio = 1.0 (which passes the 5 % gate). Container gate
-        // also passes here so dispatches.
+        // doc_freq > num_docs gets clamped to ratio = 1.0 (passes ratio).
+        // Per-term + cohort gates pass on the inputs.
         let terms: Vec<TermStat> = (0..20).map(|_| ts(2_000_000, 1_000_000)).collect();
         assert!(should_dispatch_gpu(&terms));
     }
 
     #[test]
-    fn zero_frequency_term_in_cohort_does_not_break_gate() {
-        // Zero-freq term contributes 0 containers + 0 ratio; other
-        // terms still drive the decision. 9 × 65_536 + 0 = 9
-        // containers — fails MIN_CONTAINERS = 10.
-        let mut terms: Vec<TermStat> = (0..9).map(|_| ts(65_536, 70_000)).collect();
-        terms.push(ts(0, 70_000));
+    fn zero_frequency_term_in_cohort_disables_dispatch() {
+        // Zero-freq term has doc_freq = 0 < MIN_PER_TERM_CARDINALITY →
+        // per-term gate rejects regardless of the rest.
+        let mut terms: Vec<TermStat> = (0..20).map(|_| ts(500_000, 1_000_000)).collect();
+        terms.push(ts(0, 1_000_000));
         assert!(!should_dispatch_gpu(&terms));
+    }
 
-        // Same cohort with one extra non-zero term → 10 containers,
-        // dispatch.
-        let mut terms2: Vec<TermStat> = (0..10).map(|_| ts(65_536, 70_000)).collect();
-        terms2.push(ts(0, 70_000));
-        assert!(should_dispatch_gpu(&terms2));
+    #[test]
+    fn min_per_term_cardinality_constant_matches_design() {
+        assert_eq!(MIN_PER_TERM_CARDINALITY, 100_000);
+    }
+
+    #[test]
+    fn min_cohort_docs_constant_matches_design() {
+        assert_eq!(MIN_COHORT_DOCS, 1_000_000);
+    }
+
+    #[test]
+    fn min_ratio_constant_unchanged_from_wave6() {
+        assert!((MIN_RATIO - 0.05).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -269,7 +345,6 @@ mod tests {
 
     #[test]
     fn field_doc_ratio_clamped_to_one() {
-        // doc_freq > num_docs is corruption; ratio clamped to 1.0.
         let stat = ts(1_500_000, 1_000_000);
         assert!((stat.field_doc_ratio() - 1.0).abs() < f32::EPSILON);
     }
@@ -278,16 +353,5 @@ mod tests {
     fn field_doc_ratio_zero_segment() {
         let stat = ts(100, 0);
         assert!(stat.field_doc_ratio().abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn min_containers_constant_matches_design_doc() {
-        // Pin the constant — design doc § 3.3 + § 5.2.
-        assert_eq!(MIN_CONTAINERS, 10);
-    }
-
-    #[test]
-    fn min_ratio_constant_matches_design_doc() {
-        assert!((MIN_RATIO - 0.05).abs() < f32::EPSILON);
     }
 }

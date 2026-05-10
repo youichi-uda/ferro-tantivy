@@ -204,6 +204,67 @@ For `["_tsid", "@timestamp"]` on a 343,000-doc segment:
 - Wave 16 estimate: 2-3 days end-to-end, gated on TSDB demand
   signal (no blocker for non-TSDB Wave 15 production)
 
+## Live-ingest monotonicity caveat
+
+**Wave 15 Phase H-2** physically reorders alive docs at merge time so
+the merged segment's doc-id sequence matches the index sort order.
+This works at the **segment-creation boundary only**:
+
+- Docs added between merges land in **flush order** (insertion order,
+  not sort order) within their fresh per-flush segment.
+- Each per-flush segment carries its own sort cursor (Phase A hook),
+  so cursor-aware queries still find the right docs — just walked
+  per-segment via the cursor instead of via doc-id-ascending iteration.
+- Once a merge runs over those small fresh segments, the merged output
+  **does** get the H-2 reorder and the existing
+  `SortByStaticFastValue` SIMD top-K filter naturally early-terminates.
+
+In other words: H-2's perf benefit is **post-merge only**.  Until a
+merge consolidates fresh segments, sort-by-indexed-field queries pay
+the per-segment cursor walk cost (slightly slower than the optimised
+WARM-cache + SIMD baseline, per the Phase G empirical finding) on the
+just-flushed shards.
+
+### Operator practice for sort-cursor production indices
+
+The recommended deployment pattern when you want maximum sort-query
+throughput:
+
+1. **Bulk-load + force-merge promotion.**  After a bulk write
+   completes (e.g. nightly ingest, snapshot restore, a reindex), call
+   `POST /<index>/_forcemerge?max_num_segments=1` once.  The forced
+   merge runs through Phase H-1 (cursor rebuild) + Phase H-2 (physical
+   reorder) and produces a single sorted segment from which subsequent
+   sort queries get the SIMD early-term win.
+2. **For continuous-write workloads** (logs, telemetry, append-only
+   streams): rely on `LogMergePolicy`'s background merges to
+   consolidate small segments.  Latest-arrival docs in fresh
+   un-consolidated segments still answer queries correctly, just at
+   the slightly slower per-segment cursor walk rate; the next
+   background merge restores monotonicity.
+3. **Mixed read-write workload tuning**: lower
+   `index.merge.policy.max_merged_segment` to encourage smaller
+   merged-segment caps, which pulls fresh docs into sorted layout
+   sooner (at the cost of more overall merge throughput).
+
+### Why H-2 doesn't sort at flush time
+
+Phase H-2's reorder lives in `IndexMerger::write` rather than
+`SegmentWriter::flush`:
+
+- Flush-time reorder (the "Alternative A pure" variant) requires
+  buffering ALL docs in RAM before writing — high memory pressure for
+  large per-flush ranges, and changes the latency profile of
+  `index_writer.commit()` non-trivially.
+- Merge-time reorder reuses the input segments' on-disk fast field
+  columns to build the sort permutation, with no extra memory ceiling
+  beyond the existing merger's working set.
+- ES IndexSortByField uses the flush-time pattern, which is why ES
+  achieves consistent sorted layout from doc 1; Wave 15 trades that
+  consistency for a smaller blast radius (no SegmentWriter rewrite,
+  no per-flush memory cap risk) at the cost of the post-merge-only
+  guarantee.
+
 ## What v1 deliberately omits
 
 - **Per-cursor checksum**: the leading + trailing magic and length

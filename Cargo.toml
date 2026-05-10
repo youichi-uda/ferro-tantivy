@@ -189,6 +189,28 @@ ferro-compress = ["dep:ferro-compress"]
 # feature is enabled at production build time.
 cuda-bitmap-kernel = ["gpu", "ferro-compress", "ferro-compress/nvcomp"]
 
+# Phase 2 E-2 — wire ferro-compress's CUDA stats reduction kernel
+# (PTX from `crates/ferro-compress/src/cuda_kernels/stats_op.cu`,
+# StatsOpKernel host wrapper) into the
+# `aggregation::metric::stats::SegmentStatsCollector` collect path.
+# NVIDIA only — when this feature is off the existing CPU Kahan
+# loop stays in place. Enabling pulls ferro-compress with `nvcomp`
+# so cudart + cuda driver libs link and the kernel PTX is built
+# into the binary via `include_bytes!`.
+#
+# E-1 kernel-only bench on RTX 4070 Ti SUPER (100 M `f32`
+# elements: GPU 156.9 G-elem/s = 584 GiB/s ≈ 73 % theoretical
+# bandwidth saturation, CPU 7.7 GiB/s single-thread = **75.6 ×
+# CPU win**) is the kernel ceiling. E-2 wires the production
+# query path so `stats` / `sum` / `min` / `max` / `avg` aggregations
+# on numeric fast fields can use it once cohort + column gates pass.
+# Honest limitation: kernel uses `f32` accumulation internally
+# (sum / sum_sq accumulated to `f64` host-side); ~1 % rel error at
+# 100 M-elem scale on the reduction sum. Acceptable for typical
+# stats agg use; callers who need stricter precision should keep
+# the feature off and use the existing Kahan CPU loop.
+cuda-stats-kernel = ["gpu", "ferro-compress", "ferro-compress/nvcomp"]
+
 [workspace]
 members = [
     "query-grammar",

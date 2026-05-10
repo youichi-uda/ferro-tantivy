@@ -19,6 +19,8 @@
 mod average;
 mod cardinality;
 mod count;
+#[cfg(feature = "cuda-stats-kernel")]
+pub(crate) mod cuda_stats_dispatch;
 mod extended_stats;
 mod max;
 mod min;

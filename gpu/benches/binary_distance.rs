@@ -848,6 +848,114 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
         println!("(N=1M tracking): double-buffer speedup = {s:.2}x serial");
     }
 
+    // ── Phase 5-3 head-to-head: BMMA inline-PTX vs cuBLASLt INT8 ──
+    println!();
+    println!("--- Phase 5-3 BMMA vs cuBLASLt INT8 (cold path) ---");
+    println!(
+        "{:<33}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "shape", "INT8", "BMMA", "INT8/BMMA", "match"
+    );
+    let bmma_shapes: &[(&str, usize, usize, usize)] = &[
+        ("dim=128  N=1024    Q=8   ", 1_024, 8, 128),
+        ("dim=256  N=10000   Q=8   ", 10_000, 8, 256),
+        ("dim=512  N=10000   Q=64  ", 10_000, 64, 512),
+        ("dim=768  N=10000   Q=64  ", 10_000, 64, 768),
+        ("dim=768  N=100000  Q=64  ", 100_000, 64, 768),
+        ("dim=1024 N=100000  Q=64  ", 100_000, 64, 1024),
+        ("dim=768  N=1000000 Q=64  ", 1_000_000, 64, 768),
+    ];
+    let mut bmma_json_rows: Vec<String> = Vec::new();
+    for &(label, num_vecs, num_queries, dim_bits) in bmma_shapes {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let queries = random_u32_vec(num_queries * dim_u32, 0xb1b1_b1b1_b1b1_b1b1);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0xa2a2_a2a2_a2a2_a2a2);
+
+        let int8_first = cuda
+            .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+            .expect("int8 batched");
+        let bmma_first = match cuda.compute_batched_bmma(
+            &queries,
+            &corpus,
+            num_queries,
+            num_vecs,
+            dim_bits,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                println!(
+                    "{:<32}  (skipped — BMMA unavailable: {e})",
+                    label
+                );
+                continue;
+            }
+        };
+        let matches = int8_first == bmma_first;
+        if !matches {
+            panic!("BMMA != INT8 on shape {label}");
+        }
+
+        let iters = if num_vecs >= 1_000_000 {
+            2
+        } else if num_vecs >= 100_000 {
+            3
+        } else {
+            5
+        };
+        let int8_time = bench(iters, || {
+            black_box(
+                cuda.compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("int8 batched"),
+            );
+        });
+        let bmma_time = bench(iters, || {
+            black_box(
+                cuda.compute_batched_bmma(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("bmma batched"),
+            );
+        });
+        let speedup = int8_time.as_nanos() as f64 / bmma_time.as_nanos().max(1) as f64;
+        println!(
+            "{:<33}  {:>10}  {:>10}  {:>7.2}x  {:>8}",
+            label,
+            fmt_dur(int8_time),
+            fmt_dur(bmma_time),
+            speedup,
+            if matches { "ok" } else { "DIVERGE" }
+        );
+        bmma_json_rows.push(format!(
+            "    {{\"shape\": \"{}\", \"num_queries\": {}, \"num_vecs\": {}, \"dim_bits\": {}, \
+             \"int8_ns\": {}, \"bmma_ns\": {}, \"speedup_int8_over_bmma\": {:.4}, \"byte_equal\": {}}}",
+            label.trim(),
+            num_queries,
+            num_vecs,
+            dim_bits,
+            int8_time.as_nanos(),
+            bmma_time.as_nanos(),
+            speedup,
+            matches
+        ));
+    }
+    let bmma_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("data")
+        .join("cuda_bmma_vs_int8.json");
+    let mut bmma_json = String::new();
+    bmma_json.push_str("{\n");
+    bmma_json.push_str(&format!("  \"backend\": \"{}\",\n", info.backend));
+    bmma_json.push_str(&format!(
+        "  \"device\": \"{}\",\n",
+        info.name.replace('"', "\\\"")
+    ));
+    bmma_json.push_str("  \"calling_pattern\": \"compute_batched (cuBLASLt INT8 IMMA) vs compute_batched_bmma (inline-PTX mma.sync.aligned.m8n8k128.b1.xor.popc, naive 1-warp-per-(8x8)-tile)\",\n");
+    bmma_json.push_str("  \"results\": [\n");
+    bmma_json.push_str(&bmma_json_rows.join(",\n"));
+    bmma_json.push_str("\n  ]\n}\n");
+    if let Err(e) = std::fs::write(&bmma_path, &bmma_json) {
+        eprintln!("failed to write {}: {e}", bmma_path.display());
+    } else {
+        println!("wrote {}", bmma_path.display());
+    }
+
     if let Some(s) = assert_speedup {
         let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
         if !assert_off {

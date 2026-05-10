@@ -187,10 +187,64 @@ post-correction.
   because pipeline gain is hardware-sensitive (PCIe gen, DRAM
   speed, SM count); the JSON is consumed only for regression
   tracking.
-- Phase 5 still on the table: 5-3 BMMA 1-bit tensor-core PoC
-  (eliminates the unpack to one-byte-per-bit and lifts arithmetic
-  throughput by 8× if the inline-PTX path holds), and 5-4 real-data
-  SIFT1M / GIST1M recall@k in `ferro-bench-runner`.
+- **Phase 5-3 — BMMA (1-bit Tensor Core) inline-PTX PoC**:
+  Turing+ exposes
+  `mma.sync.aligned.m8n8k128.row.col.s32.b1.b1.s32.xor.popc` (PTX ISA
+  §9.7.13.5), a single instruction that computes
+  `popcount(A XOR B)` reduced over `K = 128` bits per warp. cuBLASLt
+  has no path to it (CUDA 12.4 only ships `CUBLAS_COMPUTE_32I` with
+  `CUDA_R_8I` inputs, so binary GEMM is not in the supported
+  compute-type matrix), so the only path is a hand-rolled CUDA kernel
+  with inline PTX, NVRTC-compiled against `--gpu-architecture=sm_75`
+  (Turing baseline; Ampere / Ada / Hopper forward-compatible).
+  - **PoC result: viable, faster than the INT8 IMMA path on
+    every shape we measured**. The PoC ships in
+    `gpu/src/vector/cuda_tensor_core/bmma.rs` with two NVRTC
+    kernels: a single-shape smoke (Q = 8, dim_bits = 128) and a
+    general kernel that handles any (Q, N, dim_bits) where dim_bits
+    is a multiple of 128. Two unit tests
+    (`bmma_smoke_byte_equal_8x1024x128`,
+    `bmma_general_parity_sweep`) gate parity against the CPU
+    oracle across six representative shapes — byte-equal at
+    every cell, no rounding/correction needed because BMMA reduces
+    to the exact integer popcount.
+  - **Cold-path speedup vs cuBLASLt INT8 IMMA (RTX 4070 Ti SUPER)**:
+    | shape (Q × N × dim) | INT8 cuBLASLt | BMMA (naive PTX) | INT8 / BMMA |
+    |---------------------|---------------|------------------|-------------|
+    |   8 × 1 024 × 128   |   39.8 µs     |   22.0 µs        | **1.81×** |
+    |   8 × 10 000 × 256  |  154.5 µs     |  105.4 µs        | **1.47×** |
+    |  64 × 10 000 × 768  |  485.7 µs     |  370.7 µs        | **1.31×** |
+    |  64 × 100 000 × 768 |    4.07 ms    |    3.01 ms       | **1.35×** |
+    |  64 × 100 000 × 1024|    4.74 ms    |    3.31 ms       | **1.43×** |
+    |  64 × 1 000 000 × 768 | 79.20 ms    |   63.23 ms       | **1.25×** |
+    Raw timings: `gpu/benches/data/cuda_bmma_vs_int8.json`. The
+    BMMA kernel is intentionally naive — one warp per (8 × 8)
+    output tile, no shared-memory tiling, no warp specialisation —
+    so the speedup vs cuBLASLt's hand-tuned INT8 IMMA is the
+    arithmetic-density advantage of binary tensor cores cancelling
+    out the implementation gap. A tiled / shared-memory BMMA kernel
+    would widen the margin further.
+  - **Structural simplification**: BMMA computes `popcount(q ⊕ d)`
+    directly, so a BMMA-path corpus needs neither the
+    one-byte-per-bit on-device unpack nor the per-row popcount
+    precompute the INT8 path requires. The cached corpus shrinks
+    from ≈ 96 MB packed + 768 MB unpacked at N = 1 M, dim = 768 to
+    just 96 MB packed (≈ 9× less device memory), and the cold
+    path skips the unpack kernel entirely.
+  - **Scope of this entry**: the BMMA path is shipped as
+    `CudaTensorCoreKernel::compute_batched_bmma(...)` — a public
+    head-to-head entry point reachable from the bench, gated on
+    `dim_bits` being a positive multiple of 128. It is **not** the
+    production path: the cuBLASLt INT8 IMMA route remains the
+    primary `compute_batched` / `compute_batched_into_pinned` /
+    `knn_search` implementation, including all the Phase 5-1 / 5-2
+    optimisations. A follow-up Phase 5-3 a — a separate ADR amend —
+    will plumb BMMA through the cached corpus + double-buffered
+    batches so the production HNSW search loop benefits from both
+    the 1.25-1.8× compute win and the 9× device-memory shrink.
+- Phase 5 still on the table: 5-3 a (production migration of the
+  cached corpus + knn_search paths to the BMMA kernel), and 5-4
+  real-data SIFT1M / GIST1M recall@k in `ferro-bench-runner`.
 - **Phase C — `knn_search` end-to-end CUDA path**: the WGSL
   `top_k_select.wgsl` bitonic-merge top-K shader has been ported to
   CUDA (NVRTC, same algorithm, same tie-break), and

@@ -52,11 +52,12 @@
 //! dimensions return `CpuFallback` so the caller can chunk or use the
 //! single-query kernel.
 
+mod bmma;
 mod kernel;
 mod pinned;
 mod popcount;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::error::{GpuError, GpuResult};
 use kernel::{CachedCorpus, CudaGemmRunner};
@@ -75,6 +76,10 @@ use popcount::popcount_per_vec;
 /// Apple / Intel / containers without GPU passthrough.
 pub struct CudaTensorCoreKernel {
     inner: Arc<CudaGemmRunner>,
+    // Phase 5-3 — BMMA NVRTC kernels, built lazily on first
+    // `compute_batched_bmma` call so the regular INT8 path doesn't
+    // pay the extra NVRTC compile cost when BMMA isn't used.
+    bmma_kernels: OnceLock<bmma::BmmaKernels>,
 }
 
 impl CudaTensorCoreKernel {
@@ -87,6 +92,7 @@ impl CudaTensorCoreKernel {
         let inner = CudaGemmRunner::try_new()?;
         Ok(Self {
             inner: Arc::new(inner),
+            bmma_kernels: OnceLock::new(),
         })
     }
 
@@ -206,6 +212,52 @@ impl CudaTensorCoreKernel {
     /// matrix) compared with the pageable `Vec<u32>` API.
     pub fn alloc_pinned_u32(&self, len: usize) -> GpuResult<PinnedU32Buffer> {
         PinnedU32Buffer::new(self.inner.ctx(), len)
+    }
+
+    /// **Phase 5-3 head-to-head bench entry point.** Compute the
+    /// batched Hamming-distance matrix using the BMMA `mma.sync`
+    /// (1-bit Tensor Core) inline-PTX kernel instead of the
+    /// production cuBLASLt INT8 IMMA path. Returns
+    /// `GpuError::CpuFallback` when `dim_bits` is not a positive
+    /// multiple of 128 (the minimum K-tile of the BMMA instruction)
+    /// or when NVRTC can't build the inline-PTX kernel.
+    ///
+    /// Bit-equivalence to the INT8 path is asserted by the
+    /// `bmma_general_parity_sweep` unit test; the bench harness
+    /// times this method against [`Self::compute_batched`] to decide
+    /// whether the BMMA kernel is competitive enough to migrate the
+    /// production path. See `docs/ADR-001-cuda-backend.md`
+    /// §Phase 5-3.
+    pub fn compute_batched_bmma(
+        &self,
+        queries_bits: &[u32],
+        corpus_bits: &[u32],
+        num_queries: usize,
+        num_vecs: usize,
+        dim_bits: usize,
+    ) -> GpuResult<Vec<u32>> {
+        if num_queries == 0 || num_vecs == 0 || dim_bits == 0 {
+            return Ok(Vec::new());
+        }
+        let kernels = match self.bmma_kernels.get() {
+            Some(k) => k,
+            None => {
+                let built = bmma::build_kernels(self.inner.ctx())?;
+                let _ = self.bmma_kernels.set(built);
+                self.bmma_kernels
+                    .get()
+                    .expect("bmma kernels just set")
+            }
+        };
+        bmma::compute_batched_bmma(
+            kernels,
+            self.inner.stream(),
+            queries_bits,
+            corpus_bits,
+            num_queries,
+            num_vecs,
+            dim_bits,
+        )
     }
 }
 

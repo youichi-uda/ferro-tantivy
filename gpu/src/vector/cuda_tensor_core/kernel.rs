@@ -326,6 +326,13 @@ impl CudaGemmRunner {
         &self.ctx
     }
 
+    /// Borrow of the runner's default CUDA stream. Used by the
+    /// Phase 5-3 BMMA dispatch in the parent module so the BMMA
+    /// kernel runs on the same ordering as the cuBLASLt INT8 path.
+    pub(super) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     /// Upload bit-packed `inputs` (M rows × dim_u32 words), unpack to
     /// one `i8` per bit on the device, and return the unpacked
     /// `M × dim_bits` row-major `i8` slice on device. Used as a shared

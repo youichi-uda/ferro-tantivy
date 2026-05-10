@@ -7,7 +7,7 @@
     "cuda_pinned_ns": "compute_batched_into_pinned (Phase 5-1 — direct pinned DMA, no host memcpy)"
   },
   "results": [
-    {"shape": "dim=768  N=100000  Q=64", "num_queries": 64, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 22902619, "cuda_cached_ns": 2483038, "cuda_pinned_ns": 2393743, "cached_speedup": 9.2236, "pinned_speedup": 9.5677, "byte_equal": true},
-    {"shape": "dim=768  N=1000000 Q=64", "num_queries": 64, "num_vecs": 1000000, "dim_bits": 768, "wgsl_ns": 206096617, "cuda_cached_ns": 65319855, "cuda_pinned_ns": 26882412, "cached_speedup": 3.1552, "pinned_speedup": 7.6666, "byte_equal": true}
+    {"shape": "dim=768  N=100000  Q=64", "num_queries": 64, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 23190594, "cuda_cached_ns": 2533181, "cuda_pinned_ns": 2462223, "cached_speedup": 9.1547, "pinned_speedup": 9.4186, "byte_equal": true},
+    {"shape": "dim=768  N=1000000 Q=64", "num_queries": 64, "num_vecs": 1000000, "dim_bits": 768, "wgsl_ns": 205153864, "cuda_cached_ns": 60510666, "cuda_pinned_ns": 26848524, "cached_speedup": 3.3904, "pinned_speedup": 7.6412, "byte_equal": true}
   ]
 }

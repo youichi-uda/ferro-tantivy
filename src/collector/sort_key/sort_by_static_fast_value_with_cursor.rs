@@ -70,10 +70,16 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValueWithCursor<T> {
             sort_column_opt.ok_or_else(|| FastFieldNotAvailableError {
                 field_name: self.field.clone(),
             })?;
-        // See `SortByStaticFastValue`'s notes — pre-decoding the column once
-        // per segment turns the inner `first(doc)` read into O(1) Vec
-        // indexing.
-        let warm_first_vals = warm_first_values(&sort_column);
+        // **Wave 19.** Share the segment-level warm cache populated on
+        // first access; see `SortByStaticFastValue` for the contract.
+        // Eliminates the per-query alloc that previously gated the warm
+        // path at `WARM_FIRST_VALS_MAX_DOCS = 256 K` docs and unlocks
+        // the SIMD cursor+top-K filter (added in this Wave) on Rally
+        // `asc_sort_with_after_timestamp`-class workloads at any
+        // segment size.
+        let warm_first_vals = segment_reader
+            .warm_fast_field_dense_u64(&self.field, &sort_column)
+            .or_else(|| warm_first_values(&sort_column).map(std::sync::Arc::new));
         Ok(SortByFastValueWithCursorSegmentComputer {
             sort_column,
             warm_first_vals,
@@ -86,7 +92,10 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValueWithCursor<T> {
 
 pub struct SortByFastValueWithCursorSegmentComputer<T> {
     sort_column: Column<u64>,
-    warm_first_vals: Option<Box<[u64]>>,
+    /// **Wave 19.** Shared segment-lifetime warm cache; see
+    /// [`SortByFastValueSegmentSortKeyComputer::warm_first_vals`] for
+    /// the contract.
+    warm_first_vals: Option<std::sync::Arc<Box<[u64]>>>,
     order: Order,
     cursor_u64: u64,
     typ: PhantomData<T>,
@@ -154,6 +163,18 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueWithCursorSegmentCo
     /// Block-mode read: see `SortByFastValueSegmentSortKeyComputer` for the
     /// rationale.  Uses `Column::first_vals` to batch-decode the doc block
     /// when no warm cache is available.
+    ///
+    /// **Wave 19 — SIMD double-filter (cursor + top-K).**  When the warm
+    /// cache covers the block, the block is contiguous (`docs[i] == docs[0]
+    /// + i`, the AllQuery / match_all / range-scan case), and `n >= 16`,
+    /// we run NEON / AVX2 filters against both the cursor bound and the
+    /// current top-K threshold and bitwise-AND the survivor masks before
+    /// pushing.  This is the lever that closes the Rally http_logs
+    /// `asc_sort_with_after_timestamp` p99 gap vs ES 9.3.x (asc
+    /// + `search_after`, `match_all`, `track_total_hits: false`): the
+    /// cursor narrows the range and the top-K filter prunes everything
+    /// outside the survivor window — equivalent to Lucene's
+    /// `BoundedSortedNumericDocValuesRangeQuery` short-circuit.
     #[inline]
     fn compute_block_sort_keys_and_collect<C: Comparator<Self::SegmentSortKey>>(
         &mut self,
@@ -161,6 +182,64 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueWithCursorSegmentCo
         top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
     ) {
         if let Some(buf) = self.warm_first_vals.as_ref() {
+            // ── Wave 19 SIMD double-filter ─────────────────────────────
+            let n = docs.len();
+            if n >= 16 && super::simd_top_k::is_contiguous_block(docs) {
+                let start = docs[0] as usize;
+                if start + n <= buf.len() {
+                    let slice = &buf[start..start + n];
+                    let docs_start = docs[0];
+                    // Cursor pass: keep docs that strictly pass the cursor.
+                    let cursor_mask = match self.order {
+                        Order::Desc => {
+                            super::simd_top_k::simd_filter_block_lt_u64(slice, self.cursor_u64, n)
+                        }
+                        Order::Asc => {
+                            super::simd_top_k::simd_filter_block_gt_u64(slice, self.cursor_u64, n)
+                        }
+                    };
+                    if cursor_mask == 0 {
+                        return;
+                    }
+                    let mut survivors = cursor_mask;
+                    // Top-K pass: AND in the heap-threshold filter when
+                    // the heap is full.  `unwrap_threshold` returns
+                    // `None` while the heap is still filling up; we then
+                    // skip the top-K filter and push every cursor
+                    // survivor so the heap can warm.
+                    if let Some(top_threshold) =
+                        super::simd_top_k::unwrap_threshold(&top_n_computer.threshold)
+                    {
+                        let topk_mask = match self.order {
+                            Order::Desc => super::simd_top_k::simd_filter_block_gt_u64(
+                                slice,
+                                top_threshold,
+                                n,
+                            ),
+                            Order::Asc => super::simd_top_k::simd_filter_block_lt_u64(
+                                slice,
+                                top_threshold,
+                                n,
+                            ),
+                        };
+                        survivors &= topk_mask;
+                        if survivors == 0 {
+                            return;
+                        }
+                    }
+                    let mut m = survivors;
+                    while m != 0 {
+                        let i = m.trailing_zeros() as usize;
+                        m &= m - 1;
+                        let val = slice[i];
+                        let doc = docs_start + i as u32;
+                        top_n_computer.push(Some(val), doc);
+                    }
+                    return;
+                }
+            }
+            // ── Scalar warm path (non-contiguous block, n < 16, or
+            // start+n out of bounds).
             for &doc in docs {
                 // SAFETY: doc < num_docs == buf.len() (see `first_value`).
                 let val = unsafe {

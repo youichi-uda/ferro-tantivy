@@ -66,6 +66,17 @@ pub struct SegmentReader {
     /// the on-disk file's version byte is peeked at open time to route
     /// each cursor to the correct map.
     sort_cursors_v2: Arc<HashMap<String, Arc<SortCursorIndexV2>>>,
+    /// **FerroSearch Wave 19.** Lazily-populated per-field warm cache of
+    /// dense single-valued numeric fast-field values, keyed by field
+    /// name. First call decodes the column into a contiguous
+    /// `Box<[u64]>` (Lucene "doc-values warm"); subsequent calls return
+    /// the cached `Arc` in O(1). Shared across all queries for the
+    /// lifetime of the segment reader, eliminating the per-query
+    /// alloc+decode cost that capped the previous (per-collector) warm
+    /// cache at `WARM_FIRST_VALS_MAX_DOCS = 256 K` docs.  Only
+    /// `ColumnIndex::Full` columns are cached; optional / multivalued
+    /// columns keep the streaming `Column::first` path.
+    warm_fast_field_cache: Arc<RwLock<FnvHashMap<String, Arc<Box<[u64]>>>>>,
 }
 
 impl SegmentReader {
@@ -281,7 +292,56 @@ impl SegmentReader {
             schema,
             sort_cursors: Arc::new(sort_cursors),
             sort_cursors_v2: Arc::new(sort_cursors_v2),
+            warm_fast_field_cache: Arc::new(RwLock::new(FnvHashMap::default())),
         })
+    }
+
+    /// **FerroSearch Wave 19.** Returns a shared, dense warm cache for
+    /// the given single-valued `Column<u64>`, populating it on first
+    /// access.  Returns `None` for `Optional` / `Multivalued` columns
+    /// or empty columns; the doc→row mapping makes a flat `Vec<u64>`
+    /// invalid for those.
+    ///
+    /// The cache lives for the lifetime of this `SegmentReader`, so
+    /// every collector against the segment shares one decoded buffer
+    /// and the per-collector decode cost (the old Wave 8
+    /// `warm_first_values`) is paid only once per (segment, field).
+    ///
+    /// Memory: `num_docs × 8 bytes` per cached field per segment.
+    pub fn warm_fast_field_dense_u64(
+        &self,
+        field_name: &str,
+        column: &columnar::Column<u64>,
+    ) -> Option<Arc<Box<[u64]>>> {
+        use columnar::ColumnIndex;
+        if !matches!(column.index, ColumnIndex::Full) {
+            return None;
+        }
+        if let Some(hit) = self
+            .warm_fast_field_cache
+            .read()
+            .expect("warm_fast_field_cache lock poisoned")
+            .get(field_name)
+            .cloned()
+        {
+            return Some(hit);
+        }
+        let mut write = self
+            .warm_fast_field_cache
+            .write()
+            .expect("warm_fast_field_cache lock poisoned");
+        if let Some(hit) = write.get(field_name).cloned() {
+            return Some(hit);
+        }
+        let num_docs = column.num_docs() as usize;
+        if num_docs == 0 {
+            return None;
+        }
+        let mut buf = vec![0u64; num_docs];
+        column.values.get_range(0, &mut buf);
+        let arc: Arc<Box<[u64]>> = Arc::new(buf.into_boxed_slice());
+        write.insert(field_name.to_string(), arc.clone());
+        Some(arc)
     }
 
     /// **FerroSearch extension (Wave 15).** Returns the auxiliary sort

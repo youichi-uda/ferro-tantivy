@@ -91,6 +91,42 @@ impl TermScorer {
     pub fn last_doc_in_block(&self) -> DocId {
         self.postings.block_cursor.skip_reader().last_doc_in_block()
     }
+
+    /// Borrow the underlying [`SegmentPostings`].
+    ///
+    /// Used by the Wave 7 / Plan 2 GPU Bool-AND dispatch helper
+    /// ([`crate::query::boolean_query`] internals) to drain a cohort
+    /// of [`TermScorer`]s into [`crate::postings::roaring::RoaringPostings`]
+    /// before invoking [`crate::postings::roaring::try_gpu_bool`]. Gated
+    /// behind `cfg(any(feature = "gpu", test))` so the adapter surface
+    /// only exists when it can be exercised — production builds that
+    /// disable the `gpu` feature don't pay for the visibility leak.
+    ///
+    /// `allow(dead_code)` exists because Wave 7/Plan2 lands the
+    /// accessor in commit 2 and consumes it in commit 3; until commit
+    /// 3 the lint would fail clippy `-D warnings`. Removed when
+    /// `gpu_intersect.rs` lands.
+    #[cfg(any(feature = "gpu", test))]
+    #[allow(dead_code)]
+    #[inline]
+    #[must_use]
+    pub(crate) fn segment_postings(&self) -> &SegmentPostings {
+        &self.postings
+    }
+
+    /// Mutable borrow of the underlying [`SegmentPostings`].
+    ///
+    /// The drain bridge ([`crate::postings::roaring::drain_block_segment_to_roaring`])
+    /// consumes its `BlockSegmentPostings` by `&mut`, so the GPU
+    /// dispatch helper needs a `&mut SegmentPostings` to clone the
+    /// underlying cursor before draining. Same gating as
+    /// [`Self::segment_postings`].
+    #[cfg(any(feature = "gpu", test))]
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn segment_postings_mut(&mut self) -> &mut SegmentPostings {
+        &mut self.postings
+    }
 }
 
 impl DocSet for TermScorer {

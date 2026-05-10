@@ -112,8 +112,18 @@ impl Segment {
     /// Opens the auxiliary sort cursor file for `field` for writing.
     ///
     /// **FerroSearch extension (Wave 15).**
+    ///
+    /// Marks the cursor path as "pending publication" via
+    /// [`Directory::mark_pending`] before opening — see the Wave 15
+    /// Phase H-6 root-cause notes on [`Directory::mark_pending`] for
+    /// the GC race this guards against.  Callers must pair this with
+    /// a `release_pending` after the owning `SegmentMeta` has been
+    /// added to the segment manager (the segment-updater pool handles
+    /// this in `schedule_add_segment` and `end_merge`).
     pub fn open_sort_cursor_write(&mut self, field: &str) -> Result<WritePtr, OpenWriteError> {
         let path = self.meta.sort_cursor_path(field);
-        self.index.directory_mut().open_write(&path)
+        let directory = self.index.directory_mut();
+        directory.mark_pending(&path);
+        directory.open_write(&path)
     }
 }

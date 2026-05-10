@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use super::operation::{AddOperation, UserOperation};
 use super::segment_updater::SegmentUpdater;
 use super::{AddBatch, AddBatchReceiver, AddBatchSender, PreparedCommit};
-use crate::directory::{DirectoryLock, GarbageCollectionResult, TerminatingWrite};
+use crate::directory::{Directory, DirectoryLock, GarbageCollectionResult, TerminatingWrite};
 use crate::error::TantivyError;
 use crate::fastfield::write_alive_bitset;
 use crate::index::{
@@ -655,6 +655,7 @@ impl<D: Document> IndexWriter<D> {
         let original_entries = segment_manager.committed_segment_entries();
 
         let mut updated_entries: Vec<SegmentEntry> = Vec::with_capacity(original_entries.len());
+        let mut newly_advertised_paths: Vec<std::path::PathBuf> = Vec::new();
         let mut backfilled_count: usize = 0;
 
         for entry in &original_entries {
@@ -691,6 +692,11 @@ impl<D: Document> IndexWriter<D> {
             let mut all_cursor_fields: Vec<String> = meta.sort_cursor_fields().to_vec();
             all_cursor_fields.push(primary_field.clone());
             let new_meta = meta.clone().with_sort_cursor_fields(all_cursor_fields);
+            // Wave 15 Phase H-6 GC fix: track the cursor path that
+            // `build_and_write_sort_cursor_v2_for` just marked pending
+            // via `open_sort_cursor_write`, so we can release it once
+            // the segment manager publishes the updated meta below.
+            newly_advertised_paths.push(new_meta.sort_cursor_path(&primary_field));
 
             let mut new_entry = entry.clone();
             new_entry.set_meta(new_meta);
@@ -703,6 +709,13 @@ impl<D: Document> IndexWriter<D> {
         }
 
         segment_manager.commit(updated_entries);
+        // Wave 15 Phase H-6 GC fix: the committed register now exposes
+        // the new cursor paths via `list_files`, so the pending marks
+        // are pure cleanup.
+        let directory = self.index.directory();
+        for path in &newly_advertised_paths {
+            directory.release_pending(path);
+        }
         let opstamp = self.committed_opstamp;
         self.segment_updater().save_metas(opstamp, None)?;
         Ok(backfilled_count)
@@ -713,6 +726,7 @@ impl<D: Document> IndexWriter<D> {
         let original_entries = segment_manager.committed_segment_entries();
 
         let mut updated_entries: Vec<SegmentEntry> = Vec::with_capacity(original_entries.len());
+        let mut newly_advertised_paths: Vec<std::path::PathBuf> = Vec::new();
         let mut backfilled_count: usize = 0;
 
         for entry in &original_entries {
@@ -752,6 +766,11 @@ impl<D: Document> IndexWriter<D> {
             let mut all_cursor_fields: Vec<String> = meta.sort_cursor_fields().to_vec();
             all_cursor_fields.push(field.to_string());
             let new_meta = meta.clone().with_sort_cursor_fields(all_cursor_fields);
+            // Wave 15 Phase H-6 GC fix: track the cursor path that
+            // `build_and_write_sort_cursor_for` just marked pending
+            // via `open_sort_cursor_write` so the release call below
+            // can match it after the segment manager commits.
+            newly_advertised_paths.push(new_meta.sort_cursor_path(field));
 
             // Clone the existing entry to keep the same delete_cursor
             // and alive_bitset, then swap in the updated meta.  This
@@ -778,6 +797,13 @@ impl<D: Document> IndexWriter<D> {
         // index's stamper / search-after cursor semantics remain
         // consistent with the existing committed state.
         segment_manager.commit(updated_entries);
+        // Wave 15 Phase H-6 GC fix: now that list_files covers the
+        // new cursor paths via the committed register, release the
+        // pending marks set by `open_sort_cursor_write`.
+        let directory = self.index.directory();
+        for path in &newly_advertised_paths {
+            directory.release_pending(path);
+        }
         let opstamp = self.committed_opstamp;
         self.segment_updater().save_metas(opstamp, None)?;
         Ok(backfilled_count)

@@ -82,6 +82,26 @@ fn garbage_collect_files(
         .garbage_collect(move || segment_updater.list_files())
 }
 
+/// FerroSearch Wave 15 Phase H-6: releases the pending-publication
+/// marks on all sort cursor files advertised by `segment_meta`.
+///
+/// Invoked from `schedule_add_segment` and `end_merge` on the
+/// segment-updater pool, immediately before the segment is added to
+/// `SegmentManager` — at that point `list_files` starts covering the
+/// cursor paths, so the pending set is only needed for the gap
+/// between `open_sort_cursor_write` and this call.
+fn release_sort_cursor_pending(segment_updater: &SegmentUpdater, segment_meta: &SegmentMeta) {
+    let cursor_fields = segment_meta.sort_cursor_fields();
+    if cursor_fields.is_empty() {
+        return;
+    }
+    let directory = segment_updater.index.directory();
+    for field in cursor_fields {
+        let path = segment_meta.sort_cursor_path(field);
+        directory.release_pending(&path);
+    }
+}
+
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
 /// This function happens in the calling thread and is computationally expensive.
 fn merge(
@@ -426,6 +446,14 @@ impl SegmentUpdater {
     pub fn schedule_add_segment(&self, segment_entry: SegmentEntry) -> FutureResult<()> {
         let segment_updater = self.clone();
         self.schedule_task(move || {
+            // FerroSearch Wave 15 Phase H-6: release the cursor-file
+            // pending-publication marks BEFORE add_segment publishes
+            // the meta.  Once `segment_manager.add_segment` returns
+            // the cursor paths are covered by `list_files` and the
+            // pending set is purely cleanup.  Releasing first keeps
+            // the lock-acquisition order simple (no nested locks
+            // between segment_manager and the managed directory).
+            release_sort_cursor_pending(&segment_updater, segment_entry.meta());
             segment_updater.segment_manager.add_segment(segment_entry);
             segment_updater.consider_merge_options();
             Ok(())
@@ -815,6 +843,15 @@ impl SegmentUpdater {
                     }
                 }
                 let previous_metas = segment_updater.load_meta();
+                // FerroSearch Wave 15 Phase H-6: release pending marks
+                // on the merged segment's cursor files before the
+                // segment manager publishes the new SegmentMeta.
+                // After `segment_manager.end_merge` the merged segment
+                // is in the committed list, so `list_files` covers
+                // these paths going forward.
+                if let Some(after_entry) = after_merge_segment_entry.as_ref() {
+                    release_sort_cursor_pending(&segment_updater, after_entry.meta());
+                }
                 let segments_status = segment_updater
                     .segment_manager
                     .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)?;

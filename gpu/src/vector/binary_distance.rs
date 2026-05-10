@@ -601,6 +601,26 @@ impl BinaryDistanceKernel {
             });
         }
 
+        // CUDA Tensor Core fast path. Bit-equivalent to the WGSL
+        // pipeline below: same popcount-identity GEMM, same bitonic
+        // top-K (CUDA port preserves the WGSL tie-break rule "lower id
+        // wins at equal distance"). Falls through to WGSL on
+        // `CpuFallback`; any other error propagates.
+        #[cfg(feature = "cuda-tensor-core")]
+        if let Some(ref cuda) = self.cuda_kernel {
+            match cuda.knn_search(
+                queries_bits, corpus_bits, num_queries, num_vecs, dim_bits, k_eff,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(GpuError::CpuFallback { reason }) => {
+                    log::debug!(
+                        "knn_search: CUDA path skipped (Q={num_queries}, N={num_vecs}, dim_bits={dim_bits}, k={k_eff}): {reason}; falling back to WGSL"
+                    );
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
         // ── Stage 1: batched distance matrix ──
         let queries_buf = GpuBuffer::new::<u32>(
             &self.ctx,

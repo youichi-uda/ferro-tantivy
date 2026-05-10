@@ -109,22 +109,53 @@ post-correction.
   | 64 × 100 000 × 768 (assertion gate) | 28.59 ms | 4.22 ms | **6.77×** |
   | 64 × 1 000 000 × 768 (tracking)     | 252.94 ms | 89.35 ms | 2.83× |
   Raw timings live in `gpu/benches/data/cuda_vs_wgsl.json`.
-- The N = 1 M shape comes in below 3×. Profile breakdown: corpus PCIe
-  upload (96 MB) ~6 ms + on-device unpack ~1 ms + INT8 GEMM ~10 ms +
-  correction ~1 ms + result PCIe download (256 MB) ~21 ms ≈ 40 ms — the
-  remaining ≈50 ms is serial-stream overhead and pageable-host transfer
-  cost. The Wave 4 reference (8.3 GP/s) was measured with a
-  **device-resident corpus**, i.e. without the upload leg. To recover
-  the full 6-7× at the N = 1 M shape we need a Phase 4 follow-up:
-  - Cache `corpus_bits_dev` and the unpacked `i8` corpus on device
-    between successive `compute_batched` calls (keyed on a corpus
-    fingerprint or an explicit `with_cached_corpus(...)` API).
-  - Pinned host memory for the result download.
-  - Async stream + double-buffered upload so the next call's upload
-    overlaps the previous call's GEMM.
-  This is not on the Phase 1 critical path; the Phase 1 deliverable is
-  bit-exact parity + ≥ 3× speedup at the production segment shape, both
-  of which the Phase 1 implementation meets.
+- The N = 1 M shape comes in below 3× on the **cold** path (re-uploads
+  the corpus on every call). Profile breakdown for the cold call:
+  corpus PCIe upload (96 MB) ~6 ms + on-device unpack ~1 ms + INT8
+  GEMM ~10 ms + correction ~1 ms + result PCIe download (256 MB)
+  ~21 ms ≈ 40 ms — the remaining ≈40 ms is serial-stream overhead and
+  pageable-host transfer cost. Wave 4's 8.3 GP/s reference assumed a
+  **device-resident corpus**, which is the natural production calling
+  pattern (BBQ corpora are immutable per Tantivy segment).
+- **Phase 4 — `CudaTensorCoreKernel::prepare_corpus` + `CudaBinaryCorpus::compute_batched`**:
+  the corpus is uploaded + unpacked + popcount-summed once and held
+  on the device until the handle is dropped. Each subsequent query
+  batch only pays the (small) query upload + result download. Measured
+  on RTX 4070 Ti SUPER:
+  | shape (Q × N × dim) | WGSL | CUDA cold | CUDA cached | cached / WGSL |
+  |---------------------|------|-----------|-------------|---------------|
+  | 64 × 100 000 × 768  | 22.7 ms | 4.10 ms | 2.29 ms | **9.89×** |
+  | 64 × 1 000 000 × 768 | 211.0 ms | 77.9 ms | 60.6 ms | **3.48×** |
+  Raw timings: `gpu/benches/data/cuda_cached_vs_wgsl.json`. The cached
+  path now clears the 3× Go threshold at the N = 1 M shape.
+- Remaining headroom on the cached N = 1 M path (60 ms vs the Wave 4
+  reference's ≈8 ms compute envelope) is dominated by the 256 MB
+  result download (~21 ms) and serial-stream overhead. Phase 5
+  follow-ups when needed: pinned host memory for the result download,
+  async stream + double buffering for query upload, and a fused
+  `compute_batched + top_k` kernel that ships only `Q × K × 8 B` back.
+- **Phase C — `knn_search` end-to-end CUDA path**: the WGSL
+  `top_k_select.wgsl` bitonic-merge top-K shader has been ported to
+  CUDA (NVRTC, same algorithm, same tie-break), and
+  `BinaryDistanceKernel::knn_search` now short-circuits through CUDA
+  when the feature is enabled. The distance matrix stays on the device
+  between GEMM and top-K, so only `Q × K × 8 B` crosses PCIe back.
+  Measured on RTX 4070 Ti SUPER (CUDA path vs WGSL knn_search):
+  | shape (Q × N × K × dim) | WGSL knn | CUDA knn |
+  |--------------------------|----------|----------|
+  | 64 × 10 000 × 100 × 768  | 4.92 ms  | 0.59 ms (cold) |
+  | 64 × 100 000 × 100 × 768 | 13.27 ms | 5.97 ms (cold) |
+  Two new public APIs support the cached calling pattern:
+  - `CudaTensorCoreKernel::knn_search(...)` — one-shot, builds a
+    cached corpus internally and runs end-to-end.
+  - `CudaBinaryCorpus::knn_search(...)` — runs against a corpus
+    handle that was already prepared via `prepare_corpus`. This is the
+    production pattern for repeated query batches against the same
+    BBQ segment.
+  Bit-equivalence with the WGSL `top_k_select.wgsl` is asserted in the
+  parity test `parity_knn_search_matches_cpu` (5 representative
+  shapes) — distances *and* tie-broken ids match the CPU oracle
+  exactly.
 - Future contributors who want to enable the path locally:
   ```
   cargo build -p tantivy-gpu --features cuda-tensor-core

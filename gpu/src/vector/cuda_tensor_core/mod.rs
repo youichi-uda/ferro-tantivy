@@ -58,7 +58,7 @@ mod popcount;
 use std::sync::Arc;
 
 use crate::error::{GpuError, GpuResult};
-use kernel::CudaGemmRunner;
+use kernel::{CachedCorpus, CudaGemmRunner};
 use popcount::popcount_per_vec;
 
 /// CUDA Tensor Core kernel for binary Hamming distance.
@@ -137,6 +137,187 @@ impl CudaTensorCoreKernel {
             dim_bits,
         )
     }
+
+    /// Upload the corpus + per-row popcount once and return a
+    /// [`CudaBinaryCorpus`] handle. Subsequent
+    /// [`CudaBinaryCorpus::compute_batched`] calls skip the
+    /// upload + unpack + popcount stages — the only PCIe traffic per
+    /// query batch is the (small) bit-packed query buffer and the
+    /// `Q × N × 4 B` result download.
+    ///
+    /// This is the production pattern: BBQ corpora are immutable per
+    /// segment, so an HNSW search loop over the same segment uploads
+    /// the corpus once and re-uses it across many query batches.
+    /// Wave 4's reference 6-7× speedup at the N = 1 M shape assumed
+    /// exactly this calling pattern.
+    pub fn prepare_corpus(
+        &self,
+        corpus_bits: &[u32],
+        num_vecs: usize,
+        dim_bits: usize,
+    ) -> GpuResult<CudaBinaryCorpus> {
+        let dim_u32 = dim_bits.div_ceil(32);
+        if num_vecs == 0 || dim_bits == 0 {
+            return Err(GpuError::ColumnTypeMismatch {
+                expected: "num_vecs > 0 && dim_bits > 0".to_string(),
+                actual: format!("num_vecs = {num_vecs}, dim_bits = {dim_bits}"),
+            });
+        }
+        if corpus_bits.len() != num_vecs * dim_u32 {
+            return Err(GpuError::ColumnTypeMismatch {
+                expected: format!("corpus_bits.len() == {}", num_vecs * dim_u32),
+                actual: format!("corpus_bits.len() == {}", corpus_bits.len()),
+            });
+        }
+        let pop_d = popcount_per_vec(corpus_bits, num_vecs, dim_u32);
+        let cached = self
+            .inner
+            .prepare_corpus(corpus_bits, num_vecs, dim_bits, &pop_d)?;
+        Ok(CudaBinaryCorpus { inner: cached })
+    }
+
+    /// One-shot end-to-end k-NN search: equivalent to
+    /// `prepare_corpus(...).knn_search(...)`. Use the cached form when
+    /// running multiple query batches against the same corpus.
+    pub fn knn_search(
+        &self,
+        queries_bits: &[u32],
+        corpus_bits: &[u32],
+        num_queries: usize,
+        num_vecs: usize,
+        dim_bits: usize,
+        k: usize,
+    ) -> GpuResult<Vec<Vec<(u32, u32)>>> {
+        if num_queries == 0 || num_vecs == 0 || k == 0 {
+            return Ok(vec![Vec::new(); num_queries]);
+        }
+        let cached = self.prepare_corpus(corpus_bits, num_vecs, dim_bits)?;
+        cached.knn_search(queries_bits, num_queries, k)
+    }
+}
+
+/// On-device cached corpus produced by
+/// [`CudaTensorCoreKernel::prepare_corpus`]. Owns the unpacked `i8`
+/// corpus matrix and the per-row popcount on the GPU; queries against
+/// it are short — only the per-call `Q × dim_u32 × 4 B` query upload +
+/// `Q × N × 4 B` result download cross PCIe.
+pub struct CudaBinaryCorpus {
+    inner: CachedCorpus,
+}
+
+impl CudaBinaryCorpus {
+    /// Number of corpus vectors held on the device.
+    pub fn num_vecs(&self) -> usize {
+        self.inner.num_vecs
+    }
+
+    /// Bit-width the corpus was prepared with. Subsequent query
+    /// batches must use the same `dim_bits`.
+    pub fn dim_bits(&self) -> usize {
+        self.inner.dim_bits
+    }
+
+    /// Compute Hamming distances between a batch of queries and the
+    /// resident corpus. Output is row-major
+    /// `num_queries × num_vecs`, identical in shape and value to
+    /// [`CudaTensorCoreKernel::compute_batched`].
+    pub fn compute_batched(
+        &self,
+        queries_bits: &[u32],
+        num_queries: usize,
+    ) -> GpuResult<Vec<u32>> {
+        let dim_u32 = self.inner.dim_bits.div_ceil(32);
+        if num_queries == 0 {
+            return Ok(Vec::new());
+        }
+        if queries_bits.len() != num_queries * dim_u32 {
+            return Err(GpuError::ColumnTypeMismatch {
+                expected: format!("queries_bits.len() == {}", num_queries * dim_u32),
+                actual: format!("queries_bits.len() == {}", queries_bits.len()),
+            });
+        }
+        let pop_q = popcount_per_vec(queries_bits, num_queries, dim_u32);
+        self.inner
+            .runner
+            .run_with_cached_corpus(queries_bits, &pop_q, &self.inner, num_queries)
+    }
+
+    /// End-to-end CUDA k-NN search: compute the Q × N distance matrix
+    /// on-device and run the bitonic-merge top-K reducer in CUDA, so
+    /// only `Q × K × 8 B` crosses PCIe back regardless of `N`.
+    ///
+    /// `k` is clamped to `min(k, num_vecs)` and rounded up internally
+    /// to the next power of two for the bitonic merge. `k` must
+    /// satisfy `1 ≤ k ≤ 1024` (matches
+    /// [`crate::vector::binary_distance::TOP_K_MAX_K_PADDED`]).
+    ///
+    /// Returns one `Vec<(distance, corpus_id)>` per query, sorted
+    /// ascending by distance, ties broken by lower id (matches the
+    /// WGSL `top_k_select.wgsl` ordering exactly).
+    pub fn knn_search(
+        &self,
+        queries_bits: &[u32],
+        num_queries: usize,
+        k: usize,
+    ) -> GpuResult<Vec<Vec<(u32, u32)>>> {
+        if num_queries == 0 || k == 0 {
+            return Ok(vec![Vec::new(); num_queries]);
+        }
+        let dim_u32 = self.inner.dim_bits.div_ceil(32);
+        if queries_bits.len() != num_queries * dim_u32 {
+            return Err(GpuError::ColumnTypeMismatch {
+                expected: format!("queries_bits.len() == {}", num_queries * dim_u32),
+                actual: format!("queries_bits.len() == {}", queries_bits.len()),
+            });
+        }
+
+        let n = self.inner.num_vecs;
+        let k_eff = k.min(n);
+        const MAX_K_PADDED: u32 = 1024;
+        if (k_eff as u32) > MAX_K_PADDED {
+            return Err(GpuError::CpuFallback {
+                reason: format!(
+                    "knn_search: k = {k_eff} exceeds CUDA top-K shader limit {MAX_K_PADDED}"
+                ),
+            });
+        }
+        let k_padded = next_pow2_u32(k_eff as u32).max(2);
+
+        let pop_q = popcount_per_vec(queries_bits, num_queries, dim_u32);
+        let (dists, ids) = self.inner.runner.knn_search_with_cached_corpus(
+            queries_bits,
+            &pop_q,
+            &self.inner,
+            num_queries,
+            k_eff,
+            k_padded,
+        )?;
+
+        let mut out = Vec::with_capacity(num_queries);
+        for q in 0..num_queries {
+            let mut row = Vec::with_capacity(k_eff);
+            for w in 0..k_eff {
+                let idx = q * k_eff + w;
+                row.push((dists[idx], ids[idx]));
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+}
+
+/// Round `n` up to the next power of two (≥ 1). Mirrors
+/// `binary_distance::next_pow2_u32` — kept private here to avoid the
+/// WGSL-side dependency creating a public API surface.
+fn next_pow2_u32(n: u32) -> u32 {
+    if n <= 1 {
+        return 1;
+    }
+    let mut p = 1u32;
+    while p < n {
+        p <<= 1;
+    }
+    p
 }
 
 #[cfg(test)]
@@ -155,6 +336,46 @@ mod tests {
     fn random_u32_vec(n: usize, seed: u64) -> Vec<u32> {
         let mut state = seed;
         (0..n).map(|_| xorshift64(&mut state) as u32).collect()
+    }
+
+    #[test]
+    fn smoke_cached_corpus_byte_equal() {
+        let kernel = match CudaTensorCoreKernel::try_new() {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("skipping CUDA cached-corpus smoke: {e}");
+                return;
+            }
+        };
+        let dim_bits = 256;
+        let dim_u32 = dim_u32_for(dim_bits);
+        let num_queries = 4;
+        let num_vecs = 32;
+        let queries = random_u32_vec(num_queries * dim_u32, 0xfeed_face_dead_beef);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0xc0de_d00d_b00b_5eed);
+
+        let cpu = hamming_distances_batched_cpu(
+            &queries, &corpus, num_queries, num_vecs, dim_u32,
+        );
+
+        let cached = kernel
+            .prepare_corpus(&corpus, num_vecs, dim_bits)
+            .expect("prepare_corpus");
+        assert_eq!(cached.num_vecs(), num_vecs);
+        assert_eq!(cached.dim_bits(), dim_bits);
+
+        // First call.
+        let r1 = cached
+            .compute_batched(&queries, num_queries)
+            .expect("first cached call");
+        assert_eq!(r1, cpu, "cached: first call must match CPU oracle");
+
+        // Second call against the same corpus must return identical
+        // bytes — proves the device-side state isn't corrupted.
+        let r2 = cached
+            .compute_batched(&queries, num_queries)
+            .expect("second cached call");
+        assert_eq!(r2, r1, "cached: repeated call must be byte-equal");
     }
 
     /// Lightweight smoke test that runs only on hosts with a CUDA

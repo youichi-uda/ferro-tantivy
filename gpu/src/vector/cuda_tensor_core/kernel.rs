@@ -32,6 +32,18 @@ use cudarc::nvrtc::compile_ptx_with_opts;
 
 use crate::error::{GpuError, GpuResult};
 
+/// Bit-packed + unpacked + popcount corpus, kept resident on the
+/// device so successive [`CudaGemmRunner::run_with_cached_corpus`]
+/// calls skip the upload + unpack + popcount stages. Build with
+/// [`CudaGemmRunner::prepare_corpus`].
+pub(super) struct CachedCorpus {
+    pub(super) runner: Arc<CudaGemmRunner>,
+    pub(super) unpacked_dev: CudaSlice<i8>,
+    pub(super) pop_dev: CudaSlice<i32>,
+    pub(super) num_vecs: usize,
+    pub(super) dim_bits: usize,
+}
+
 /// NVRTC sources compiled once at construction.
 ///
 /// 1. `unpack_bits` — read row-major `num_rows × dim_u32` u32 input and
@@ -86,6 +98,94 @@ extern "C" __global__ void pop_correction(
     int v = pop_q[m] + pop_d[n] - 2 * inner[idx];
     out[idx] = (unsigned int) v;
 }
+
+// Per-query bitonic-merge top-K. Direct port of `top_k_select.wgsl`
+// — same algorithm, same tie-break (lower id wins at equal distance),
+// same `MAX_K_PADDED = 1024` cap. Block layout: one block per query,
+// 256 threads, 16 KB of static shared memory (2 * MAX_K_PADDED u32
+// dists + 2 * MAX_K_PADDED u32 ids).
+//
+// Output `top_k_dists` / `top_k_ids` is row-major Q × K, sorted
+// ascending by distance, ties broken by lower id.
+__device__ __forceinline__ void __cmpswap(
+    unsigned int* d, unsigned int* id,
+    unsigned int a, unsigned int b, unsigned int dir) {
+    unsigned int da = d[a], db = d[b];
+    unsigned int ia = id[a], ib = id[b];
+    bool asc = (da > db) || (da == db && ia > ib);
+    bool should_swap = (asc && dir == 1u) || (!asc && dir == 0u);
+    if (should_swap) {
+        d[a] = db;  d[b] = da;
+        id[a] = ib; id[b] = ia;
+    }
+}
+
+extern "C" __global__ void top_k_select(
+    const unsigned int* __restrict__ dists,
+    unsigned int* __restrict__ top_k_dists,
+    unsigned int* __restrict__ top_k_ids,
+    unsigned int num_queries,
+    unsigned int num_vecs,
+    unsigned int k,
+    unsigned int k_padded) {
+    const unsigned int MAX_K_PADDED = 1024u;
+    const unsigned int WG_SIZE = 256u;
+    const unsigned int SENTINEL = 0xFFFFFFFFu;
+    __shared__ unsigned int buf_dist[2u * MAX_K_PADDED];
+    __shared__ unsigned int buf_id[2u * MAX_K_PADDED];
+
+    unsigned int q = blockIdx.x;
+    unsigned int tid = threadIdx.x;
+    if (q >= num_queries) return;
+
+    unsigned int n = num_vecs;
+    unsigned int kp = k_padded;            // power of two, ≤ MAX_K_PADDED
+    unsigned int total_len = kp * 2u;
+    unsigned int row_base = q * n;
+
+    // Initialize sentinels in both halves.
+    for (unsigned int i = tid; i < total_len; i += WG_SIZE) {
+        buf_dist[i] = SENTINEL;
+        buf_id[i] = 0u;
+    }
+    __syncthreads();
+
+    // Streaming merge: process N inputs in batches of `kp`. After each
+    // batch the lower half holds the running top kp sorted ascending.
+    for (unsigned int processed = 0u; processed < n; processed += kp) {
+        for (unsigned int j = tid; j < kp; j += WG_SIZE) {
+            unsigned int src = processed + j;
+            if (src < n) {
+                buf_dist[kp + j] = dists[row_base + src];
+                buf_id[kp + j] = src;
+            } else {
+                buf_dist[kp + j] = SENTINEL;
+                buf_id[kp + j] = 0u;
+            }
+        }
+        __syncthreads();
+
+        // Bitonic sort 2*kp entries ascending.
+        for (unsigned int size = 2u; size <= total_len; size *= 2u) {
+            for (unsigned int stride = size / 2u; stride > 0u; stride /= 2u) {
+                for (unsigned int idx = tid; idx < total_len; idx += WG_SIZE) {
+                    unsigned int pair = idx ^ stride;
+                    if (pair > idx) {
+                        unsigned int dir = ((idx & size) == 0u) ? 1u : 0u;
+                        __cmpswap(buf_dist, buf_id, idx, pair, dir);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    // Spill the first k entries. Already sorted ascending.
+    for (unsigned int w = tid; w < k; w += WG_SIZE) {
+        top_k_dists[q * k + w] = buf_dist[w];
+        top_k_ids[q * k + w] = buf_id[w];
+    }
+}
 "#;
 
 /// Owns the cuBLASLt handle, NVRTC-compiled correction kernel, and a
@@ -97,6 +197,7 @@ pub(super) struct CudaGemmRunner {
     workspace_size: usize,
     unpack_func: CudaFunction,
     correction_func: CudaFunction,
+    top_k_func: CudaFunction,
     stream: Arc<CudaStream>,
     // Hold the context so the device isn't dropped while we still own
     // the cuBLASLt handle / workspace.
@@ -149,6 +250,11 @@ impl CudaGemmRunner {
                 reason: format!("load_function(pop_correction) failed: {e}"),
             }
         })?;
+        let top_k_func = module.load_function("top_k_select").map_err(|e| {
+            GpuError::CpuFallback {
+                reason: format!("load_function(top_k_select) failed: {e}"),
+            }
+        })?;
 
         Ok(Self {
             handle,
@@ -156,9 +262,132 @@ impl CudaGemmRunner {
             workspace_size,
             unpack_func,
             correction_func,
+            top_k_func,
             stream,
             _ctx: ctx,
         })
+    }
+
+    /// Upload bit-packed `inputs` (M rows × dim_u32 words), unpack to
+    /// one `i8` per bit on the device, and return the unpacked
+    /// `M × dim_bits` row-major `i8` slice on device. Used as a shared
+    /// helper by [`Self::run`] (queries + corpus) and
+    /// [`Self::prepare_corpus`] (corpus only — kept resident).
+    fn unpack_to_device(
+        &self,
+        bits: &[u32],
+        num_rows: usize,
+        dim_bits: usize,
+    ) -> GpuResult<CudaSlice<i8>> {
+        let dim_u32 = dim_bits.div_ceil(32);
+        debug_assert_eq!(bits.len(), num_rows * dim_u32);
+
+        let stream = &self.stream;
+        let packed_dev = stream.clone_htod(bits).map_err(map_drv)?;
+        let mut unpacked_dev =
+            unsafe { stream.alloc::<i8>(num_rows * dim_bits) }.map_err(map_drv)?;
+
+        let total = num_rows as u64 * dim_bits as u64;
+        let dim_u32_u32 = dim_u32 as u32;
+        let dim_bits_u32 = dim_bits as u32;
+        let num_rows_u32 = num_rows as u32;
+        unsafe {
+            stream
+                .launch_builder(&self.unpack_func)
+                .arg(&packed_dev)
+                .arg(&mut unpacked_dev)
+                .arg(&num_rows_u32)
+                .arg(&dim_u32_u32)
+                .arg(&dim_bits_u32)
+                .launch(launch_cfg(total))
+                .map_err(map_drv)?;
+        }
+        Ok(unpacked_dev)
+    }
+
+    /// Run GEMM + correction and **leave the result on the device** —
+    /// returns the row-major `m × n` `u32` distance matrix as a
+    /// `CudaSlice<u32>`. Used by both
+    /// [`Self::gemm_and_correct`] (which then downloads to host) and
+    /// the on-device top-K path in [`Self::knn_search_with_cached_corpus`].
+    fn gemm_and_correct_dev(
+        &self,
+        q_i8_dev: &CudaSlice<i8>,
+        d_i8_dev: &CudaSlice<i8>,
+        pop_q_dev: &CudaSlice<i32>,
+        pop_d_dev: &CudaSlice<i32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> GpuResult<CudaSlice<u32>> {
+        let stream = &self.stream;
+
+        let mut inner_dev = unsafe { stream.alloc::<i32>(m * n) }.map_err(map_drv)?;
+        let mut out_dev = unsafe { stream.alloc::<u32>(m * n) }.map_err(map_drv)?;
+
+        // GEMM: inner_col[n, m] = Σ_k D[n, k] * Q[m, k]
+        //       (= row-major inner[m, n] in the same memory).
+        // Layout derivation: see kernel.rs module docs.
+        // - A := corpus (D), shape K × N column-major (= storage row-major
+        //   N × K), opA = T → op(A) = D in row-major view.
+        // - B := queries (Q), shape K × M column-major (= storage row-major
+        //   M × K), opB = N → op(B) = Q^T in column-major view.
+        // - Output dim: M_p = N (rows), N_p = M (cols), ldc = N.
+        {
+            let (a_ptr, _record_a) = d_i8_dev.device_ptr(stream);
+            let (b_ptr, _record_b) = q_i8_dev.device_ptr(stream);
+            let (c_ptr, _record_c) = inner_dev.device_ptr_mut(stream);
+            unsafe {
+                self.matmul_int8_int32(
+                    a_ptr, b_ptr, c_ptr,
+                    /* m_p */ n as u64,
+                    /* n_p */ m as u64,
+                    /* k_p */ k as u64,
+                    /* transa */ true,
+                    /* transb */ false,
+                    /* lda    */ k as i64,
+                    /* ldb    */ k as i64,
+                    /* ldc    */ n as i64,
+                )?;
+            }
+        }
+
+        let total = m as u64 * n as u64;
+        let m_u32 = m as u32;
+        let n_u32 = n as u32;
+        unsafe {
+            stream
+                .launch_builder(&self.correction_func)
+                .arg(&inner_dev)
+                .arg(pop_q_dev)
+                .arg(pop_d_dev)
+                .arg(&mut out_dev)
+                .arg(&m_u32)
+                .arg(&n_u32)
+                .launch(launch_cfg(total))
+                .map_err(map_drv)?;
+        }
+        Ok(out_dev)
+    }
+
+    /// Convenience wrapper around [`Self::gemm_and_correct_dev`] that
+    /// downloads the full `m × n` result to host memory and waits for
+    /// completion before returning.
+    fn gemm_and_correct(
+        &self,
+        q_i8_dev: &CudaSlice<i8>,
+        d_i8_dev: &CudaSlice<i8>,
+        pop_q_dev: &CudaSlice<i32>,
+        pop_d_dev: &CudaSlice<i32>,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> GpuResult<Vec<u32>> {
+        let out_dev =
+            self.gemm_and_correct_dev(q_i8_dev, d_i8_dev, pop_q_dev, pop_d_dev, m, n, k)?;
+        let out_host = self.stream.clone_dtoh(&out_dev).map_err(map_drv)?;
+        self.stream.synchronize().map_err(map_drv)?;
+        Ok(out_host)
     }
 
     /// End-to-end batched compute: returns row-major `M × N` Hamming
@@ -179,115 +408,130 @@ impl CudaGemmRunner {
         num_vecs: usize,
         dim_bits: usize,
     ) -> GpuResult<Vec<u32>> {
-        let m = num_queries;
-        let n = num_vecs;
-        let k = dim_bits;
-        let dim_u32 = dim_bits.div_ceil(32);
+        debug_assert_eq!(pop_q.len(), num_queries);
+        debug_assert_eq!(pop_d.len(), num_vecs);
 
-        debug_assert_eq!(queries_bits.len(), m * dim_u32);
-        debug_assert_eq!(corpus_bits.len(), n * dim_u32);
-        debug_assert_eq!(pop_q.len(), m);
-        debug_assert_eq!(pop_d.len(), n);
+        let q_i8_dev = self.unpack_to_device(queries_bits, num_queries, dim_bits)?;
+        let d_i8_dev = self.unpack_to_device(corpus_bits, num_vecs, dim_bits)?;
+        let pop_q_dev = self.stream.clone_htod(pop_q).map_err(map_drv)?;
+        let pop_d_dev = self.stream.clone_htod(pop_d).map_err(map_drv)?;
+        self.gemm_and_correct(
+            &q_i8_dev, &d_i8_dev, &pop_q_dev, &pop_d_dev, num_queries, num_vecs, dim_bits,
+        )
+    }
 
+    /// Upload + unpack + popcount the corpus once and return a handle
+    /// the caller can re-use across many `compute_batched_with_cached_corpus`
+    /// invocations. The handle owns its on-device storage and survives
+    /// until dropped.
+    pub(super) fn prepare_corpus(
+        self: &Arc<Self>,
+        corpus_bits: &[u32],
+        num_vecs: usize,
+        dim_bits: usize,
+        pop_d: &[i32],
+    ) -> GpuResult<CachedCorpus> {
+        debug_assert_eq!(pop_d.len(), num_vecs);
+        let unpacked_dev = self.unpack_to_device(corpus_bits, num_vecs, dim_bits)?;
+        let pop_dev = self.stream.clone_htod(pop_d).map_err(map_drv)?;
+        // Block until the unpack finishes so a follow-up
+        // `compute_batched_with_cached_corpus` sees a quiescent corpus.
+        self.stream.synchronize().map_err(map_drv)?;
+        Ok(CachedCorpus {
+            runner: Arc::clone(self),
+            unpacked_dev,
+            pop_dev,
+            num_vecs,
+            dim_bits,
+        })
+    }
+
+    /// Run a query batch against an already-uploaded corpus. Returns
+    /// row-major `num_queries × corpus.num_vecs` Hamming distances.
+    pub(super) fn run_with_cached_corpus(
+        &self,
+        queries_bits: &[u32],
+        pop_q: &[i32],
+        corpus: &CachedCorpus,
+        num_queries: usize,
+    ) -> GpuResult<Vec<u32>> {
+        debug_assert_eq!(pop_q.len(), num_queries);
+        let q_i8_dev = self.unpack_to_device(queries_bits, num_queries, corpus.dim_bits)?;
+        let pop_q_dev = self.stream.clone_htod(pop_q).map_err(map_drv)?;
+        self.gemm_and_correct(
+            &q_i8_dev,
+            &corpus.unpacked_dev,
+            &pop_q_dev,
+            &corpus.pop_dev,
+            num_queries,
+            corpus.num_vecs,
+            corpus.dim_bits,
+        )
+    }
+
+    /// Run an end-to-end k-NN search against a cached corpus —
+    /// distance matrix + on-device top-K reduction. Only `Q × K × 8 B`
+    /// crosses PCIe back, regardless of N.
+    ///
+    /// `k_padded` must be a power of two ≤ 1024 (the shader-side
+    /// `MAX_K_PADDED`); the caller is responsible for rounding `k` up.
+    pub(super) fn knn_search_with_cached_corpus(
+        &self,
+        queries_bits: &[u32],
+        pop_q: &[i32],
+        corpus: &CachedCorpus,
+        num_queries: usize,
+        k: usize,
+        k_padded: u32,
+    ) -> GpuResult<(Vec<u32>, Vec<u32>)> {
+        debug_assert_eq!(pop_q.len(), num_queries);
+        let q_i8_dev = self.unpack_to_device(queries_bits, num_queries, corpus.dim_bits)?;
+        let pop_q_dev = self.stream.clone_htod(pop_q).map_err(map_drv)?;
+
+        // Stage 1: distance matrix on-device (no host download).
+        let dist_dev = self.gemm_and_correct_dev(
+            &q_i8_dev,
+            &corpus.unpacked_dev,
+            &pop_q_dev,
+            &corpus.pop_dev,
+            num_queries,
+            corpus.num_vecs,
+            corpus.dim_bits,
+        )?;
+
+        // Stage 2: per-query top-K via the CUDA bitonic merge kernel.
         let stream = &self.stream;
-
-        // Upload bit-packed inputs (u32) and per-row popcount (i32).
-        let q_packed_dev = stream.clone_htod(queries_bits).map_err(map_drv)?;
-        let d_packed_dev = stream.clone_htod(corpus_bits).map_err(map_drv)?;
-        let pop_q_dev = stream.clone_htod(pop_q).map_err(map_drv)?;
-        let pop_d_dev = stream.clone_htod(pop_d).map_err(map_drv)?;
-
-        // Allocate device-side i8 unpacked tensors and reusable
-        // intermediates. Total scratch: (m + n) * k bytes for
-        // unpacking, m * n * 4 bytes for the inner product, m * n * 4
-        // bytes for the final output.
-        let mut q_i8_dev = unsafe { stream.alloc::<i8>(m * k) }.map_err(map_drv)?;
-        let mut d_i8_dev = unsafe { stream.alloc::<i8>(n * k) }.map_err(map_drv)?;
-
-        // Device-side bit unpack (one byte per bit, ∈ {0, 1}).
-        let dim_u32_u32 = dim_u32 as u32;
-        let dim_bits_u32 = dim_bits as u32;
-        let m_u32 = m as u32;
-        let n_u32 = n as u32;
-        let q_total = m as u64 * k as u64;
-        let d_total = n as u64 * k as u64;
+        let mut top_dists_dev =
+            unsafe { stream.alloc::<u32>(num_queries * k) }.map_err(map_drv)?;
+        let mut top_ids_dev =
+            unsafe { stream.alloc::<u32>(num_queries * k) }.map_err(map_drv)?;
+        let num_queries_u32 = num_queries as u32;
+        let num_vecs_u32 = corpus.num_vecs as u32;
+        let k_u32 = k as u32;
+        // 1 block per query, 256 threads.
+        let cfg = LaunchConfig {
+            grid_dim: (num_queries_u32.max(1), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0, // shared mem is statically declared in the kernel
+        };
         unsafe {
             stream
-                .launch_builder(&self.unpack_func)
-                .arg(&q_packed_dev)
-                .arg(&mut q_i8_dev)
-                .arg(&m_u32)
-                .arg(&dim_u32_u32)
-                .arg(&dim_bits_u32)
-                .launch(launch_cfg(q_total))
-                .map_err(map_drv)?;
-            stream
-                .launch_builder(&self.unpack_func)
-                .arg(&d_packed_dev)
-                .arg(&mut d_i8_dev)
-                .arg(&n_u32)
-                .arg(&dim_u32_u32)
-                .arg(&dim_bits_u32)
-                .launch(launch_cfg(d_total))
-                .map_err(map_drv)?;
-        }
-
-        // Allocate the inner-product matrix and the final output. Both
-        // row-major M × N. cuBLASLt writes the inner-product as
-        // column-major N × M, which shares memory with row-major M × N.
-        let mut inner_dev = unsafe { stream.alloc::<i32>(m * n) }.map_err(map_drv)?;
-        let mut out_dev = unsafe { stream.alloc::<u32>(m * n) }.map_err(map_drv)?;
-
-        // GEMM: inner_col[n, m] = Σ_k D[n, k] * Q[m, k]
-        //       (= row-major inner[m, n] in the same memory).
-        // Layout derivation: see kernel.rs module docs.
-        // - A := corpus (D), shape K × N column-major (= storage row-major
-        //   N × K), opA = T → op(A) = D in row-major view.
-        // - B := queries (Q), shape K × M column-major (= storage row-major
-        //   M × K), opB = N → op(B) = Q^T in column-major view.
-        // - Output dim: M_p = N (rows), N_p = M (cols), ldc = N.
-        //
-        // The `device_ptr*` guards are dropped at the end of this scope
-        // so the subsequent NVRTC kernel launch can take its own
-        // immutable borrows of `inner_dev`.
-        {
-            let (a_ptr, _record_a) = d_i8_dev.device_ptr(stream);
-            let (b_ptr, _record_b) = q_i8_dev.device_ptr(stream);
-            let (c_ptr, _record_c) = inner_dev.device_ptr_mut(stream);
-            unsafe {
-                self.matmul_int8_int32(
-                    a_ptr, b_ptr, c_ptr,
-                    /* m_p */ n as u64,
-                    /* n_p */ m as u64,
-                    /* k_p */ k as u64,
-                    /* transa */ true,
-                    /* transb */ false,
-                    /* lda    */ k as i64,
-                    /* ldb    */ k as i64,
-                    /* ldc    */ n as i64,
-                )?;
-            }
-        }
-
-        // Element-wise correction: out[idx] = pop_q[m] + pop_d[n] − 2·inner[idx].
-        let total = m as u64 * n as u64;
-        let cfg = launch_cfg(total);
-        unsafe {
-            stream
-                .launch_builder(&self.correction_func)
-                .arg(&inner_dev)
-                .arg(&pop_q_dev)
-                .arg(&pop_d_dev)
-                .arg(&mut out_dev)
-                .arg(&m_u32)
-                .arg(&n_u32)
+                .launch_builder(&self.top_k_func)
+                .arg(&dist_dev)
+                .arg(&mut top_dists_dev)
+                .arg(&mut top_ids_dev)
+                .arg(&num_queries_u32)
+                .arg(&num_vecs_u32)
+                .arg(&k_u32)
+                .arg(&k_padded)
                 .launch(cfg)
                 .map_err(map_drv)?;
         }
 
-        let out_host = stream.clone_dtoh(&out_dev).map_err(map_drv)?;
+        let dists_host = stream.clone_dtoh(&top_dists_dev).map_err(map_drv)?;
+        let ids_host = stream.clone_dtoh(&top_ids_dev).map_err(map_drv)?;
         stream.synchronize().map_err(map_drv)?;
-        Ok(out_host)
+        Ok((dists_host, ids_host))
     }
 
     /// Lower-level cuBLASLt INT8 → INT32 matmul.

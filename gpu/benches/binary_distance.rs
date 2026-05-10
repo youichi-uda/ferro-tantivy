@@ -551,6 +551,120 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
         );
     }
 
+    // ── Cached-corpus head-to-head (Phase 4 deliverable) ──
+    println!();
+    println!("--- CUDA cached corpus vs WGSL (production calling pattern) ---");
+    println!("(prepare_corpus once, then time only the per-query batch)");
+    println!(
+        "{:<32}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "shape", "WGSL", "CUDA-c", "speedup", "match"
+    );
+    let cached_shapes: &[(&str, usize, usize, usize)] = &[
+        ("dim=768  N=100000  Q=64 ", 100_000, 64, 768),
+        ("dim=768  N=1000000 Q=64 ", 1_000_000, 64, 768),
+    ];
+    let mut cached_json_rows: Vec<String> = Vec::new();
+    let mut cached_1m_speedup: Option<f64> = None;
+    for &(label, num_vecs, num_queries, dim_bits) in cached_shapes {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let queries = random_u32_vec(num_queries * dim_u32, 0xa1a2_a3a4_a5a6_a7a8);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0xb1b2_b3b4_b5b6_b7b8);
+
+        let cached = cuda
+            .prepare_corpus(&corpus, num_vecs, dim_bits)
+            .expect("prepare_corpus");
+
+        let cuda_first = cached
+            .compute_batched(&queries, num_queries)
+            .expect("cuda cached");
+        let wgsl_first = wgsl_kernel
+            .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+            .expect("wgsl batched");
+        let matches = cuda_first == wgsl_first;
+        if !matches {
+            panic!("cached CUDA != WGSL on shape {label}");
+        }
+
+        let iters = if num_vecs >= 1_000_000 { 3 } else { 5 };
+        let cuda_time = bench(iters, || {
+            black_box(
+                cached
+                    .compute_batched(&queries, num_queries)
+                    .expect("cuda cached"),
+            );
+        });
+        let wgsl_time = bench(iters, || {
+            black_box(
+                wgsl_kernel
+                    .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("wgsl batched"),
+            );
+        });
+        let speedup = wgsl_time.as_nanos() as f64 / cuda_time.as_nanos().max(1) as f64;
+        if num_vecs == 1_000_000 {
+            cached_1m_speedup = Some(speedup);
+        }
+        println!(
+            "{:<32}  {:>10}  {:>10}  {:>7.2}x  {:>8}",
+            label,
+            fmt_dur(wgsl_time),
+            fmt_dur(cuda_time),
+            speedup,
+            if matches { "ok" } else { "DIVERGE" }
+        );
+        cached_json_rows.push(format!(
+            "    {{\"shape\": \"{}\", \"num_queries\": {}, \"num_vecs\": {}, \"dim_bits\": {}, \
+             \"wgsl_ns\": {}, \"cuda_cached_ns\": {}, \"speedup\": {:.4}, \"byte_equal\": {}}}",
+            label.trim(),
+            num_queries,
+            num_vecs,
+            dim_bits,
+            wgsl_time.as_nanos(),
+            cuda_time.as_nanos(),
+            speedup,
+            matches
+        ));
+    }
+
+    // Append cached results to the JSON.
+    let cached_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("data")
+        .join("cuda_cached_vs_wgsl.json");
+    let mut cached_json = String::new();
+    cached_json.push_str("{\n");
+    cached_json.push_str(&format!("  \"backend\": \"{}\",\n", info.backend));
+    cached_json.push_str(&format!(
+        "  \"device\": \"{}\",\n",
+        info.name.replace('"', "\\\"")
+    ));
+    cached_json.push_str("  \"calling_pattern\": \"prepare_corpus once, then time per-query batch\",\n");
+    cached_json.push_str("  \"results\": [\n");
+    cached_json.push_str(&cached_json_rows.join(",\n"));
+    cached_json.push_str("\n  ]\n}\n");
+    if let Err(e) = std::fs::write(&cached_path, &cached_json) {
+        eprintln!("failed to write {}: {e}", cached_path.display());
+    } else {
+        println!("wrote {}", cached_path.display());
+    }
+
+    // Phase 4 sign-off: with `prepare_corpus` the N=1M shape must
+    // also clear the 3× threshold (Wave 4's 6-7× target with
+    // device-resident corpus).
+    if let Some(s) = cached_1m_speedup {
+        let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
+        if !assert_off {
+            assert!(
+                s >= go_threshold,
+                "CUDA-cached vs WGSL @ N=1M Q=64 = {s:.2}x below Go threshold \
+                 {go_threshold:.1}x. Set BINARY_DIST_BENCH_NO_ASSERT=1 to skip."
+            );
+            println!(
+                "ASSERT PASSED   : CUDA-cached @ N=1M Q=64 = {s:.2}x >= {go_threshold:.1}x"
+            );
+        }
+    }
+
     if let Some(s) = assert_speedup {
         let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
         if !assert_off {

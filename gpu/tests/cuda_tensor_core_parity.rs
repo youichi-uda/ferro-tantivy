@@ -17,7 +17,9 @@
 
 #![cfg(feature = "cuda-tensor-core")]
 
-use tantivy_gpu::vector::binary_distance::{dim_u32_for, hamming_distances_batched_cpu};
+use tantivy_gpu::vector::binary_distance::{
+    dim_u32_for, hamming_distances_batched_cpu, top_k_select_cpu,
+};
 use tantivy_gpu::vector::cuda_tensor_core::CudaTensorCoreKernel;
 
 fn xorshift64(state: &mut u64) -> u64 {
@@ -207,6 +209,113 @@ fn parity_identity() {
         dim_bits as u32,
         "dist(query1=NOT(corpus[1]), corpus[1]) must equal dim_bits"
     );
+}
+
+/// CUDA `knn_search` must agree exactly with the CPU oracle — same
+/// distances and same tie-broken ids — across a representative grid.
+/// The tie-break rule both implementations follow is "ascending by
+/// distance, ties broken by lower id".
+#[test]
+fn parity_knn_search_matches_cpu() {
+    let kernel = match try_build() {
+        Some(k) => k,
+        None => return,
+    };
+
+    let cases: &[(usize, usize, usize, usize)] = &[
+        // (Q, N, dim_bits, K)
+        (1, 16, 64, 4),
+        (4, 256, 256, 16),
+        (8, 1024, 768, 32),
+        (16, 4096, 768, 100),
+        (32, 16_384, 1024, 128),
+    ];
+
+    for &(q, n, dim_bits, k) in cases {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let mut queries =
+            random_u32_vec(q * dim_u32, 0xface_face_face_faceu64 ^ q as u64 ^ n as u64);
+        let mut corpus =
+            random_u32_vec(n * dim_u32, 0xbabe_babe_babe_babeu64 ^ q as u64 ^ n as u64);
+        zero_padding(&mut queries, q, dim_bits);
+        zero_padding(&mut corpus, n, dim_bits);
+
+        let cpu_dists = hamming_distances_batched_cpu(&queries, &corpus, q, n, dim_u32);
+        let cpu_topk = top_k_select_cpu(&cpu_dists, q, n, k);
+
+        // One-shot path.
+        let gpu_topk = kernel
+            .knn_search(&queries, &corpus, q, n, dim_bits, k)
+            .unwrap_or_else(|e| panic!("CUDA knn_search Q={q} N={n} dim={dim_bits} k={k}: {e}"));
+        // Cached path.
+        let cached = kernel
+            .prepare_corpus(&corpus, n, dim_bits)
+            .expect("prepare_corpus");
+        let cached_topk = cached
+            .knn_search(&queries, q, k)
+            .unwrap_or_else(|e| panic!("CUDA cached knn_search: {e}"));
+
+        for qi in 0..q {
+            let row_cpu: Vec<(u32, u32)> = cpu_topk[qi].clone();
+            let row_gpu = &gpu_topk[qi];
+            let row_cached = &cached_topk[qi];
+
+            assert_eq!(
+                row_gpu.len(),
+                row_cpu.len(),
+                "row {qi} length mismatch (Q={q} N={n} dim={dim_bits} k={k})"
+            );
+            assert_eq!(
+                row_gpu, &row_cpu,
+                "one-shot CUDA knn != CPU at row {qi} (Q={q} N={n} dim={dim_bits} k={k})"
+            );
+            assert_eq!(
+                row_cached, &row_cpu,
+                "cached CUDA knn != CPU at row {qi} (Q={q} N={n} dim={dim_bits} k={k})"
+            );
+        }
+    }
+}
+
+/// Cached-corpus path must produce byte-identical output to the
+/// fresh-call path. Sweep is smaller than the full parity grid because
+/// `prepare_corpus` adds a one-time upload+unpack the test harness
+/// pays once per shape; the inner loop is just the queries.
+#[test]
+fn parity_cached_corpus_matches_fresh() {
+    let kernel = match try_build() {
+        Some(k) => k,
+        None => return,
+    };
+
+    let cases: &[(usize, usize, usize)] = &[
+        (1, 100, 256),
+        (8, 1024, 768),
+        (32, 4096, 768),
+        (64, 8192, 1024),
+    ];
+
+    for &(q, n, dim_bits) in cases {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let mut queries = random_u32_vec(q * dim_u32, 0xc1c2_c3c4u64 ^ q as u64 ^ n as u64);
+        let mut corpus = random_u32_vec(n * dim_u32, 0xd1d2_d3d4u64 ^ q as u64 ^ n as u64);
+        zero_padding(&mut queries, q, dim_bits);
+        zero_padding(&mut corpus, n, dim_bits);
+
+        let cpu = hamming_distances_batched_cpu(&queries, &corpus, q, n, dim_u32);
+        let fresh = kernel
+            .compute_batched(&queries, &corpus, q, n, dim_bits)
+            .expect("fresh");
+        let cached = kernel
+            .prepare_corpus(&corpus, n, dim_bits)
+            .expect("prepare_corpus")
+            .compute_batched(&queries, q)
+            .expect("cached compute");
+
+        assert_eq!(fresh, cpu, "fresh != cpu at Q={q} N={n} dim={dim_bits}");
+        assert_eq!(cached, cpu, "cached != cpu at Q={q} N={n} dim={dim_bits}");
+        assert_eq!(cached, fresh, "cached != fresh at Q={q} N={n} dim={dim_bits}");
+    }
 }
 
 /// Small-but-odd shapes that probe leading-dimension and alignment

@@ -10,7 +10,7 @@ use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
-use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
+use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId, SortCursorIndex};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
@@ -47,6 +47,12 @@ pub struct SegmentReader {
     store_file: FileSlice,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
+    /// **FerroSearch extension (Wave 15).** Eagerly-loaded auxiliary sort
+    /// cursors, keyed by field name. Populated from
+    /// `Segment::meta().sort_cursor_fields()` at `open` time. Each entry
+    /// is a small `Vec<DocId>` (~4 bytes/doc) wrapped in `Arc` for cheap
+    /// sharing across `Searcher` clones.
+    sort_cursors: Arc<HashMap<String, Arc<SortCursorIndex>>>,
 }
 
 impl SegmentReader {
@@ -190,6 +196,17 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
+        // FerroSearch (Wave 15): eagerly load any auxiliary sort cursors
+        // listed in segment meta. Missing files are surfaced as errors
+        // because the meta entry advertises them as part of the segment
+        // contract.
+        let mut sort_cursors: HashMap<String, Arc<SortCursorIndex>> = HashMap::new();
+        for field in segment.meta().sort_cursor_fields() {
+            let slice = segment.open_sort_cursor_read(field)?;
+            let cursor = SortCursorIndex::open(slice)?;
+            sort_cursors.insert(field.clone(), Arc::new(cursor));
+        }
+
         Ok(SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
@@ -204,7 +221,22 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite,
             schema,
+            sort_cursors: Arc::new(sort_cursors),
         })
+    }
+
+    /// **FerroSearch extension (Wave 15).** Returns the auxiliary sort
+    /// cursor for `field`, or `None` if the segment does not advertise
+    /// one in its meta. The returned `Arc` is shared with this reader
+    /// and is cheap to clone.
+    pub fn sort_cursor(&self, field: &str) -> Option<Arc<SortCursorIndex>> {
+        self.sort_cursors.get(field).cloned()
+    }
+
+    /// **FerroSearch extension (Wave 15).** Returns the names of the
+    /// fields for which a sort cursor was loaded.
+    pub fn sort_cursor_fields(&self) -> impl Iterator<Item = &str> + '_ {
+        self.sort_cursors.keys().map(String::as_str)
     }
 
     /// Returns a field reader associated with the field given in argument.

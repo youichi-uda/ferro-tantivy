@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use crate::index::build_and_write_sort_cursors;
 use crate::indexer::operation::AddOperation;
 use crate::indexer::segment_updater::save_metas;
 use crate::indexer::SegmentWriter;
@@ -40,7 +41,14 @@ impl<D: Document> SingleSegmentIndexWriter<D> {
     pub fn finalize(self) -> crate::Result<Index> {
         let max_doc = self.segment_writer.max_doc();
         self.segment_writer.finalize()?;
-        let segment: Segment = self.segment.with_max_doc(max_doc);
+        let mut segment: Segment = self.segment.with_max_doc(max_doc);
+        // FerroSearch (Wave 15): build any auxiliary sort cursor files
+        // requested via `IndexSettings::sort_by_field`, and advertise
+        // them in `SegmentMeta::sort_cursor_fields` so they survive GC.
+        let cursor_fields = build_and_write_sort_cursors(&mut segment)?;
+        if !cursor_fields.is_empty() {
+            segment = segment.with_sort_cursor_fields(cursor_fields);
+        }
         let index = segment.index();
         let index_meta = IndexMeta {
             index_settings: index.settings().clone(),

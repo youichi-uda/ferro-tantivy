@@ -1,0 +1,584 @@
+//! Auxiliary "sort cursor" index — FerroSearch Wave 15 extension.
+//!
+//! See `vendor/tantivy-local/docs/sort_cursor_format.md` for the on-disk
+//! file layout. The high-level idea is to store a permutation of the
+//! segment's `DocId`s ordered by a configured fast field's first value.
+//! A subsequent top-K query that matches the configured sort can iterate
+//! the cursor and stop after K hits without scanning the whole segment.
+//!
+//! This module is deliberately decoupled from the `Collector` trait — it
+//! only owns the build/persist/iterate primitives. The Wave 15 Phase B
+//! collector lives in `crate::collector::early_term_sort_by_cursor`.
+
+use std::cmp::Ordering;
+use std::fmt::Debug;
+use std::io::{self, Write};
+
+use columnar::Column;
+use common::{BinarySerializable, DateTime};
+
+use crate::directory::FileSlice;
+use crate::error::DataCorruption;
+use crate::index::Order;
+use crate::DocId;
+
+/// Magic prefix `"SCRI"` (Sort Cursor RaIl).
+///
+/// Written as little-endian `u32`. Distinct from any other tantivy file
+/// magic to make corrupted/cross-mounted files fail loudly.
+const SORT_CURSOR_MAGIC: u32 = 0x4952_4353; // 'S','C','R','I' little-endian
+/// Format version. Bump on incompatible layout changes.
+const SORT_CURSOR_VERSION: u8 = 1;
+
+/// Auxiliary sort cursor for a single (segment, field) pair.
+///
+/// Owns a permutation `doc_ids` of the segment's live `DocId`s such that
+/// `column.first(doc_ids[i])` is non-decreasing (asc) or non-increasing
+/// (desc). Documents whose value is absent (`column.first(doc) == None`)
+/// are placed at the end regardless of order, matching Elasticsearch's
+/// default `missing="_last"` semantics.
+///
+/// The struct is cheap to clone (it owns a single `Vec<DocId>` and a
+/// short header), but in production the recommended access path is to
+/// open a `FileSlice` view via [`SortCursorIndex::open`] and iterate via
+/// [`SortCursorIndex::iter`] without copying the bulk array.
+#[derive(Clone, Debug)]
+pub struct SortCursorIndex {
+    field: String,
+    order: Order,
+    doc_ids: Vec<DocId>,
+}
+
+/// Internal sort key that mirrors Elasticsearch's `missing="_last"` rule.
+/// `None` always sorts last regardless of the requested `Order`.
+fn sort_key<T: PartialOrd>(
+    a: (DocId, &Option<T>),
+    b: (DocId, &Option<T>),
+    order: Order,
+) -> Ordering {
+    let a_missing = a.1.is_none() as u8;
+    let b_missing = b.1.is_none() as u8;
+    match a_missing.cmp(&b_missing) {
+        Ordering::Equal => {}
+        not_eq => return not_eq,
+    }
+    let value_cmp = match (a.1, b.1) {
+        (Some(av), Some(bv)) => match order {
+            Order::Asc => av.partial_cmp(bv).unwrap_or(Ordering::Equal),
+            Order::Desc => bv.partial_cmp(av).unwrap_or(Ordering::Equal),
+        },
+        _ => Ordering::Equal,
+    };
+    // Stable tie-breaker: doc_id ascending. This makes the on-disk
+    // representation deterministic across builds with the same data.
+    value_cmp.then_with(|| a.0.cmp(&b.0))
+}
+
+impl SortCursorIndex {
+    /// Builds a sort cursor by reading every doc's first value from `column`.
+    ///
+    /// `num_docs` is the segment's `max_doc` (the cursor enumerates
+    /// `0..num_docs`; deleted docs are filtered later by the consumer).
+    /// `field` is recorded verbatim in the file header so a later
+    /// `open` can verify the cursor matches the requested field.
+    pub fn build_from_column<T>(
+        field: impl Into<String>,
+        order: Order,
+        column: &Column<T>,
+        num_docs: u32,
+    ) -> Self
+    where
+        T: PartialOrd + Copy + Debug + Send + Sync + 'static,
+    {
+        let mut keyed: Vec<(DocId, Option<T>)> = (0..num_docs)
+            .map(|doc_id| (doc_id, column.first(doc_id)))
+            .collect();
+        keyed.sort_by(|a, b| sort_key((a.0, &a.1), (b.0, &b.1), order));
+        let doc_ids = keyed.into_iter().map(|(d, _)| d).collect();
+        Self {
+            field: field.into(),
+            order,
+            doc_ids,
+        }
+    }
+
+    /// Specialization that builds from a raw `Vec<Option<T>>` keyed by
+    /// `DocId`. Useful in tests where constructing a `Column<T>` is
+    /// awkward.
+    #[doc(hidden)]
+    pub fn build_from_values<T>(
+        field: impl Into<String>,
+        order: Order,
+        values: Vec<Option<T>>,
+    ) -> Self
+    where
+        T: PartialOrd + Copy + Debug + Send + Sync + 'static,
+    {
+        let mut keyed: Vec<(DocId, Option<T>)> = values
+            .into_iter()
+            .enumerate()
+            .map(|(d, v)| (d as DocId, v))
+            .collect();
+        keyed.sort_by(|a, b| sort_key((a.0, &a.1), (b.0, &b.1), order));
+        let doc_ids = keyed.into_iter().map(|(d, _)| d).collect();
+        Self {
+            field: field.into(),
+            order,
+            doc_ids,
+        }
+    }
+
+    /// Field name recorded in the cursor header.
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    /// Sort order recorded in the cursor header.
+    pub fn order(&self) -> Order {
+        self.order
+    }
+
+    /// Number of doc ids in the cursor (== `max_doc` at build time).
+    pub fn len(&self) -> usize {
+        self.doc_ids.len()
+    }
+
+    /// Returns `true` if the cursor is empty (no docs at build time).
+    pub fn is_empty(&self) -> bool {
+        self.doc_ids.is_empty()
+    }
+
+    /// Iterates the doc ids in sort order.
+    pub fn iter(&self) -> impl Iterator<Item = DocId> + '_ {
+        self.doc_ids.iter().copied()
+    }
+
+    /// Returns the underlying `Vec<DocId>` (already sorted).
+    pub fn doc_ids(&self) -> &[DocId] {
+        &self.doc_ids
+    }
+
+    /// Serialises the cursor to `writer` using the layout described in
+    /// `docs/sort_cursor_format.md`.
+    pub fn write<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        SORT_CURSOR_MAGIC.serialize(writer)?;
+        SORT_CURSOR_VERSION.serialize(writer)?;
+        let order_byte: u8 = match self.order {
+            Order::Asc => 0,
+            Order::Desc => 1,
+        };
+        order_byte.serialize(writer)?;
+        // 2 reserved bytes for future flags (e.g. missing-position policy).
+        0u16.serialize(writer)?;
+        // Field name length (u16) + UTF-8 bytes.
+        let field_bytes = self.field.as_bytes();
+        let field_len = u16::try_from(field_bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sort cursor field name exceeds 65,535 bytes",
+            )
+        })?;
+        field_len.serialize(writer)?;
+        writer.write_all(field_bytes)?;
+        // Number of doc ids, then the doc ids themselves (u32 LE).
+        let num_docs = u32::try_from(self.doc_ids.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sort cursor doc count exceeds u32::MAX",
+            )
+        })?;
+        num_docs.serialize(writer)?;
+        for &doc_id in &self.doc_ids {
+            doc_id.serialize(writer)?;
+        }
+        // Trailing magic for sanity-checking truncation.
+        SORT_CURSOR_MAGIC.serialize(writer)?;
+        Ok(())
+    }
+
+    /// Deserialises a cursor from a `FileSlice`.
+    ///
+    /// Returns `DataCorruption` on magic / version / size mismatch.
+    pub fn open(slice: FileSlice) -> crate::Result<Self> {
+        let bytes = slice.read_bytes()?;
+        Self::from_bytes(bytes.as_slice())
+    }
+
+    /// Parse a cursor from an in-memory byte buffer.
+    pub fn from_bytes(buf: &[u8]) -> crate::Result<Self> {
+        let mut reader = buf;
+        let magic = u32::deserialize(&mut reader).map_err(|e| {
+            DataCorruption::comment_only(format!("sort cursor: failed to read magic: {e}"))
+        })?;
+        if magic != SORT_CURSOR_MAGIC {
+            return Err(DataCorruption::comment_only(format!(
+                "sort cursor: bad magic 0x{magic:08x}, expected 0x{SORT_CURSOR_MAGIC:08x}"
+            ))
+            .into());
+        }
+        let version = u8::deserialize(&mut reader).map_err(|e| {
+            DataCorruption::comment_only(format!("sort cursor: failed to read version: {e}"))
+        })?;
+        if version != SORT_CURSOR_VERSION {
+            return Err(DataCorruption::comment_only(format!(
+                "sort cursor: unsupported version {version}, expected {SORT_CURSOR_VERSION}"
+            ))
+            .into());
+        }
+        let order_byte = u8::deserialize(&mut reader).map_err(|e| {
+            DataCorruption::comment_only(format!("sort cursor: failed to read order: {e}"))
+        })?;
+        let order = match order_byte {
+            0 => Order::Asc,
+            1 => Order::Desc,
+            other => {
+                return Err(DataCorruption::comment_only(format!(
+                    "sort cursor: invalid order byte {other}"
+                ))
+                .into());
+            }
+        };
+        let _reserved = u16::deserialize(&mut reader).map_err(|e| {
+            DataCorruption::comment_only(format!("sort cursor: failed to read reserved: {e}"))
+        })?;
+        let field_len = u16::deserialize(&mut reader).map_err(|e| {
+            DataCorruption::comment_only(format!("sort cursor: failed to read field_len: {e}"))
+        })? as usize;
+        if reader.len() < field_len {
+            return Err(DataCorruption::comment_only(
+                "sort cursor: field name truncated".to_string(),
+            )
+            .into());
+        }
+        let (field_bytes, rest) = reader.split_at(field_len);
+        let field = std::str::from_utf8(field_bytes)
+            .map_err(|e| {
+                DataCorruption::comment_only(format!("sort cursor: field name not utf8: {e}"))
+            })?
+            .to_string();
+        reader = rest;
+        let num_docs = u32::deserialize(&mut reader).map_err(|e| {
+            DataCorruption::comment_only(format!("sort cursor: failed to read num_docs: {e}"))
+        })? as usize;
+        let needed_bytes = num_docs.checked_mul(4).and_then(|n| n.checked_add(4));
+        let Some(needed_bytes) = needed_bytes else {
+            return Err(DataCorruption::comment_only(format!(
+                "sort cursor: num_docs ({num_docs}) overflow"
+            ))
+            .into());
+        };
+        if reader.len() < needed_bytes {
+            return Err(DataCorruption::comment_only(format!(
+                "sort cursor: payload truncated (need {needed_bytes} bytes, have {})",
+                reader.len()
+            ))
+            .into());
+        }
+        let mut doc_ids = Vec::with_capacity(num_docs);
+        for _ in 0..num_docs {
+            doc_ids.push(u32::deserialize(&mut reader).map_err(|e| {
+                DataCorruption::comment_only(format!("sort cursor: failed to read doc_id: {e}"))
+            })?);
+        }
+        let trailing_magic = u32::deserialize(&mut reader).map_err(|e| {
+            DataCorruption::comment_only(format!(
+                "sort cursor: failed to read trailing magic: {e}"
+            ))
+        })?;
+        if trailing_magic != SORT_CURSOR_MAGIC {
+            return Err(DataCorruption::comment_only(format!(
+                "sort cursor: bad trailing magic 0x{trailing_magic:08x}"
+            ))
+            .into());
+        }
+        Ok(Self {
+            field,
+            order,
+            doc_ids,
+        })
+    }
+}
+
+/// Builds a sort cursor by trying common fast-field column types in order
+/// (`i64`, `u64`, `f64`, `DateTime`).
+///
+/// Returns an error if no compatible column exists for `field`. This is
+/// the function the `SegmentWriter` finalize hook calls when
+/// `IndexSettings::sort_by_field` is set.
+pub fn build_sort_cursor_from_fast_fields(
+    readers: &crate::fastfield::FastFieldReaders,
+    field: &str,
+    order: Order,
+    num_docs: u32,
+) -> crate::Result<SortCursorIndex> {
+    if let Some(col) = readers.column_opt::<i64>(field)? {
+        return Ok(SortCursorIndex::build_from_column(field, order, &col, num_docs));
+    }
+    if let Some(col) = readers.column_opt::<u64>(field)? {
+        return Ok(SortCursorIndex::build_from_column(field, order, &col, num_docs));
+    }
+    if let Some(col) = readers.column_opt::<f64>(field)? {
+        return Ok(SortCursorIndex::build_from_column(field, order, &col, num_docs));
+    }
+    if let Some(col) = readers.column_opt::<DateTime>(field)? {
+        return Ok(SortCursorIndex::build_from_column(field, order, &col, num_docs));
+    }
+    Err(crate::TantivyError::SchemaError(format!(
+        "Field `{field}` is not a numeric or date fast field; cannot build sort cursor"
+    )))
+}
+
+/// Builds and persists the auxiliary sort cursor file(s) for `segment`,
+/// based on `segment.index().settings().sort_by_field`.
+///
+/// **FerroSearch extension (Wave 15).** Called by `index_documents` and
+/// `SingleSegmentIndexWriter::finalize` after the main segment files have
+/// been laid out on disk and `with_max_doc` has been applied. Returns
+/// the field names whose cursor was successfully written, so the caller
+/// can advertise them in `SegmentMeta::sort_cursor_fields` via
+/// [`crate::index::Segment::with_sort_cursor_fields`].
+///
+/// A no-op (`Ok(Vec::new())`) when the index has no `sort_by_field`
+/// configured — keeps the indexing path zero-cost for indices that do
+/// not opt in.
+pub fn build_and_write_sort_cursors(
+    segment: &mut crate::index::Segment,
+) -> crate::Result<Vec<String>> {
+    use common::TerminatingWrite;
+
+    let sort_by = match segment.index().settings().sort_by_field.clone() {
+        Some(sb) => sb,
+        None => return Ok(Vec::new()),
+    };
+    let max_doc = segment.meta().max_doc();
+    if max_doc == 0 {
+        // An empty segment carries no doc ids; skip writing a cursor.
+        return Ok(Vec::new());
+    }
+    let reader = crate::index::SegmentReader::open(segment)?;
+    let cursor = build_sort_cursor_from_fast_fields(
+        reader.fast_fields(),
+        &sort_by.field,
+        sort_by.order,
+        max_doc,
+    )?;
+    let mut writer = segment.open_sort_cursor_write(&sort_by.field)?;
+    cursor.write(&mut writer)?;
+    writer.terminate()?;
+    Ok(vec![sort_by.field])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(cursor: &SortCursorIndex) -> SortCursorIndex {
+        let mut buf = Vec::new();
+        cursor.write(&mut buf).expect("write should succeed");
+        SortCursorIndex::from_bytes(&buf).expect("parse should succeed")
+    }
+
+    #[test]
+    fn build_correctness_asc() {
+        // values per doc_id: doc 0 = 30, doc 1 = 10, doc 2 = 20
+        let cursor = SortCursorIndex::build_from_values(
+            "score",
+            Order::Asc,
+            vec![Some(30i64), Some(10), Some(20)],
+        );
+        assert_eq!(cursor.doc_ids(), &[1u32, 2, 0]);
+        assert_eq!(cursor.field(), "score");
+        assert_eq!(cursor.order(), Order::Asc);
+    }
+
+    #[test]
+    fn build_correctness_desc() {
+        let cursor = SortCursorIndex::build_from_values(
+            "score",
+            Order::Desc,
+            vec![Some(30i64), Some(10), Some(20)],
+        );
+        assert_eq!(cursor.doc_ids(), &[0u32, 2, 1]);
+        assert_eq!(cursor.order(), Order::Desc);
+    }
+
+    #[test]
+    fn missing_values_sort_last_for_both_orders() {
+        // doc 1 has no value; should always be at the tail.
+        let cursor_asc = SortCursorIndex::build_from_values(
+            "ts",
+            Order::Asc,
+            vec![Some(5i64), None, Some(1)],
+        );
+        assert_eq!(cursor_asc.doc_ids(), &[2u32, 0, 1]);
+
+        let cursor_desc = SortCursorIndex::build_from_values(
+            "ts",
+            Order::Desc,
+            vec![Some(5i64), None, Some(1)],
+        );
+        assert_eq!(cursor_desc.doc_ids(), &[0u32, 2, 1]);
+    }
+
+    #[test]
+    fn ties_break_by_doc_id_for_determinism() {
+        let cursor = SortCursorIndex::build_from_values(
+            "k",
+            Order::Asc,
+            vec![Some(7i64), Some(7), Some(7), Some(1)],
+        );
+        // 1 first, then ties broken by ascending doc_id.
+        assert_eq!(cursor.doc_ids(), &[3u32, 0, 1, 2]);
+    }
+
+    #[test]
+    fn write_open_roundtrip_small() {
+        let cursor = SortCursorIndex::build_from_values(
+            "@timestamp",
+            Order::Desc,
+            vec![Some(100i64), Some(50), Some(75), None],
+        );
+        let restored = roundtrip(&cursor);
+        assert_eq!(restored.field(), "@timestamp");
+        assert_eq!(restored.order(), Order::Desc);
+        assert_eq!(restored.doc_ids(), cursor.doc_ids());
+    }
+
+    #[test]
+    fn write_open_roundtrip_large() {
+        // 10K docs with semi-random keys.
+        let n = 10_000u32;
+        let values: Vec<Option<i64>> = (0..n)
+            .map(|i| Some(((i as i64) * 2654435761) & 0xFFFF))
+            .collect();
+        let cursor = SortCursorIndex::build_from_values("k", Order::Asc, values);
+        let restored = roundtrip(&cursor);
+        assert_eq!(restored.len(), n as usize);
+        assert_eq!(restored.doc_ids(), cursor.doc_ids());
+        // Independently verify monotonicity of the restored ordering by
+        // re-keying with the same sort.
+        // (We rebuild the values map and walk the doc_ids to check
+        // values are non-decreasing.)
+        let values2: Vec<i64> = (0..n)
+            .map(|i| ((i as i64) * 2654435761) & 0xFFFF)
+            .collect();
+        let mut prev: Option<i64> = None;
+        for &doc in restored.doc_ids() {
+            let v = values2[doc as usize];
+            if let Some(p) = prev {
+                assert!(p <= v, "non-monotonic at doc {doc}: {p} > {v}");
+            }
+            prev = Some(v);
+        }
+    }
+
+    #[test]
+    fn empty_cursor_roundtrips() {
+        let cursor =
+            SortCursorIndex::build_from_values::<i64>("empty", Order::Asc, Vec::new());
+        assert!(cursor.is_empty());
+        let restored = roundtrip(&cursor);
+        assert!(restored.is_empty());
+        assert_eq!(restored.field(), "empty");
+    }
+
+    #[test]
+    fn corrupted_magic_is_rejected() {
+        let cursor = SortCursorIndex::build_from_values(
+            "f",
+            Order::Asc,
+            vec![Some(1i64), Some(2), Some(3)],
+        );
+        let mut buf = Vec::new();
+        cursor.write(&mut buf).unwrap();
+        buf[0] = 0; // corrupt leading magic
+        let err = SortCursorIndex::from_bytes(&buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("magic"), "expected magic error, got: {msg}");
+    }
+
+    #[test]
+    fn unsupported_version_is_rejected() {
+        let cursor = SortCursorIndex::build_from_values(
+            "f",
+            Order::Asc,
+            vec![Some(1i64), Some(2)],
+        );
+        let mut buf = Vec::new();
+        cursor.write(&mut buf).unwrap();
+        // Version byte sits right after the 4-byte magic.
+        buf[4] = 99;
+        let err = SortCursorIndex::from_bytes(&buf).unwrap_err();
+        assert!(err.to_string().contains("version"));
+    }
+
+    #[test]
+    fn truncated_payload_is_rejected() {
+        let cursor = SortCursorIndex::build_from_values(
+            "f",
+            Order::Asc,
+            (0..256i64).map(Some).collect(),
+        );
+        let mut buf = Vec::new();
+        cursor.write(&mut buf).unwrap();
+        buf.truncate(buf.len() - 16);
+        let err = SortCursorIndex::from_bytes(&buf).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("truncated") || msg.contains("trailing"),
+            "expected truncation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn end_to_end_index_commit_persists_cursor() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField};
+        use crate::schema::{Schema, FAST};
+        use crate::{Index, IndexWriter, TantivyDocument};
+
+        let mut schema_builder = Schema::builder();
+        let value_field = schema_builder.add_i64_field("value", FAST);
+        let schema = schema_builder.build();
+
+        let settings = IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "value".to_string(),
+                order: Order::Desc,
+            }),
+            ..Default::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        // Insertion order is intentionally scrambled so the cursor must
+        // do non-trivial work to recover the descending sort.
+        for v in [40i64, 10, 30, 20, 50] {
+            let mut doc = TantivyDocument::default();
+            doc.add_i64(value_field, v);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let segment_reader = searcher.segment_reader(0);
+        // Meta should advertise the cursor.
+        let cursor_fields: Vec<&str> = segment_reader.sort_cursor_fields().collect();
+        assert_eq!(cursor_fields, vec!["value"]);
+
+        let cursor = segment_reader
+            .sort_cursor("value")
+            .expect("sort cursor should be present");
+        assert_eq!(cursor.field(), "value");
+        assert_eq!(cursor.order(), Order::Desc);
+        // Recovered doc order: descending by value → 50, 40, 30, 20, 10
+        // Insertion DocIds: 0=40, 1=10, 2=30, 3=20, 4=50
+        // → expected cursor.doc_ids() = [4, 0, 2, 3, 1].
+        assert_eq!(cursor.doc_ids(), &[4u32, 0, 2, 3, 1]);
+        Ok(())
+    }
+}

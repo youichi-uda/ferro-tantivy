@@ -36,6 +36,7 @@ impl SegmentMetaInventory {
             segment_id,
             max_doc,
             deletes: None,
+            sort_cursor_fields: Vec::new(),
         };
         SegmentMeta::from(self.inventory.track(inner))
     }
@@ -99,9 +100,31 @@ impl SegmentMeta {
     /// is by removing all files that have been created by tantivy
     /// and are not used by any segment anymore.
     pub fn list_files(&self) -> HashSet<PathBuf> {
-        SegmentComponent::iterator()
+        let mut files: HashSet<PathBuf> = SegmentComponent::iterator()
             .map(|component| self.relative_path(*component))
-            .collect::<HashSet<PathBuf>>()
+            .collect();
+        for field in &self.tracked.sort_cursor_fields {
+            files.insert(self.sort_cursor_path(field));
+        }
+        files
+    }
+
+    /// Returns the relative path of the auxiliary sort cursor file for `field`.
+    ///
+    /// **FerroSearch extension (Wave 15).** The path is
+    /// `{segment_uuid}.{field}.sortcursor`.
+    pub fn sort_cursor_path(&self, field: &str) -> PathBuf {
+        let mut path = self.id().uuid_string();
+        path.push('.');
+        path.push_str(field);
+        path.push_str(".sortcursor");
+        PathBuf::from(path)
+    }
+
+    /// Returns the list of fields for which a sort cursor was built at commit
+    /// time and persisted alongside the segment.
+    pub fn sort_cursor_fields(&self) -> &[String] {
+        &self.tracked.sort_cursor_fields
     }
 
     /// Returns the relative path of a component of our segment.
@@ -159,6 +182,28 @@ impl SegmentMeta {
             segment_id: inner_meta.segment_id,
             max_doc,
             deletes: None,
+            sort_cursor_fields: inner_meta.sort_cursor_fields.clone(),
+        });
+        SegmentMeta { tracked }
+    }
+
+    /// Records that an auxiliary sort cursor file was built for each of
+    /// `fields` at the time this segment was finalized.
+    ///
+    /// **FerroSearch extension (Wave 15).** Used by `SegmentWriter::finalize`
+    /// to advertise the cursor files via `SegmentMeta::list_files`, so the
+    /// directory GC retains them across writer cycles.
+    #[must_use]
+    pub fn with_sort_cursor_fields(self, fields: Vec<String>) -> SegmentMeta {
+        assert!(
+            self.tracked.sort_cursor_fields.is_empty(),
+            "with_sort_cursor_fields called twice"
+        );
+        let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
+            segment_id: inner_meta.segment_id,
+            max_doc: inner_meta.max_doc,
+            deletes: inner_meta.deletes.clone(),
+            sort_cursor_fields: fields.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -177,7 +222,8 @@ impl SegmentMeta {
         let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
             segment_id: inner_meta.segment_id,
             max_doc: inner_meta.max_doc,
-            deletes: Some(delete_meta),
+            deletes: Some(delete_meta.clone()),
+            sort_cursor_fields: inner_meta.sort_cursor_fields.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -188,6 +234,12 @@ struct InnerSegmentMeta {
     segment_id: SegmentId,
     max_doc: u32,
     pub deletes: Option<DeleteMeta>,
+    /// **FerroSearch extension (Wave 15).** Fields for which an auxiliary
+    /// sort cursor file `<segment_id>.<field>.sortcursor` was written at
+    /// commit time. Defaults to empty for backward compatibility with
+    /// segments produced before this extension existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sort_cursor_fields: Vec<String>,
 }
 
 impl InnerSegmentMeta {
@@ -224,6 +276,33 @@ pub struct IndexSettings {
     #[serde(default = "default_docstore_blocksize")]
     /// The size of each block that will be compressed and written to disk
     pub docstore_blocksize: usize,
+    /// Optional index-time sort.
+    ///
+    /// **FerroSearch extension (Wave 15).** When set, a `SortCursorIndex`
+    /// auxiliary file is built per segment at commit time, allowing top-K
+    /// sort queries that match the configured sort field/order to terminate
+    /// early after K hits. Equivalent in spirit to Elasticsearch's
+    /// `index.sort.field` setting, but implemented as a lazily-applied
+    /// auxiliary cursor rather than a physical doc-layout sort.
+    ///
+    /// Skipped at serialization when `None` to keep `meta.json` of indices
+    /// that do not opt in byte-identical to the upstream tantivy format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by_field: Option<IndexSortByField>,
+}
+
+/// Index-time sort configuration (FerroSearch Wave 15).
+///
+/// Identifies a single fast field whose values are used to build a
+/// `SortCursorIndex` per segment. Subsequent top-K queries with a matching
+/// sort can be served via the cursor and terminate after K hits without
+/// scanning the whole segment.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct IndexSortByField {
+    /// Name of the fast field to sort by.
+    pub field: String,
+    /// Sort order.
+    pub order: Order,
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -237,6 +316,7 @@ impl Default for IndexSettings {
             docstore_compression: Compressor::default(),
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
+            sort_by_field: None,
         }
     }
 }
@@ -406,6 +486,7 @@ mod tests {
                 }),
                 docstore_blocksize: 1_000_000,
                 docstore_compress_dedicated_thread: true,
+                sort_by_field: None,
             },
             segments: Vec::new(),
             schema,
@@ -471,7 +552,8 @@ mod tests {
             IndexSettings {
                 docstore_compression: Compressor::default(),
                 docstore_compress_dedicated_thread: true,
-                docstore_blocksize: 16_384
+                docstore_blocksize: 16_384,
+                sort_by_field: None,
             }
         );
         {

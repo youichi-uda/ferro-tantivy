@@ -12,7 +12,10 @@ use super::{AddBatch, AddBatchReceiver, AddBatchSender, PreparedCommit};
 use crate::directory::{DirectoryLock, GarbageCollectionResult, TerminatingWrite};
 use crate::error::TantivyError;
 use crate::fastfield::write_alive_bitset;
-use crate::index::{Index, Segment, SegmentComponent, SegmentId, SegmentMeta, SegmentReader};
+use crate::index::{
+    build_and_write_sort_cursors, Index, Segment, SegmentComponent, SegmentId, SegmentMeta,
+    SegmentReader,
+};
 use crate::indexer::delete_queue::{DeleteCursor, DeleteQueue};
 use crate::indexer::doc_opstamp_mapping::DocToOpstampMapping;
 use crate::indexer::index_writer_status::IndexWriterStatus;
@@ -232,7 +235,15 @@ fn index_documents<D: Document>(
 
     let doc_opstamps: Vec<Opstamp> = segment_writer.finalize()?;
 
-    let segment_with_max_doc = segment.with_max_doc(max_doc);
+    let mut segment_with_max_doc = segment.with_max_doc(max_doc);
+
+    // FerroSearch (Wave 15): if the index is configured with
+    // `sort_by_field`, build the auxiliary sort cursor file(s) and
+    // record them in segment meta so the directory GC keeps them.
+    let cursor_fields = build_and_write_sort_cursors(&mut segment_with_max_doc)?;
+    if !cursor_fields.is_empty() {
+        segment_with_max_doc = segment_with_max_doc.with_sort_cursor_fields(cursor_fields);
+    }
 
     let alive_bitset_opt = apply_deletes(&segment_with_max_doc, &mut delete_cursor, &doc_opstamps)?;
 

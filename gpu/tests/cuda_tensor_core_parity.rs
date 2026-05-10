@@ -318,6 +318,66 @@ fn parity_cached_corpus_matches_fresh() {
     }
 }
 
+/// `compute_batched_into_pinned` must produce byte-identical output to
+/// the `Vec<u32>`-returning entry point. The pinned API is the
+/// production HNSW-loop entry point, so this is the gate that protects
+/// the speedup-bearing path from silent regressions.
+#[test]
+fn parity_pinned_buffer_matches_vec_path() {
+    let kernel = match try_build() {
+        Some(k) => k,
+        None => return,
+    };
+
+    let cases: &[(usize, usize, usize)] = &[
+        (1, 1, 32),
+        (4, 100, 256),
+        (8, 1024, 768),
+        (64, 8192, 1024),
+    ];
+
+    for &(q, n, dim_bits) in cases {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let mut queries = random_u32_vec(q * dim_u32, 0x9999_8888_7777_6666u64 ^ q as u64 ^ n as u64);
+        let mut corpus = random_u32_vec(n * dim_u32, 0xaaaa_bbbb_cccc_ddddu64 ^ q as u64 ^ n as u64);
+        zero_padding(&mut queries, q, dim_bits);
+        zero_padding(&mut corpus, n, dim_bits);
+
+        let cpu = hamming_distances_batched_cpu(&queries, &corpus, q, n, dim_u32);
+
+        let cached = kernel
+            .prepare_corpus(&corpus, n, dim_bits)
+            .expect("prepare_corpus");
+        let mut pinned = kernel
+            .alloc_pinned_u32(q * n)
+            .expect("alloc_pinned_u32");
+        cached
+            .compute_batched_into_pinned(&queries, q, &mut pinned)
+            .expect("compute_batched_into_pinned");
+        assert_eq!(
+            pinned.as_slice(),
+            cpu.as_slice(),
+            "pinned-output path must be byte-equal to CPU oracle (Q={q} N={n} dim={dim_bits})"
+        );
+
+        // Also confirm the same allocation can be reused for a
+        // smaller second batch — the buffer reuse pattern the HNSW
+        // search loop relies on.
+        let q2 = q.max(2) / 2;
+        if q2 > 0 {
+            let cpu2 = hamming_distances_batched_cpu(&queries[..q2 * dim_u32], &corpus, q2, n, dim_u32);
+            cached
+                .compute_batched_into_pinned(&queries[..q2 * dim_u32], q2, &mut pinned)
+                .expect("compute_batched_into_pinned (smaller batch)");
+            assert_eq!(
+                &pinned.as_slice()[..q2 * n],
+                cpu2.as_slice(),
+                "pinned reuse must be byte-equal at smaller batch (Q={q2} N={n} dim={dim_bits})"
+            );
+        }
+    }
+}
+
 /// Small-but-odd shapes that probe leading-dimension and alignment
 /// edges of the IMMA path.
 #[test]

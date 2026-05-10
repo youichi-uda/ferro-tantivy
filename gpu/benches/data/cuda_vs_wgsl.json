@@ -3,10 +3,10 @@
   "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
   "go_threshold_speedup": 3.0,
   "results": [
-    {"shape": "dim=768  N=10000   Q=8", "num_queries": 8, "num_vecs": 10000, "dim_bits": 768, "wgsl_ns": 1992382, "cuda_ns": 291932, "speedup": 6.8248, "byte_equal": true},
-    {"shape": "dim=768  N=10000   Q=64", "num_queries": 64, "num_vecs": 10000, "dim_bits": 768, "wgsl_ns": 2331253, "cuda_ns": 481075, "speedup": 4.8459, "byte_equal": true},
-    {"shape": "dim=768  N=100000  Q=8", "num_queries": 8, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 5627041, "cuda_ns": 2383768, "speedup": 2.3606, "byte_equal": true},
-    {"shape": "dim=768  N=100000  Q=64", "num_queries": 64, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 22605657, "cuda_ns": 4145483, "speedup": 5.4531, "byte_equal": true},
-    {"shape": "dim=768  N=1000000 Q=64", "num_queries": 64, "num_vecs": 1000000, "dim_bits": 768, "wgsl_ns": 205392283, "cuda_ns": 84929839, "speedup": 2.4184, "byte_equal": true}
+    {"shape": "dim=768  N=10000   Q=8", "num_queries": 8, "num_vecs": 10000, "dim_bits": 768, "wgsl_ns": 2318222, "cuda_ns": 301883, "speedup": 7.6792, "byte_equal": true},
+    {"shape": "dim=768  N=10000   Q=64", "num_queries": 64, "num_vecs": 10000, "dim_bits": 768, "wgsl_ns": 2458600, "cuda_ns": 483514, "speedup": 5.0849, "byte_equal": true},
+    {"shape": "dim=768  N=100000  Q=8", "num_queries": 8, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 5996788, "cuda_ns": 2379969, "speedup": 2.5197, "byte_equal": true},
+    {"shape": "dim=768  N=100000  Q=64", "num_queries": 64, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 24392840, "cuda_ns": 4222901, "speedup": 5.7763, "byte_equal": true},
+    {"shape": "dim=768  N=1000000 Q=64", "num_queries": 64, "num_vecs": 1000000, "dim_bits": 768, "wgsl_ns": 234531762, "cuda_ns": 97481526, "speedup": 2.4059, "byte_equal": true}
   ]
 }

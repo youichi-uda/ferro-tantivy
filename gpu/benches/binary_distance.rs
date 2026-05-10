@@ -555,9 +555,10 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
     println!();
     println!("--- CUDA cached corpus vs WGSL (production calling pattern) ---");
     println!("(prepare_corpus once, then time only the per-query batch)");
+    println!("(CUDA-c = `Vec<u32>` API, CUDA-p = `_into_pinned` Phase 5-1 path)");
     println!(
-        "{:<32}  {:>10}  {:>10}  {:>8}  {:>8}",
-        "shape", "WGSL", "CUDA-c", "speedup", "match"
+        "{:<32}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}  {:>8}",
+        "shape", "WGSL", "CUDA-c", "CUDA-p", "c/WGSL", "p/WGSL", "match"
     );
     let cached_shapes: &[(&str, usize, usize, usize)] = &[
         ("dim=768  N=100000  Q=64 ", 100_000, 64, 768),
@@ -565,6 +566,7 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
     ];
     let mut cached_json_rows: Vec<String> = Vec::new();
     let mut cached_1m_speedup: Option<f64> = None;
+    let mut pinned_1m_speedup: Option<f64> = None;
     for &(label, num_vecs, num_queries, dim_bits) in cached_shapes {
         let dim_u32 = dim_u32_for(dim_bits);
         let queries = random_u32_vec(num_queries * dim_u32, 0xa1a2_a3a4_a5a6_a7a8);
@@ -585,6 +587,19 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
             panic!("cached CUDA != WGSL on shape {label}");
         }
 
+        // Phase 5-1 entry point: a user-supplied pinned host buffer
+        // sized once for the largest batch, reused across calls.
+        let mut pinned_out = cuda
+            .alloc_pinned_u32(num_queries * num_vecs)
+            .expect("alloc_pinned_u32");
+        cached
+            .compute_batched_into_pinned(&queries, num_queries, &mut pinned_out)
+            .expect("cuda cached pinned");
+        let pinned_matches = pinned_out.as_slice() == cuda_first.as_slice();
+        if !pinned_matches {
+            panic!("pinned CUDA != Vec CUDA on shape {label}");
+        }
+
         let iters = if num_vecs >= 1_000_000 { 3 } else { 5 };
         let cuda_time = bench(iters, || {
             black_box(
@@ -593,6 +608,12 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
                     .expect("cuda cached"),
             );
         });
+        let pinned_time = bench(iters, || {
+            cached
+                .compute_batched_into_pinned(&queries, num_queries, &mut pinned_out)
+                .expect("cuda cached pinned");
+            black_box(pinned_out.as_slice());
+        });
         let wgsl_time = bench(iters, || {
             black_box(
                 wgsl_kernel
@@ -600,29 +621,36 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
                     .expect("wgsl batched"),
             );
         });
-        let speedup = wgsl_time.as_nanos() as f64 / cuda_time.as_nanos().max(1) as f64;
+        let cuda_speedup = wgsl_time.as_nanos() as f64 / cuda_time.as_nanos().max(1) as f64;
+        let pinned_speedup = wgsl_time.as_nanos() as f64 / pinned_time.as_nanos().max(1) as f64;
         if num_vecs == 1_000_000 {
-            cached_1m_speedup = Some(speedup);
+            cached_1m_speedup = Some(cuda_speedup);
+            pinned_1m_speedup = Some(pinned_speedup);
         }
         println!(
-            "{:<32}  {:>10}  {:>10}  {:>7.2}x  {:>8}",
+            "{:<32}  {:>10}  {:>10}  {:>10}  {:>7.2}x  {:>7.2}x  {:>8}",
             label,
             fmt_dur(wgsl_time),
             fmt_dur(cuda_time),
-            speedup,
-            if matches { "ok" } else { "DIVERGE" }
+            fmt_dur(pinned_time),
+            cuda_speedup,
+            pinned_speedup,
+            if matches && pinned_matches { "ok" } else { "DIVERGE" }
         );
         cached_json_rows.push(format!(
             "    {{\"shape\": \"{}\", \"num_queries\": {}, \"num_vecs\": {}, \"dim_bits\": {}, \
-             \"wgsl_ns\": {}, \"cuda_cached_ns\": {}, \"speedup\": {:.4}, \"byte_equal\": {}}}",
+             \"wgsl_ns\": {}, \"cuda_cached_ns\": {}, \"cuda_pinned_ns\": {}, \
+             \"cached_speedup\": {:.4}, \"pinned_speedup\": {:.4}, \"byte_equal\": {}}}",
             label.trim(),
             num_queries,
             num_vecs,
             dim_bits,
             wgsl_time.as_nanos(),
             cuda_time.as_nanos(),
-            speedup,
-            matches
+            pinned_time.as_nanos(),
+            cuda_speedup,
+            pinned_speedup,
+            matches && pinned_matches
         ));
     }
 
@@ -639,6 +667,10 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
         info.name.replace('"', "\\\"")
     ));
     cached_json.push_str("  \"calling_pattern\": \"prepare_corpus once, then time per-query batch\",\n");
+    cached_json.push_str("  \"variants\": {\n");
+    cached_json.push_str("    \"cuda_cached_ns\": \"compute_batched (Vec<u32> return — pinned scratch + memcpy)\",\n");
+    cached_json.push_str("    \"cuda_pinned_ns\": \"compute_batched_into_pinned (Phase 5-1 — direct pinned DMA, no host memcpy)\"\n");
+    cached_json.push_str("  },\n");
     cached_json.push_str("  \"results\": [\n");
     cached_json.push_str(&cached_json_rows.join(",\n"));
     cached_json.push_str("\n  ]\n}\n");
@@ -661,6 +693,26 @@ fn cuda_vs_wgsl_section(ctx: &GpuContext) {
             );
             println!(
                 "ASSERT PASSED   : CUDA-cached @ N=1M Q=64 = {s:.2}x >= {go_threshold:.1}x"
+            );
+        }
+    }
+
+    // Phase 5-1 sign-off: the pinned-output path must clear 4× WGSL
+    // at the headline shape — that's the conservative target the
+    // ADR's Phase 5-1 entry advertises (the Wave 4 envelope for a
+    // device-resident corpus + pinned host DMA was 6-7×, so 4× is
+    // the regression gate).
+    let phase_5_1_threshold = 4.0_f64;
+    if let Some(s) = pinned_1m_speedup {
+        let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
+        if !assert_off {
+            assert!(
+                s >= phase_5_1_threshold,
+                "Phase 5-1 pinned path @ N=1M Q=64 = {s:.2}x below threshold \
+                 {phase_5_1_threshold:.1}x. Set BINARY_DIST_BENCH_NO_ASSERT=1 to skip."
+            );
+            println!(
+                "ASSERT PASSED   : CUDA-pinned @ N=1M Q=64 = {s:.2}x >= {phase_5_1_threshold:.1}x"
             );
         }
     }

@@ -25,11 +25,12 @@ use std::sync::Arc;
 
 use cudarc::cublaslt::{result as blas_result, sys as blas_sys};
 use cudarc::driver::{
-    sys as drv_sys, CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
-    LaunchConfig, PushKernelArg,
+    result as drv_result, sys as drv_sys, CudaContext, CudaFunction, CudaSlice, CudaStream,
+    DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx_with_opts;
 
+use super::pinned::PinnedU32Buffer;
 use crate::error::{GpuError, GpuResult};
 
 /// Bit-packed + unpacked + popcount corpus, kept resident on the
@@ -200,8 +201,9 @@ pub(super) struct CudaGemmRunner {
     top_k_func: CudaFunction,
     stream: Arc<CudaStream>,
     // Hold the context so the device isn't dropped while we still own
-    // the cuBLASLt handle / workspace.
-    _ctx: Arc<CudaContext>,
+    // the cuBLASLt handle / workspace, and so the parent module can
+    // allocate user-visible pinned host buffers tied to it.
+    ctx: Arc<CudaContext>,
 }
 
 impl CudaGemmRunner {
@@ -264,8 +266,15 @@ impl CudaGemmRunner {
             correction_func,
             top_k_func,
             stream,
-            _ctx: ctx,
+            ctx,
         })
+    }
+
+    /// Borrow of the underlying CUDA context, exposed so the parent
+    /// module can allocate user-visible pinned host buffers tied to
+    /// the same context.
+    pub(super) fn ctx(&self) -> &Arc<CudaContext> {
+        &self.ctx
     }
 
     /// Upload bit-packed `inputs` (M rows × dim_u32 words), unpack to
@@ -371,8 +380,17 @@ impl CudaGemmRunner {
     }
 
     /// Convenience wrapper around [`Self::gemm_and_correct_dev`] that
-    /// downloads the full `m × n` result to host memory and waits for
-    /// completion before returning.
+    /// downloads the full `m × n` result into a freshly allocated
+    /// pageable `Vec<u32>` and waits for completion before returning.
+    ///
+    /// At very large output sizes (≥ 100 MB; the headline
+    /// `Q = 64, N = 1 M, dim = 768` shape is ≈ 256 MB) the host-side
+    /// memcpy from a cached pinned scratch into a fresh `Vec` is more
+    /// expensive than the driver's staging-buffer DMA into pageable
+    /// memory, so this path keeps the original `clone_dtoh`. Callers
+    /// that want the Phase 5-1 pinned-DMA path use
+    /// [`Self::gemm_and_correct_into_pinned`] which DMAs directly
+    /// into the user-supplied pinned buffer.
     fn gemm_and_correct(
         &self,
         q_i8_dev: &CudaSlice<i8>,
@@ -388,6 +406,43 @@ impl CudaGemmRunner {
         let out_host = self.stream.clone_dtoh(&out_dev).map_err(map_drv)?;
         self.stream.synchronize().map_err(map_drv)?;
         Ok(out_host)
+    }
+
+    /// Same compute path as [`Self::gemm_and_correct`] but writes the
+    /// `m × n` distance matrix directly into a user-supplied pinned
+    /// host buffer, skipping the pinned → `Vec<u32>` host copy. The
+    /// caller is responsible for sizing `out` to at least `m * n`
+    /// elements; a smaller buffer is rejected.
+    fn gemm_and_correct_into_pinned(
+        &self,
+        q_i8_dev: &CudaSlice<i8>,
+        d_i8_dev: &CudaSlice<i8>,
+        pop_q_dev: &CudaSlice<i32>,
+        pop_d_dev: &CudaSlice<i32>,
+        m: usize,
+        n: usize,
+        k: usize,
+        out: &mut PinnedU32Buffer,
+    ) -> GpuResult<()> {
+        let total = m.checked_mul(n).ok_or_else(|| GpuError::CpuFallback {
+            reason: format!("gemm_and_correct: m * n overflow (m={m}, n={n})"),
+        })?;
+        if out.len() < total {
+            return Err(GpuError::ColumnTypeMismatch {
+                expected: format!("pinned out buffer len ≥ {total}"),
+                actual: format!("pinned out buffer len = {}", out.len()),
+            });
+        }
+        let out_dev =
+            self.gemm_and_correct_dev(q_i8_dev, d_i8_dev, pop_q_dev, pop_d_dev, m, n, k)?;
+        unsafe {
+            let dst_slice = std::slice::from_raw_parts_mut(out.as_mut_ptr(), total);
+            let (src_ptr, _record) = out_dev.device_ptr(&self.stream);
+            drv_result::memcpy_dtoh_async(dst_slice, src_ptr, self.stream.cu_stream())
+                .map_err(map_drv)?;
+        }
+        self.stream.synchronize().map_err(map_drv)?;
+        Ok(())
     }
 
     /// End-to-end batched compute: returns row-major `M × N` Hamming
@@ -466,6 +521,35 @@ impl CudaGemmRunner {
             num_queries,
             corpus.num_vecs,
             corpus.dim_bits,
+        )
+    }
+
+    /// Same as [`Self::run_with_cached_corpus`] but writes the result
+    /// matrix directly into the user-supplied pinned host buffer. The
+    /// production HNSW search loop reuses the same buffer across
+    /// thousands of query batches against one segment, so this path
+    /// avoids both the per-call allocation and the pinned → `Vec<u32>`
+    /// host memcpy that the `Vec`-returning entry point pays.
+    pub(super) fn run_with_cached_corpus_into_pinned(
+        &self,
+        queries_bits: &[u32],
+        pop_q: &[i32],
+        corpus: &CachedCorpus,
+        num_queries: usize,
+        out: &mut PinnedU32Buffer,
+    ) -> GpuResult<()> {
+        debug_assert_eq!(pop_q.len(), num_queries);
+        let q_i8_dev = self.unpack_to_device(queries_bits, num_queries, corpus.dim_bits)?;
+        let pop_q_dev = self.stream.clone_htod(pop_q).map_err(map_drv)?;
+        self.gemm_and_correct_into_pinned(
+            &q_i8_dev,
+            &corpus.unpacked_dev,
+            &pop_q_dev,
+            &corpus.pop_dev,
+            num_queries,
+            corpus.num_vecs,
+            corpus.dim_bits,
+            out,
         )
     }
 

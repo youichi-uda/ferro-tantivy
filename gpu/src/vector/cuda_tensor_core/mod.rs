@@ -53,12 +53,14 @@
 //! single-query kernel.
 
 mod kernel;
+mod pinned;
 mod popcount;
 
 use std::sync::Arc;
 
 use crate::error::{GpuError, GpuResult};
 use kernel::{CachedCorpus, CudaGemmRunner};
+pub use pinned::PinnedU32Buffer;
 use popcount::popcount_per_vec;
 
 /// CUDA Tensor Core kernel for binary Hamming distance.
@@ -194,6 +196,17 @@ impl CudaTensorCoreKernel {
         let cached = self.prepare_corpus(corpus_bits, num_vecs, dim_bits)?;
         cached.knn_search(queries_bits, num_queries, k)
     }
+
+    /// Allocate a page-locked (pinned) host buffer of `len` `u32`
+    /// values, suitable as a destination for
+    /// [`CudaBinaryCorpus::compute_batched_into_pinned`]. A pinned
+    /// buffer DMAs directly from the device at full PCIe bandwidth,
+    /// roughly halving result-download wall-clock at the
+    /// `Q = 64, N = 1 M, dim = 768` headline shape (≈ 256 MB result
+    /// matrix) compared with the pageable `Vec<u32>` API.
+    pub fn alloc_pinned_u32(&self, len: usize) -> GpuResult<PinnedU32Buffer> {
+        PinnedU32Buffer::new(self.inner.ctx(), len)
+    }
 }
 
 /// On-device cached corpus produced by
@@ -240,6 +253,43 @@ impl CudaBinaryCorpus {
         self.inner
             .runner
             .run_with_cached_corpus(queries_bits, &pop_q, &self.inner, num_queries)
+    }
+
+    /// Pinned-output overload of [`Self::compute_batched`]. The result
+    /// matrix is written directly into the user-supplied
+    /// [`PinnedU32Buffer`]; only the small popcount + query upload and
+    /// the device-side compute need to run before the host can read
+    /// `out.as_slice()`. Allocate the buffer once (typically sized to
+    /// `max_query_batch * num_vecs`) via
+    /// [`CudaTensorCoreKernel::alloc_pinned_u32`] and reuse it across
+    /// the search loop.
+    ///
+    /// The buffer must hold at least `num_queries * num_vecs`
+    /// elements; smaller buffers are rejected up-front.
+    pub fn compute_batched_into_pinned(
+        &self,
+        queries_bits: &[u32],
+        num_queries: usize,
+        out: &mut PinnedU32Buffer,
+    ) -> GpuResult<()> {
+        let dim_u32 = self.inner.dim_bits.div_ceil(32);
+        if num_queries == 0 {
+            return Ok(());
+        }
+        if queries_bits.len() != num_queries * dim_u32 {
+            return Err(GpuError::ColumnTypeMismatch {
+                expected: format!("queries_bits.len() == {}", num_queries * dim_u32),
+                actual: format!("queries_bits.len() == {}", queries_bits.len()),
+            });
+        }
+        let pop_q = popcount_per_vec(queries_bits, num_queries, dim_u32);
+        self.inner.runner.run_with_cached_corpus_into_pinned(
+            queries_bits,
+            &pop_q,
+            &self.inner,
+            num_queries,
+            out,
+        )
     }
 
     /// End-to-end CUDA k-NN search: compute the Q × N distance matrix

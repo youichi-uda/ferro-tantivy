@@ -129,11 +129,39 @@ post-correction.
   Raw timings: `gpu/benches/data/cuda_cached_vs_wgsl.json`. The cached
   path now clears the 3× Go threshold at the N = 1 M shape.
 - Remaining headroom on the cached N = 1 M path (60 ms vs the Wave 4
-  reference's ≈8 ms compute envelope) is dominated by the 256 MB
-  result download (~21 ms) and serial-stream overhead. Phase 5
-  follow-ups when needed: pinned host memory for the result download,
-  async stream + double buffering for query upload, and a fused
-  `compute_batched + top_k` kernel that ships only `Q × K × 8 B` back.
+  reference's ≈8 ms compute envelope) was dominated by the 256 MB
+  result download (~21 ms) and serial-stream overhead. Phase 5-1
+  closes most of that gap; the rest is staged in 5-2 / 5-3 / 5-4.
+- **Phase 5-1 — pinned-output API
+  (`compute_batched_into_pinned`)**: a new entry point on
+  `CudaTensorCoreKernel` and `CudaBinaryCorpus` writes the `Q × N` `u32`
+  distance matrix directly into a user-supplied page-locked host
+  buffer, allocated via `CudaTensorCoreKernel::alloc_pinned_u32`. The
+  pinned buffer uses `CU_MEMHOSTALLOC_DEFAULT` flags (cacheable; not
+  the write-combined flavour exposed by `cudarc::CudaContext::alloc_pinned`,
+  which would penalise host reads). This skips both the driver's
+  staging-buffer copy and the pinned → `Vec<u32>` host memcpy that the
+  `Vec`-returning entry point pays. The `Vec<u32>` API is unchanged —
+  for very large outputs (≥ 100 MB) the staging-DMA-into-pageable
+  path is still cheaper than DMA-into-pinned + a host memcpy.
+  Re-measured on RTX 4070 Ti SUPER:
+  | shape (Q × N × dim) | WGSL | CUDA cached `Vec` | CUDA cached pinned | pinned / WGSL |
+  |---------------------|------|-------------------|--------------------|---------------|
+  | 64 × 100 000 × 768  | 23.66 ms | 2.39 ms | 2.57 ms | **9.20×** |
+  | 64 × 1 000 000 × 768 | 250.00 ms | 76.83 ms | **27.41 ms** | **9.12×** |
+  Raw timings: `gpu/benches/data/cuda_cached_vs_wgsl.json` (the JSON
+  now carries both `cuda_cached_ns` and `cuda_pinned_ns` per shape
+  plus a `variants` block describing each). Bit-equivalence is held by
+  the new `parity_pinned_buffer_matches_vec_path` parity test (4
+  representative shapes; pinned bytes byte-equal to the CPU oracle and
+  to the `Vec<u32>` path; buffer reuse across shrinking batches also
+  exercised).
+- Phase 5 still on the table: 5-2 double-buffered query upload for
+  HNSW search loops (overlap next batch's query upload with current
+  GEMM), 5-3 BMMA 1-bit tensor-core PoC (eliminates the unpack to
+  one-byte-per-bit and lifts arithmetic throughput by 8× if the
+  inline-PTX path holds), and 5-4 real-data SIFT1M / GIST1M recall@k
+  in `ferro-bench-runner`.
 - **Phase C — `knn_search` end-to-end CUDA path**: the WGSL
   `top_k_select.wgsl` bitonic-merge top-K shader has been ported to
   CUDA (NVRTC, same algorithm, same tie-break), and

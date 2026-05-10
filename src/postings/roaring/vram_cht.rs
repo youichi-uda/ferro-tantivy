@@ -302,7 +302,16 @@ impl VramCht {
     /// this entry is now the freshest. The returned `Arc` keeps the
     /// device buffer alive across concurrent eviction; the pointer is
     /// stable for the `Arc`'s lifetime.
+    ///
+    /// When the `FERRO_DISABLE_VRAM_CHT` env var is set, returns `None`
+    /// immediately and bumps the misses counter so observers see the
+    /// kill-switch effect (the dispatch path then falls through to
+    /// the host fold path bytewise-identically to D-1 alone).
     pub fn get(&self, key: &ChtKey) -> Option<Arc<VramTermEntry>> {
+        if is_disabled() {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let mut inner = self.inner.lock().expect("VramCht mutex poisoned");
         let next_token = inner.next_token + 1;
         let cloned = if let Some((entry, token)) = inner.map.get_mut(key) {
@@ -340,6 +349,12 @@ impl VramCht {
         key: ChtKey,
         roaring: &RoaringPostings,
     ) -> Result<bool, VramChtError> {
+        if is_disabled() {
+            // Kill-switch active — pretend we accepted the entry but
+            // don't allocate device memory. Subsequent `get` calls
+            // will miss as expected.
+            return Ok(false);
+        }
         // Compute footprint up front before any device calls.
         let bucket_count = roaring
             .containers
@@ -594,6 +609,35 @@ pub fn global() -> &'static VramCht {
     GLOBAL_VRAM_CHT.get_or_init(|| VramCht::with_budget(DEFAULT_VRAM_CHT_BUDGET_BYTES))
 }
 
+/// Phase 2 D-3 v2 kill-switch — when the `FERRO_DISABLE_VRAM_CHT`
+/// env var is set to `1` / `true`, all `get` / `insert` / `promote`
+/// calls short-circuit (return as if the cache were always empty
+/// and full-budget rejected). The dispatch site
+/// (`try_gpu_intersect`) sees `None` from `get` and falls through
+/// to the host fold path, giving operators a clean A/B comparison
+/// against the D-1 host CHT alone without recompiling.
+///
+/// Checked once on first call (process-lifetime cache); the env
+/// var must be set before any query path touches the cache. Stats
+/// counters still record the misses so observers can confirm the
+/// kill-switch is active.
+fn is_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("FERRO_DISABLE_VRAM_CHT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Whether the VRAM CHT kill-switch is currently active. Public so
+/// the periodic stats logger and bench harnesses can report the
+/// effective state alongside the hit/miss counters.
+#[must_use]
+pub fn kill_switch_active() -> bool {
+    is_disabled()
+}
+
 /// Get the process-global VRAM cache, initialising with a custom
 /// budget **iff this is the first access**. Returns `None` if the
 /// global is already initialised.
@@ -828,6 +872,55 @@ mod tests {
         let inserted = cht.insert(key2.clone(), &small_roaring()).unwrap();
         assert!(inserted);
         assert!(cht.get(&key2).is_some());
+    }
+
+    #[test]
+    fn kill_switch_via_env_var() {
+        // Phase 2 D-3 v2 follow-up: FERRO_DISABLE_VRAM_CHT=1 forces
+        // get/insert/promote to short-circuit so operators can A/B
+        // bench v2 vs D-1 alone without recompiling.
+        //
+        // This test cannot run in parallel with other tests that read
+        // the kill-switch state because `is_disabled()` caches the
+        // env-var lookup in a process-global `OnceLock`. We test the
+        // API surface (the underlying static caching is process-local
+        // to the test binary; in production the env var is set once
+        // at startup before any cache touch).
+        if !cuda_available() {
+            return;
+        }
+        // We can't easily flip the env var mid-test (OnceLock caches
+        // on first call). Instead, document that:
+        //   - With FERRO_DISABLE_VRAM_CHT unset (default):
+        //     get-then-insert-then-get sees: miss → insert OK → hit.
+        //   - With FERRO_DISABLE_VRAM_CHT=1 (set before process start):
+        //     get-then-insert-then-get sees: miss → insert OK(false) → miss.
+        //
+        // The following assertions cover the default path; the
+        // kill-switch path is exercised end-to-end by the bench
+        // harness's `FERRO_DISABLE_VRAM_CHT=1 cargo bench` invocation
+        // (Phase 2 D-3 v2 follow-up A/B).
+        let cht = VramCht::with_budget(64 * 1024 * 1024);
+        let key = dummy_key(0xb007, 100);
+        if kill_switch_active() {
+            // Env var was set before this test process started.
+            // Verify get/insert short-circuit cleanly.
+            assert!(cht.get(&key).is_none());
+            let inserted = cht.insert(key.clone(), &small_roaring()).unwrap();
+            assert!(!inserted, "kill-switch active: insert must short-circuit");
+            assert!(cht.get(&key).is_none(), "kill-switch active: get always misses");
+            // Stats: misses bumped (twice — once per get), inserts not bumped.
+            let stats = cht.stats();
+            assert_eq!(stats.inserts, 0);
+            assert_eq!(stats.entries, 0);
+            assert!(stats.misses >= 2);
+        } else {
+            // Default path: cache works as designed.
+            assert!(cht.get(&key).is_none());
+            let inserted = cht.insert(key.clone(), &small_roaring()).unwrap();
+            assert!(inserted);
+            assert!(cht.get(&key).is_some());
+        }
     }
 
     #[test]

@@ -388,6 +388,7 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
                 start_after: None,
                 scoring: None,
                 scores: Vec::new(),
+                start_after_raw: None,
             });
         };
 
@@ -423,6 +424,51 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
             Vec::new()
         };
 
+        // **Wave 18-3 follow-up: non-exact pivot resolution.**
+        //
+        // Resolve the caller-supplied `start_after` once per segment
+        // into a "raw" form where every `CursorSortVal::String(bytes)`
+        // slot is rewritten as a `CursorSortVal::Numeric(ord)` whose
+        // u64 value is a segment-local boundary computed via
+        // `dict.term_ord_or_next(bytes)`.  The harvest hot loop then
+        // checks `is_strictly_after_lex` against this raw form using
+        // the cursor's stored u64 ords *before* paying for the byte-
+        // decode of the matched doc's tuple, so docs that fail the
+        // search_after constraint never enter the per-field decode
+        // path (which clones up to ~32 bytes per string slot).
+        //
+        // Encoding rules (mirror `is_strictly_after_lex`'s Numeric
+        // arm semantics; see `resolve_search_after_string_slot`):
+        //
+        // * `Exact(p)`               — `Numeric(Some(p))` for both
+        //   orders (cursor_ord > p in ASC, cursor_ord < p in DESC).
+        // * `Next(0)` + Asc          — `Numeric(None)` (bytes are
+        //   smaller than every term in dict → all docs strict-after
+        //   in ASC).
+        // * `Next(num_terms)` + Asc  — `Numeric(Some(u64::MAX))`
+        //   (bytes are larger than every term → no docs strict-
+        //   after; an `> u64::MAX` cmp is always false).
+        // * `Next(p)` + Asc, 0<p<n   — `Numeric(Some(p - 1))`
+        //   (strict-after = cursor_ord ≥ p ⇔ cursor_ord > p - 1).
+        // * `Next(p)` + Desc, any p  — `Numeric(Some(p))`
+        //   (strict-after = cursor_ord < p; Next means dict has no
+        //   term at p but the next ord-up is p, so cursor docs with
+        //   ord < p have terms < bytes, satisfying DESC strict-
+        //   after).
+        //
+        // If any String slot's dict lookup errors out (rare), we
+        // fall back to the slow bytes-compare path by leaving
+        // `start_after_raw = None` for the whole start_after — the
+        // harvest's pre-decode check is then skipped and the
+        // existing decoded-bytes `is_strictly_after_lex` does the
+        // work.
+        let start_after_raw = match &self.start_after {
+            None => None,
+            Some(user_start) => {
+                resolve_search_after_for_segment(user_start, &str_columns, &self.fields)
+            }
+        };
+
         Ok(EarlyTermSortByCursorMultiSegmentCollector {
             cursor: Some(cursor),
             fields: self.fields.clone(),
@@ -434,6 +480,7 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
             start_after: self.start_after.clone(),
             scoring: self.scoring,
             scores,
+            start_after_raw,
         })
     }
 
@@ -496,6 +543,19 @@ pub struct EarlyTermSortByCursorMultiSegmentCollector {
     /// written by `collect(doc, score)`.  We deliberately avoid
     /// `HashMap` so the hot path stays a single indexed store.
     scores: Vec<f32>,
+    /// **Wave 18-3 follow-up.**  Per-segment resolved `start_after`
+    /// where every `String(bytes)` slot is rewritten as
+    /// `Numeric(segment_local_pivot_ord)`.  When `Some`, the
+    /// harvest hot loop checks search_after with raw u64
+    /// comparisons against the cursor's stored ords *before* paying
+    /// for the per-field byte decode, so docs that fail
+    /// search_after skip the decode entirely.
+    ///
+    /// `None` means either no caller-supplied `start_after`, or one
+    /// of the dict lookups errored out — in either case the harvest
+    /// falls through to the slow bytes-compare path on the decoded
+    /// tuple (existing Wave 18-3 baseline).
+    start_after_raw: Option<Vec<CursorSortVal>>,
 }
 
 impl EarlyTermSortByCursorMultiSegmentCollector {
@@ -526,6 +586,11 @@ impl EarlyTermSortByCursorMultiSegmentCollector {
             start_after,
             scoring: None,
             scores: Vec::new(),
+            // Wave 18-3 follow-up: test / mix path doesn't pre-resolve
+            // bytes pivots — the slow bytes-compare path is exercised
+            // verbatim, which is the existing baseline these
+            // constructors were authored against.
+            start_after_raw: None,
         }
     }
 
@@ -557,6 +622,7 @@ impl EarlyTermSortByCursorMultiSegmentCollector {
             start_after,
             scoring,
             scores,
+            start_after_raw: None,
         }
     }
 }
@@ -669,6 +735,33 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
             if !self.matched_bitset.contains(doc) {
                 continue;
             }
+            // **Wave 18-3 follow-up — fast skip via raw ord pivot.**
+            //
+            // When the caller supplied a `start_after` and every
+            // String slot resolved through the segment's dict at
+            // `for_segment` time, we have a `start_after_raw` view
+            // whose String slots are encoded as `Numeric(pivot_ord)`.
+            // Compare the cursor's raw u64 ords (cheap, no decode)
+            // against that view first; if the doc fails the
+            // search_after constraint, skip the per-field byte decode
+            // entirely.  Each skipped doc saves up to one
+            // `Vec<u8>::clone` per string slot — the dominant per-
+            // hit allocation on the existing baseline.
+            //
+            // Includes the trailing `_score` axis when scoring is on:
+            // the raw view appends `CursorSortVal::Score(score)` so
+            // `is_strictly_after_lex` honours score-tail search_after
+            // (Wave 18-4 `[ts DESC, _score DESC]` pagination).
+            if let Some(start_raw) = &self.start_after_raw {
+                let mut raw_view = raw_view_for_cursor_position(&cursor, cursor_idx, prefix_len);
+                if self.scoring.is_some() {
+                    let s = self.scores.get(doc as usize).copied().unwrap_or(0.0);
+                    raw_view.push(CursorSortVal::Score(s));
+                }
+                if !is_strictly_after_lex(&raw_view, start_raw, &orders) {
+                    continue;
+                }
+            }
             // Materialise the cursor-recorded primary tuple as the
             // tie-group key.  String slots are kept as their
             // segment-local term ord here (cheap u64 compare for
@@ -713,9 +806,15 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
                 let s = self.scores.get(doc as usize).copied().unwrap_or(0.0);
                 tuple.push(CursorSortVal::Score(s));
             }
-            if let Some(start) = &self.start_after {
-                if !is_strictly_after_lex(&tuple, start, &orders) {
-                    continue;
+            // Slow-path search_after check — runs only when the raw
+            // resolution at `for_segment` failed (e.g. dict lookup
+            // error).  Wave 18-3 follow-up: most queries hit the fast
+            // path above and skip this entire branch.
+            if self.start_after_raw.is_none() {
+                if let Some(start) = &self.start_after {
+                    if !is_strictly_after_lex(&tuple, start, &orders) {
+                        continue;
+                    }
                 }
             }
             let addr = DocAddress {
@@ -755,6 +854,102 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
         flush_tie_group(&mut buffer, &mut hits, &orders);
         hits
     }
+}
+
+/// **Wave 18-3 follow-up helper.** Resolves caller-supplied
+/// `start_after` into a segment-local "raw" representation where
+/// every `CursorSortVal::String(bytes)` slot is rewritten as a
+/// `CursorSortVal::Numeric(pivot_ord)` whose u64 value is a
+/// boundary computed from the segment's term dictionary via
+/// `sstable::Dictionary::term_ord_or_next`.
+///
+/// Returns `None` when any String slot's dict lookup errors —
+/// callers then fall back to the existing decoded-bytes
+/// `is_strictly_after_lex` path verbatim.  Trailing `Score(_)` and
+/// `Numeric(_)` slots are forwarded unchanged.
+///
+/// See the doc-comment block at the top of `for_segment` for the
+/// boundary encoding rules.  In particular, the ASC + `Next(p)`
+/// case decrements `p` (saturated to 0) so the standard
+/// `cmp_sort_val` ASC numeric arm's `tuple > pivot` predicate
+/// remains correct.  For `Next(0)` (bytes are smaller than every
+/// term in dict) we encode `Numeric(None)` so the slot becomes
+/// unconstrained in `is_strictly_after_lex`.
+fn resolve_search_after_for_segment(
+    user_start: &[CursorSortVal],
+    str_columns: &[Option<columnar::StrColumn>],
+    fields: &[(String, Order)],
+) -> Option<Vec<CursorSortVal>> {
+    let mut out: Vec<CursorSortVal> = Vec::with_capacity(user_start.len());
+    for (i, slot) in user_start.iter().enumerate() {
+        match slot {
+            CursorSortVal::String(Some(bytes)) => {
+                // Use the segment's StrColumn dictionary to look up
+                // the pivot ord — bail to `None` on dict error so
+                // the caller falls back to the bytes-compare path.
+                let order_for_slot = fields.get(i).map(|(_, o)| *o).unwrap_or(Order::Asc);
+                let str_col = str_columns.get(i).and_then(|c| c.as_ref());
+                let Some(str_col) = str_col else {
+                    // No StrColumn for this slot — fall back so the
+                    // slow path sees the raw bytes.
+                    return None;
+                };
+                let dict = str_col.dictionary();
+                let num_terms = dict.num_terms() as u64;
+                let hit = match dict.term_ord_or_next(bytes) {
+                    Ok(h) => h,
+                    Err(_) => return None,
+                };
+                let resolved = match hit {
+                    columnar::TermOrdHit::Exact(p) => CursorSortVal::Numeric(Some(p)),
+                    columnar::TermOrdHit::Next(p) => match order_for_slot {
+                        Order::Asc => {
+                            if p == 0 {
+                                // bytes < every term → all docs
+                                // strict-after under ASC.  Numeric(None)
+                                // makes `is_strictly_after_lex` treat
+                                // this slot as unconstrained.
+                                CursorSortVal::Numeric(None)
+                            } else if p >= num_terms {
+                                // bytes > every term → no docs strict-
+                                // after under ASC.  `cursor_ord >
+                                // u64::MAX` is always false.
+                                CursorSortVal::Numeric(Some(u64::MAX))
+                            } else {
+                                CursorSortVal::Numeric(Some(p - 1))
+                            }
+                        }
+                        Order::Desc => CursorSortVal::Numeric(Some(p)),
+                    },
+                };
+                out.push(resolved);
+            }
+            // Already in the right form for `is_strictly_after_lex` —
+            // forward unchanged.
+            CursorSortVal::String(None)
+            | CursorSortVal::Numeric(_)
+            | CursorSortVal::Score(_) => out.push(slot.clone()),
+        }
+    }
+    Some(out)
+}
+
+/// **Wave 18-3 follow-up helper.**  Builds a raw `Vec<CursorSortVal>`
+/// view of a cursor position where every slot is `Numeric(raw_ord)` —
+/// String slots' raw value is the segment-local term ord direct from
+/// the cursor.  Paired with `start_after_raw` (whose String slots
+/// have been resolved to ords by `resolve_search_after_for_segment`)
+/// so `is_strictly_after_lex` can compare ords in u64 space without
+/// any byte decode.
+#[inline]
+fn raw_view_for_cursor_position(
+    cursor: &SortCursorIndexV2,
+    cursor_idx: usize,
+    prefix_len: usize,
+) -> Vec<CursorSortVal> {
+    (0..prefix_len)
+        .map(|fi| CursorSortVal::Numeric(cursor.value(cursor_idx, fi)))
+        .collect()
 }
 
 /// **Wave 18-6 helper.**  Sorts `buffer` by the full multi-field lex
@@ -921,6 +1116,7 @@ mod tests {
             start_after,
             scoring: None,
             scores: Vec::new(),
+            start_after_raw: None,
         };
         segment.harvest()
     }
@@ -1901,5 +2097,261 @@ mod tests {
         // Cursor's `(value, doc_id ASC)` build order — preserved by
         // Wave 18-6's stable buffer sort when scoring is off.
         assert_eq!(docs, vec![0u32, 1, 2, 3]);
+    }
+
+    // -------------------------------------------------------------
+    // Wave 18-3 follow-up — non-exact pivot resolution for string
+    // search_after.  These pin the `dict.term_ord_or_next`-driven
+    // boundary encoding in `resolve_search_after_for_segment` for
+    // the four corner cases:
+    //
+    //  * Exact match (bytes is a dict term).
+    //  * Next, middle (bytes falls between two existing terms).
+    //  * Next(0) (bytes is smaller than every term).
+    //  * Next(num_terms) (bytes is larger than every term).
+    //
+    // Each case is exercised once per order direction.
+    // -------------------------------------------------------------
+
+    /// Builds a real in-RAM index over a single keyword field with
+    /// the supplied term sequence (one doc per term, ts column held
+    /// constant), then returns a parameterised `(searcher, schema,
+    /// country_field, ts_field)` quad usable by the resolution
+    /// tests below.  The cursor is built with `index.sort.fields =
+    /// [(country, order)]` so each segment's StrColumn dictionary
+    /// indexes the supplied terms in sorted byte order — the
+    /// boundary cases below assume that ordering.
+    fn build_string_search_after_test_index(
+        terms: &[&str],
+        order: Order,
+    ) -> (
+        crate::Searcher,
+        crate::schema::Field,
+        crate::schema::Field,
+    ) {
+        use crate::index::IndexSortByField;
+        use crate::schema::{FAST, INDEXED, STORED, STRING, Schema};
+        use crate::{Index, IndexBuilder, IndexSettings};
+        let mut sb = Schema::builder();
+        let country = sb.add_text_field("country", STRING | FAST);
+        let ts = sb.add_i64_field("ts", FAST | INDEXED | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "country".to_string(),
+                order,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().unwrap();
+        for (i, t) in terms.iter().enumerate() {
+            writer
+                .add_document(doc!(country => *t, ts => i as i64))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        (searcher, country, ts)
+    }
+
+    /// ASC + Exact: search_after on a term that exists in the dict.
+    /// Boundary semantic = strict-greater (cursor_ord > pivot).
+    /// Dict: [AR, JP, US].  search_after = "JP" → pivot = ord("JP").
+    /// Expected hits: only "US" (ord > ord("JP")).
+    #[test]
+    fn wave_18_3_followup_resolve_asc_exact() {
+        let (searcher, _country, _ts) =
+            build_string_search_after_test_index(&["AR", "JP", "US"], Order::Asc);
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Asc)],
+            10,
+        )
+        .with_search_after(vec![s(b"JP")]);
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .unwrap();
+        let bytes: Vec<&[u8]> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::String(Some(b)) => b.as_slice(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(bytes, vec![b"US".as_slice()]);
+    }
+
+    /// ASC + Next(middle): search_after on a term that falls
+    /// between two dict entries.  Dict: [AR, JP, US].  search_after
+    /// = "BR" → Next(1) (would sit between AR/JP).  ASC strict-
+    /// after expects cursor_ord >= 1, so "JP" and "US" pass.
+    #[test]
+    fn wave_18_3_followup_resolve_asc_next_middle() {
+        let (searcher, _country, _ts) =
+            build_string_search_after_test_index(&["AR", "JP", "US"], Order::Asc);
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Asc)],
+            10,
+        )
+        .with_search_after(vec![s(b"BR")]);
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .unwrap();
+        let bytes: Vec<&[u8]> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::String(Some(b)) => b.as_slice(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(bytes, vec![b"JP".as_slice(), b"US".as_slice()]);
+    }
+
+    /// ASC + Next(0): search_after bytes are smaller than every
+    /// term in dict.  Dict: [JP, US].  search_after = "AA" →
+    /// Next(0) → resolved to `Numeric(None)` (unconstrained slot,
+    /// all docs strict-after).  Expected: every doc.
+    #[test]
+    fn wave_18_3_followup_resolve_asc_next_before_all() {
+        let (searcher, _country, _ts) =
+            build_string_search_after_test_index(&["JP", "US"], Order::Asc);
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Asc)],
+            10,
+        )
+        .with_search_after(vec![s(b"AA")]);
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .unwrap();
+        let bytes: Vec<&[u8]> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::String(Some(b)) => b.as_slice(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(bytes, vec![b"JP".as_slice(), b"US".as_slice()]);
+    }
+
+    /// ASC + Next(num_terms): search_after bytes are larger than
+    /// every term in dict.  Dict: [JP, US].  search_after = "ZZ" →
+    /// Next(2) (off-end) → resolved to `Numeric(Some(u64::MAX))` so
+    /// `cursor_ord > u64::MAX` is always false → no docs.
+    #[test]
+    fn wave_18_3_followup_resolve_asc_next_after_all() {
+        let (searcher, _country, _ts) =
+            build_string_search_after_test_index(&["JP", "US"], Order::Asc);
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Asc)],
+            10,
+        )
+        .with_search_after(vec![s(b"ZZ")]);
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .unwrap();
+        assert!(hits.is_empty(), "search_after past max term yields no hits");
+    }
+
+    /// DESC + Exact: dict [AR, JP, US], cursor walk emits US, JP,
+    /// AR (DESC).  search_after = "JP" → pivot = ord("JP") = 1.
+    /// DESC strict-after = cursor_ord < 1 → only "AR" (ord 0).
+    #[test]
+    fn wave_18_3_followup_resolve_desc_exact() {
+        let (searcher, _country, _ts) =
+            build_string_search_after_test_index(&["AR", "JP", "US"], Order::Desc);
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Desc)],
+            10,
+        )
+        .with_search_after(vec![s(b"JP")]);
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .unwrap();
+        let bytes: Vec<&[u8]> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::String(Some(b)) => b.as_slice(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(bytes, vec![b"AR".as_slice()]);
+    }
+
+    /// DESC + Next(middle): dict [AR, JP, US].  search_after =
+    /// "BR" → Next(1).  DESC strict-after = cursor_ord < 1 → only
+    /// "AR" (ord 0).
+    #[test]
+    fn wave_18_3_followup_resolve_desc_next_middle() {
+        let (searcher, _country, _ts) =
+            build_string_search_after_test_index(&["AR", "JP", "US"], Order::Desc);
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Desc)],
+            10,
+        )
+        .with_search_after(vec![s(b"BR")]);
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .unwrap();
+        let bytes: Vec<&[u8]> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::String(Some(b)) => b.as_slice(),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(bytes, vec![b"AR".as_slice()]);
+    }
+
+    /// DESC + Next(0): search_after = "AA", dict [JP, US].
+    /// Next(0) → pivot = 0 → cursor_ord < 0 = never → no hits.
+    /// Semantically: bytes < every term in dict → no doc has term
+    /// < bytes in DESC strict-after, so no hits.
+    #[test]
+    fn wave_18_3_followup_resolve_desc_next_before_all() {
+        let (searcher, _country, _ts) =
+            build_string_search_after_test_index(&["JP", "US"], Order::Desc);
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Desc)],
+            10,
+        )
+        .with_search_after(vec![s(b"AA")]);
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "DESC strict-after < (smaller-than-all bytes) yields no hits"
+        );
+    }
+
+    /// DESC + Next(num_terms): search_after = "ZZ", dict [JP, US].
+    /// Next(2) → pivot = 2 → cursor_ord < 2 = every cursor doc
+    /// (ord 0, 1) passes → both hits.
+    #[test]
+    fn wave_18_3_followup_resolve_desc_next_after_all() {
+        let (searcher, _country, _ts) =
+            build_string_search_after_test_index(&["JP", "US"], Order::Desc);
+        let collector = EarlyTermSortByCursorCollectorMulti::new(
+            vec![("country", Order::Desc)],
+            10,
+        )
+        .with_search_after(vec![s(b"ZZ")]);
+        let hits = searcher
+            .search(&crate::query::AllQuery, &collector)
+            .unwrap();
+        let bytes: Vec<&[u8]> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::String(Some(b)) => b.as_slice(),
+                _ => panic!(),
+            })
+            .collect();
+        // Cursor walks DESC so US (ord 1) comes before JP (ord 0).
+        assert_eq!(bytes, vec![b"US".as_slice(), b"JP".as_slice()]);
     }
 }

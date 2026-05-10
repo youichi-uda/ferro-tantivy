@@ -384,18 +384,79 @@ fn bench_heavy_scored(c: &mut Criterion) {
     group.finish();
 }
 
+/// **Mega cohort, Wave 8/A/2 GPU win-zone**.
+///
+/// 12 terms × 100 000 dense + 5 000 noise = 105 000 docs. Each cohort
+/// term has `doc_freq = 100 000 = MIN_PER_TERM_CARDINALITY`; cohort
+/// total = 1.2 M ≥ `MIN_COHORT_DOCS = 1 000 000`; `field_doc_ratio =
+/// 100 000 / 105 000 ≈ 95 %` ≥ `MIN_RATIO`. All three Wave 8 / A / 2
+/// gates clear, so the GPU dispatch fires.
+///
+/// Index ingest is ~10-20 s in debug, ~1-3 s release; the ingest
+/// happens **once** outside the criterion hot loop so bench runtime is
+/// dominated by the search loop. Per-iteration AND across 12 × 100 K-doc
+/// posting lists hits ~24 Roaring containers (8 KiB each) = ~192 KiB
+/// VRAM working set + 11 pairwise kernel reductions; with the
+/// Wave 8 / A / 1 OnceLock cache, the wgpu device init is paid once at
+/// criterion warmup, not per-iter.
+///
+/// Sample size is reduced to 20 (vs 50 elsewhere) so the criterion
+/// hot loop completes in well under 30 s even when each iter is a few
+/// ms. Throughput is reported in elements (matched docs).
+#[allow(dead_code)] // bench routines registered via `criterion_group!`
+fn bench_mega_cohort(c: &mut Criterion) {
+    let term_strs: Vec<String> = (0..12).map(|i| format!("mega{i}")).collect();
+    let term_refs: Vec<&str> = term_strs.iter().map(String::as_str).collect();
+    let (_index, body, searcher) =
+        build_index_dense_plus_noise(100_000, 5_000, &term_refs);
+    let query = bool_and_query(body, &term_refs);
+
+    let mut group = c.benchmark_group("bool_and_query_path/mega_cohort");
+    group.throughput(Throughput::Elements(100_000));
+    // 20 samples × ~ms-ish per iter → bench in ~10 s. Larger fixtures
+    // are out of criterion's per-iter budget; the
+    // `phase0-bench/wave7_query_path/run_*.sh` driver scripts can drive
+    // out-of-process scenarios for production-scale validation.
+    group.sample_size(20);
+    group.bench_function("count_12term_dense_100000_noise_5000", |b| {
+        b.iter_batched(
+            || {
+                let _g = COUNTER_LOCK.lock().unwrap();
+                let pre_gpu = gpu_dispatch_count();
+                let pre_cpu = cpu_fallback_count();
+                (pre_gpu, pre_cpu)
+            },
+            |(pre_gpu, pre_cpu)| {
+                let count = searcher.search(&query, &Count).expect("search ok");
+                debug_assert_eq!(count, 100_000);
+                let post_gpu = gpu_dispatch_count();
+                let post_cpu = cpu_fallback_count();
+                debug_assert!(
+                    post_gpu > pre_gpu || post_cpu > pre_cpu,
+                    "mega cohort must trip the dispatch helper"
+                );
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         // 50 samples is a reasonable trade-off between criterion's
         // statistical convergence and bench wallclock. Running on the
         // 12-term × 1050-doc heavy fixture, this is ~2-3 s per routine
-        // on a 4070 Ti SUPER (warm caches).
+        // on a 4070 Ti SUPER (warm caches). The mega_cohort routine
+        // overrides this to 20 internally because the per-iter cost is
+        // ~ms-class.
         .sample_size(50);
     targets =
         bench_heavy,
         bench_light,
         bench_boundary,
         bench_heavy_scored,
+        bench_mega_cohort,
 }
 criterion_main!(benches);

@@ -566,35 +566,93 @@ impl IndexMerger {
 
             field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
-            // We can now serialize this postings, by pushing each document to the
-            // postings serializer.
-            for (segment_ord, mut segment_postings) in
-                segment_postings_containing_the_term.drain(..)
-            {
-                let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
+            // Wave 15 Phase H-2: when the merger is reordering docs by an
+            // index-time sort field, the per-segment iteration emits docs
+            // in OLD doc-id order (which is no longer monotonic in the
+            // remapped NEW doc-id space).  The postings BitPacker
+            // requires monotonic input, so we collect all
+            // (new_doc, term_freq, positions) triples across every
+            // segment containing the term, sort by new_doc, then write
+            // in sorted order.  Per-term Vec allocation is bounded by
+            // the term's document frequency — modest for any real term
+            // distribution.
+            //
+            // The legacy Stack/StackedWithDeletes paths preserve
+            // per-segment doc-id order (segment N's docs map to a
+            // contiguous range starting after segment N-1), so the
+            // remapped doc_ids are monotonic by construction; the fast
+            // per-segment loop below stays unchanged for those paths.
+            let needs_global_sort =
+                doc_id_mapping.mapping_type() == MappingType::Sorted;
 
-                let mut doc = segment_postings.doc();
-                while doc != TERMINATED {
-                    // deleted doc are skipped as they do not have a `remapped_doc_id`.
-                    if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
-                        // we make sure to only write the term if
-                        // there is at least one document.
-                        let term_freq = if has_term_freq {
-                            segment_postings.positions(&mut positions_buffer);
-                            segment_postings.term_freq()
-                        } else {
-                            // The positions_buffer may contain positions from the previous term
-                            // Existence of positions depend on the value type in JSON fields.
-                            // https://github.com/quickwit-oss/tantivy/issues/2283
-                            positions_buffer.clear();
-                            0u32
-                        };
+            if needs_global_sort {
+                let mut term_docs: Vec<(DocId, u32, Vec<u32>)> =
+                    Vec::with_capacity(total_doc_freq as usize);
+                for (segment_ord, mut segment_postings) in
+                    segment_postings_containing_the_term.drain(..)
+                {
+                    let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
 
-                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                        field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
+                    let mut doc = segment_postings.doc();
+                    while doc != TERMINATED {
+                        if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
+                            let term_freq = if has_term_freq {
+                                segment_postings.positions(&mut positions_buffer);
+                                segment_postings.term_freq()
+                            } else {
+                                positions_buffer.clear();
+                                0u32
+                            };
+                            term_docs.push((
+                                remapped_doc_id,
+                                term_freq,
+                                positions_buffer.clone(),
+                            ));
+                        }
+                        doc = segment_postings.advance();
                     }
+                }
+                // Sort by new doc-id — the postings BitPacker contract.
+                term_docs.sort_unstable_by_key(|x| x.0);
+                for (new_doc_id, term_freq, positions) in term_docs {
+                    let delta_positions = delta_computer.compute_delta(&positions);
+                    field_serializer.write_doc(new_doc_id, term_freq, delta_positions);
+                }
+            } else {
+                // Legacy fast path: per-segment loop, remapped doc_ids
+                // monotonic by construction (Stack / StackedWithDeletes).
+                for (segment_ord, mut segment_postings) in
+                    segment_postings_containing_the_term.drain(..)
+                {
+                    let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
 
-                    doc = segment_postings.advance();
+                    let mut doc = segment_postings.doc();
+                    while doc != TERMINATED {
+                        // deleted doc are skipped as they do not have a `remapped_doc_id`.
+                        if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
+                            // we make sure to only write the term if
+                            // there is at least one document.
+                            let term_freq = if has_term_freq {
+                                segment_postings.positions(&mut positions_buffer);
+                                segment_postings.term_freq()
+                            } else {
+                                // The positions_buffer may contain positions from the previous term
+                                // Existence of positions depend on the value type in JSON fields.
+                                // https://github.com/quickwit-oss/tantivy/issues/2283
+                                positions_buffer.clear();
+                                0u32
+                            };
+
+                            let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                            field_serializer.write_doc(
+                                remapped_doc_id,
+                                term_freq,
+                                delta_positions,
+                            );
+                        }
+
+                        doc = segment_postings.advance();
+                    }
                 }
             }
             // closing the term.
@@ -698,10 +756,16 @@ impl IndexMerger {
         // legacy stack/shuffle paths still work) but loses the early-
         // term win at query time.
         let doc_id_mapping = match self.sort_by_field.as_ref() {
-            Some(sort_by) => self.get_doc_id_mapping_sorted_by_field(
-                &sort_by.field,
-                sort_by.order == crate::index::Order::Desc,
-            )?,
+            Some(sort_by) => {
+                debug!(
+                    "Wave 15 H-2: building sort-order doc-id mapping field={} order={:?}",
+                    sort_by.field, sort_by.order
+                );
+                self.get_doc_id_mapping_sorted_by_field(
+                    &sort_by.field,
+                    sort_by.order == crate::index::Order::Desc,
+                )?
+            }
             None => self.get_doc_id_from_concatenated_data()?,
         };
         debug!("write-fieldnorms");

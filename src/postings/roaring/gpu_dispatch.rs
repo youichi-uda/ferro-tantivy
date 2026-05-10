@@ -49,10 +49,31 @@ use crate::postings::roaring::container::{BitmapContainer, Container};
 use crate::postings::roaring::planner::{should_dispatch_gpu, TermStat};
 #[cfg(all(feature = "gpu", feature = "ferro-compress"))]
 use crate::postings::roaring::BITMAP_CONTAINER_WORDS;
-#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+
+// Backend selection. The `cuda-bitmap-kernel` feature, when enabled,
+// swaps the wgpu `tantivy_gpu::posting::BitmapOpKernel` for the CUDA
+// driver-API kernel exposed via `ferro_compress::BitmapOpKernel`
+// (wrapped by `super::cuda_dispatch::CudaBitmapOpKernel` for host-slice
+// API parity). The CUDA path eliminates wgpu's ~3 ms per-dispatch
+// floor (mega_cohort: wgpu 37.24 ms → CUDA expected ~3 ms on RTX 4070
+// Ti SUPER, see `findings_4070_ti_super_20260510.md` § Wave 8 / A
+// re-bench). The wgpu path remains as the cross-vendor fallback when
+// the feature is off.
+#[cfg(all(
+    feature = "gpu",
+    feature = "ferro-compress",
+    not(feature = "cuda-bitmap-kernel")
+))]
 use tantivy_gpu::posting::{BitmapOp, BitmapOpKernel};
-#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+#[cfg(all(
+    feature = "gpu",
+    feature = "ferro-compress",
+    not(feature = "cuda-bitmap-kernel")
+))]
 use tantivy_gpu::GpuContext;
+
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+use crate::postings::roaring::cuda_dispatch::CudaBitmapOpKernel;
 
 /// Bool operation the GPU kernel supports.
 ///
@@ -70,7 +91,11 @@ pub enum BoolOp {
     Xor,
 }
 
-#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+#[cfg(all(
+    feature = "gpu",
+    feature = "ferro-compress",
+    not(feature = "cuda-bitmap-kernel")
+))]
 impl BoolOp {
     fn to_gpu(self) -> BitmapOp {
         match self {
@@ -143,15 +168,39 @@ pub fn reset_dispatch_counters() {
 // discovery on every call when the host has no compatible backend
 // (e.g. headless CI).
 
-#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+#[cfg(all(
+    feature = "gpu",
+    feature = "ferro-compress",
+    not(feature = "cuda-bitmap-kernel")
+))]
 static GPU_RESOURCES: OnceLock<Result<BitmapOpKernel, ()>> = OnceLock::new();
 
-#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+#[cfg(all(
+    feature = "gpu",
+    feature = "ferro-compress",
+    not(feature = "cuda-bitmap-kernel")
+))]
 fn gpu_resources() -> Option<&'static BitmapOpKernel> {
     let entry = GPU_RESOURCES.get_or_init(|| {
         let ctx = GpuContext::init().map_err(|_| ())?;
         BitmapOpKernel::new(&ctx).map_err(|_| ())
     });
+    entry.as_ref().ok()
+}
+
+// CUDA backend cache. Same sticky-on-failure init pattern as the wgpu
+// branch above, but the inner type is the CUDA wrapper which owns
+// persistent device buffers + a cudaStream_t for the lifetime of the
+// process. Wave 8.A's `gpu_resources_caches_init` test continues to
+// witness cache population (via `GPU_RESOURCES.get().is_some()` after
+// the first dispatch), now backed by the CUDA kernel under this
+// feature.
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+static GPU_RESOURCES: OnceLock<Result<CudaBitmapOpKernel, ()>> = OnceLock::new();
+
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+fn gpu_resources() -> Option<&'static CudaBitmapOpKernel> {
+    let entry = GPU_RESOURCES.get_or_init(|| CudaBitmapOpKernel::new().map_err(|_| ()));
     entry.as_ref().ok()
 }
 
@@ -228,7 +277,15 @@ pub fn try_gpu_bool(
     // the kernel is fast enough at fixed flat size that a branch is
     // not worth the dispatch-count instrumentation skew.
     let mut acc = flat_buffer_for_term(terms[0], &union_keys);
+    // Backend-specific op encoding: wgpu kernel takes
+    // `tantivy_gpu::posting::BitmapOp`; CUDA wrapper takes the local
+    // `BoolOp` directly (it converts internally to
+    // `ferro_compress::BitmapOp`). Same `compute(op, &acc, &other) ->
+    // Result<Vec<u32>>` API surface in both branches.
+    #[cfg(not(feature = "cuda-bitmap-kernel"))]
     let bitmap_op = op.to_gpu();
+    #[cfg(feature = "cuda-bitmap-kernel")]
+    let bitmap_op = op;
     for term in terms.iter().skip(1) {
         let other = flat_buffer_for_term(term, &union_keys);
         match kernel.compute(bitmap_op, &acc, &other) {

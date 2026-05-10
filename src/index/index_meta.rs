@@ -218,7 +218,7 @@ impl SegmentMeta {
             self.tracked.sort_cursor_fields,
             fields,
         );
-        log::info!(
+        log::debug!(
             "Wave 15 H-trace: with_sort_cursor_fields applied segment={} fields={:?} max_doc={}",
             self.tracked.segment_id.uuid_string(),
             fields,

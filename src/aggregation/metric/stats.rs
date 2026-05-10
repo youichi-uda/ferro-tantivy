@@ -17,12 +17,22 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 /// Phase 2 E-2 — CUDA stats dispatch threshold. Below this many
 /// staged `f32` values, the kernel-launch + memcpy overhead exceeds
-/// the per-element CPU cost and the GPU loses. The
-/// `crates/ferro-compress/src/bin/stats_bench.rs` kernel-only bench
-/// shows the GPU starts to win cleanly around 100 K elements on
-/// RTX 4070 Ti SUPER (15.8× CPU at 100 K → 75.6× CPU at 100 M).
-/// Tuned to the conservative side: smaller cohorts pass through the
-/// CPU Kahan loop unchanged.
+/// the per-element CPU cost and the GPU loses.
+///
+/// **Wave 1 negative finding (2026-05-10):** raising the threshold
+/// from 100 K → 1 M (to reduce dispatch count) backfired at 10 M-doc
+/// scale: CUDA p99 went from ~640 µs to 4-14 ms vs CPU 650 µs. The
+/// fewer-but-larger dispatches paid more for (a) per-query
+/// `Vec::with_capacity(1 M f32) = 4 MB` allocation cost amortised
+/// across 1000+ queries, (b) larger PCIe transfers exposing more
+/// tail-latency variance per memcpy. Reverted to 100 K which
+/// matches the `phase0-bench/stats_bench` kernel-only cross-over
+/// point (15.8× CPU at 100 K → 75.6× CPU at 100 M).
+///
+/// The staging-buffer architecture itself is the bottleneck at this
+/// scale; the path forward is **Wave 2 (skip the Vec entirely via
+/// column_block_accessor.val_cache slice expose)** or **Wave 3
+/// (VRAM-resident column)**, not threshold tuning.
 #[cfg(feature = "cuda-stats-kernel")]
 const GPU_STAGING_FLUSH_THRESHOLD: usize = 100_000;
 
@@ -377,6 +387,15 @@ impl GpuState {
             // dispatches by type) but defensive.
             let const_matches = COLUMN_TYPE_ID == req.field_type as u8;
             if const_matches {
+                // Lazy allocation: empty Vec, grows by doubling on
+                // first push to ~400 KB peak (= GPU_STAGING_FLUSH_THRESHOLD
+                // = 100 K f32). Wave 1 tried Vec::with_capacity(1 M)
+                // pre-alloc but the per-query 4 MB allocation cost
+                // dominated when the threshold was raised to 1 M.
+                // At threshold 100 K the doubling chain is short
+                // (17 grows, ~1 MB cumulative memcpy) and amortises
+                // cleanly against the ~100 dispatches per 10 M-doc
+                // query.
                 return GpuState::Eligible {
                     staging: Vec::new(),
                 };
@@ -572,7 +591,17 @@ impl<const COLUMN_TYPE_ID: u8> SegmentStatsCollector<COLUMN_TYPE_ID> {
         }
         // Take ownership so we can borrow `&mut self.buckets` while
         // operating on the staging buffer. The Vec is left empty in
-        // place; ready for the next batch.
+        // place; ready for the next batch (alloc-from-zero on next
+        // push). Wave 1 tried `*staging = values_after_clear` to
+        // preserve capacity across dispatches but the change made
+        // p99 dramatically worse at 10 M-doc scale (640 µs → 17 ms);
+        // the natural alloc/free pattern is faster, likely because
+        // the allocator's small-block free list reuses the
+        // freshly-freed pages efficiently while a long-lived 400 KB
+        // allocation pinned in the collector hurts something
+        // upstream (page locality? scheduler?). Negative result
+        // worth keeping documented so the next attempt doesn't
+        // re-derive it.
         let values = std::mem::take(staging);
         let count = values.len() as u64;
 

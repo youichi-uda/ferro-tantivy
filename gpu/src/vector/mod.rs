@@ -30,6 +30,8 @@
 
 pub mod binary_distance;
 pub mod binary_hnsw;
+#[cfg(feature = "cuda-tensor-core")]
+pub mod cuda_tensor_core;
 pub mod distance;
 pub mod field;
 pub mod gpu_cache;

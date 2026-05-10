@@ -173,6 +173,14 @@ pub struct BinaryDistanceKernel {
     pipeline_batched: GpuPipelineRaw,
     pipeline_top_k: GpuPipelineRaw,
     ctx: GpuContext,
+    /// Optional NVIDIA Tensor Core fast path. Initialised once at
+    /// construction (if the `cuda-tensor-core` feature is on **and**
+    /// the runtime can load libcuda + cuBLASLt + the NVRTC kernel) and
+    /// consulted by [`Self::compute_batched`] before the WGSL pipeline.
+    /// `None` on AMD / Apple / Intel / CPU-fallback / containers
+    /// without GPU passthrough.
+    #[cfg(feature = "cuda-tensor-core")]
+    cuda_kernel: Option<crate::vector::cuda_tensor_core::CudaTensorCoreKernel>,
 }
 
 impl GpuKernel for BinaryDistanceKernel {
@@ -195,11 +203,36 @@ impl GpuKernel for BinaryDistanceKernel {
             TOP_K_SELECT_SHADER,
             "top_k_select",
         )?;
+        // Try to spin up the CUDA Tensor Core fast path. Failure here
+        // is non-fatal — the WGSL pipeline above is the source of
+        // truth, the CUDA path is a runtime optimisation.
+        #[cfg(feature = "cuda-tensor-core")]
+        let cuda_kernel = if ctx.is_hardware_gpu() {
+            match crate::vector::cuda_tensor_core::CudaTensorCoreKernel::try_new() {
+                Ok(k) => {
+                    log::info!(
+                        "binary-distance: CUDA Tensor Core fast path enabled (cuBLASLt INT8 IMMA)"
+                    );
+                    Some(k)
+                }
+                Err(e) => {
+                    log::debug!(
+                        "binary-distance: CUDA Tensor Core path unavailable, using WGSL: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            // Honour the caller's explicit CPU-fallback choice.
+            None
+        };
         Ok(Self {
             pipeline,
             pipeline_batched,
             pipeline_top_k,
             ctx: ctx.clone(),
+            #[cfg(feature = "cuda-tensor-core")]
+            cuda_kernel,
         })
     }
 }
@@ -210,6 +243,24 @@ impl BinaryDistanceKernel {
     /// callers that don't want to import the trait.
     pub fn new(ctx: &GpuContext) -> GpuResult<Self> {
         <Self as GpuKernel>::compile(ctx)
+    }
+
+    /// Construct a binary distance kernel with the CUDA Tensor Core
+    /// fast path explicitly disabled, even when the
+    /// `cuda-tensor-core` feature is enabled and the host has a
+    /// reachable NVIDIA device.
+    ///
+    /// This exists for benchmark harnesses that need to A/B the WGSL
+    /// pipeline against the CUDA path on the same kernel instance.
+    /// Production callers should use [`Self::new`].
+    pub fn new_wgsl_only(ctx: &GpuContext) -> GpuResult<Self> {
+        #[cfg_attr(not(feature = "cuda-tensor-core"), allow(unused_mut))]
+        let mut kernel = Self::new(ctx)?;
+        #[cfg(feature = "cuda-tensor-core")]
+        {
+            kernel.cuda_kernel = None;
+        }
+        Ok(kernel)
     }
 
     /// Compute Hamming distances between one query and a batch of
@@ -377,6 +428,23 @@ impl BinaryDistanceKernel {
                 expected: format!("corpus_bits.len() == {}", num_vecs * dim_u32),
                 actual: format!("corpus_bits.len() == {}", corpus_bits.len()),
             });
+        }
+
+        // CUDA Tensor Core fast path — bit-exact with the WGSL kernel
+        // (popcount-identity reformulation, INT8 IMMA + INT32 accum).
+        // Falls through to WGSL on `CpuFallback` (no NVIDIA, no cuBLASLt
+        // algorithm matched, etc.); any other error is propagated.
+        #[cfg(feature = "cuda-tensor-core")]
+        if let Some(ref cuda) = self.cuda_kernel {
+            match cuda.compute_batched(queries_bits, corpus_bits, num_queries, num_vecs, dim_bits) {
+                Ok(result) => return Ok(result),
+                Err(GpuError::CpuFallback { reason }) => {
+                    log::debug!(
+                        "binary-distance: CUDA path skipped (Q={num_queries}, N={num_vecs}, dim_bits={dim_bits}): {reason}; falling back to WGSL"
+                    );
+                }
+                Err(other) => return Err(other),
+            }
         }
 
         let queries_buf = GpuBuffer::new::<u32>(

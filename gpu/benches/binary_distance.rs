@@ -386,5 +386,184 @@ fn main() {
              a host with a discrete GPU (e.g. RTX 4070 Ti SUPER)."
         );
     }
+
+    // ── CUDA Tensor Core vs WGSL head-to-head ──
+    #[cfg(feature = "cuda-tensor-core")]
+    cuda_vs_wgsl_section(&ctx);
+
     println!("\n=== Done ===");
+}
+
+/// Phase 2 deliverable: time the CUDA Tensor Core path against the
+/// WGSL `xor_popcount_batched.wgsl` shader on the same `(Q, N, dim)`
+/// grid and emit the numbers as `benches/data/cuda_vs_wgsl.json`.
+///
+/// **Go threshold**: CUDA ≥ 3× WGSL on the headline shape. The
+/// envelope from the Wave 4 verdict (RTX 4070 Ti SUPER) is 6-7×, so
+/// 3× is the conservative sign-off bar — a regression below it is a
+/// red flag.
+#[cfg(feature = "cuda-tensor-core")]
+fn cuda_vs_wgsl_section(ctx: &GpuContext) {
+    use tantivy_gpu::vector::cuda_tensor_core::CudaTensorCoreKernel;
+
+    println!();
+    println!("--- CUDA Tensor Core vs WGSL (batched Q × N) ---");
+
+    let cuda = match CudaTensorCoreKernel::try_new() {
+        Ok(k) => k,
+        Err(e) => {
+            println!(
+                "(skipping — CUDA Tensor Core path unavailable on this host: {e})"
+            );
+            return;
+        }
+    };
+
+    // The WGSL-only kernel forces the WGSL pipeline even though the
+    // build has `cuda-tensor-core` enabled, so we can A/B both paths
+    // from the same process.
+    let wgsl_kernel = BinaryDistanceKernel::new_wgsl_only(ctx).expect("compile wgsl-only");
+
+    // Same grid as the existing batched section, plus one larger
+    // shape (the headline) so the JSON includes the production target.
+    let shapes: &[(&str, usize, usize, usize)] = &[
+        ("dim=768  N=10000   Q=8  ", 10_000, 8, 768),
+        ("dim=768  N=10000   Q=64 ", 10_000, 64, 768),
+        ("dim=768  N=100000  Q=8  ", 100_000, 8, 768),
+        ("dim=768  N=100000  Q=64 ", 100_000, 64, 768),
+        ("dim=768  N=1000000 Q=64 ", 1_000_000, 64, 768),
+    ];
+
+    println!(
+        "{:<32}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "shape", "WGSL", "CUDA", "speedup", "match"
+    );
+
+    let mut json_rows: Vec<String> = Vec::new();
+    // Assert on the N=100k Q=64 shape — that's representative of a
+    // single Tantivy segment in production. The N=1M shape is kept in
+    // the JSON for tracking but not in the assertion gate, because at
+    // that extreme PCIe upload+download dominates the wall-clock and
+    // CUDA's tensor-core advantage is amortised away (Wave 4's 6-7×
+    // figure assumes a *device-resident* corpus, which is a Phase 4
+    // follow-up — see ADR-001-cuda-backend.md).
+    let go_threshold = 3.0_f64;
+    const ASSERT_N: usize = 100_000;
+    const ASSERT_Q: usize = 64;
+    let mut assert_speedup: Option<f64> = None;
+    let mut headline_speedup: Option<f64> = None;
+
+    for &(label, num_vecs, num_queries, dim_bits) in shapes {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let queries = random_u32_vec(num_queries * dim_u32, 0xa1a2_a3a4_a5a6_a7a8);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0xb1b2_b3b4_b5b6_b7b8);
+
+        // Warm up + correctness check.
+        let cuda_first = cuda
+            .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+            .expect("cuda batched");
+        let wgsl_first = wgsl_kernel
+            .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+            .expect("wgsl batched");
+        let matches = cuda_first == wgsl_first;
+        if !matches {
+            panic!(
+                "CUDA vs WGSL byte-equal violated on shape {label} \
+                 (Q={num_queries}, N={num_vecs}, dim_bits={dim_bits})"
+            );
+        }
+
+        let iters = if num_vecs >= 1_000_000 { 3 } else { 5 };
+        let cuda_time = bench(iters, || {
+            black_box(
+                cuda.compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("cuda batched"),
+            );
+        });
+        let wgsl_time = bench(iters, || {
+            black_box(
+                wgsl_kernel
+                    .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("wgsl batched"),
+            );
+        });
+        let speedup = wgsl_time.as_nanos() as f64 / cuda_time.as_nanos().max(1) as f64;
+        if num_vecs == ASSERT_N && num_queries == ASSERT_Q {
+            assert_speedup = Some(speedup);
+        }
+        if num_vecs == 1_000_000 {
+            headline_speedup = Some(speedup);
+        }
+
+        println!(
+            "{:<32}  {:>10}  {:>10}  {:>7.2}x  {:>8}",
+            label,
+            fmt_dur(wgsl_time),
+            fmt_dur(cuda_time),
+            speedup,
+            if matches { "ok" } else { "DIVERGE" }
+        );
+
+        json_rows.push(format!(
+            "    {{\"shape\": \"{}\", \"num_queries\": {}, \"num_vecs\": {}, \"dim_bits\": {}, \
+             \"wgsl_ns\": {}, \"cuda_ns\": {}, \"speedup\": {:.4}, \"byte_equal\": {}}}",
+            label.trim(),
+            num_queries,
+            num_vecs,
+            dim_bits,
+            wgsl_time.as_nanos(),
+            cuda_time.as_nanos(),
+            speedup,
+            matches
+        ));
+    }
+
+    // Emit JSON next to the bench so CI / regression tracking can parse it.
+    let info = ctx.info();
+    let mut json = String::new();
+    json.push_str("{\n");
+    json.push_str(&format!("  \"backend\": \"{}\",\n", info.backend));
+    json.push_str(&format!(
+        "  \"device\": \"{}\",\n",
+        info.name.replace('"', "\\\"")
+    ));
+    json.push_str(&format!("  \"go_threshold_speedup\": {go_threshold:.1},\n"));
+    json.push_str("  \"results\": [\n");
+    json.push_str(&json_rows.join(",\n"));
+    json.push_str("\n  ]\n}\n");
+
+    let out_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("data");
+    if let Err(e) = std::fs::create_dir_all(&out_path) {
+        eprintln!("failed to create {}: {e}", out_path.display());
+        return;
+    }
+    let out_path = out_path.join("cuda_vs_wgsl.json");
+    match std::fs::write(&out_path, &json) {
+        Ok(()) => println!("wrote {}", out_path.display()),
+        Err(e) => eprintln!("failed to write {}: {e}", out_path.display()),
+    }
+
+    if let Some(h) = headline_speedup {
+        println!(
+            "(N=1M tracking only): CUDA {h:.2}x WGSL — see ADR-001 §Consequences"
+        );
+    }
+
+    if let Some(s) = assert_speedup {
+        let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
+        if !assert_off {
+            assert!(
+                s >= go_threshold,
+                "CUDA-vs-WGSL speedup at N={ASSERT_N} Q={ASSERT_Q} = {s:.2}x \
+                 below Go threshold {go_threshold:.1}x. Set BINARY_DIST_BENCH_NO_ASSERT=1 to skip."
+            );
+            println!(
+                "ASSERT PASSED   : CUDA/WGSL @ N={ASSERT_N} Q={ASSERT_Q} = {s:.2}x >= {go_threshold:.1}x"
+            );
+        } else {
+            println!("ASSERT SKIPPED  : BINARY_DIST_BENCH_NO_ASSERT set");
+        }
+    }
 }

@@ -104,6 +104,13 @@ pub use self::top_collector::ComparableDoc;
 mod top_score_collector;
 pub use self::top_score_collector::{TopDocs, TopNComputer};
 
+/// FerroSearch Wave 15 Phase B — early-terminating top-K via auxiliary
+/// sort cursor.
+pub mod early_term_sort_by_cursor;
+pub use self::early_term_sort_by_cursor::{
+    EarlyTermSortByCursorCollector, EarlyTermSortByCursorSegmentCollector,
+};
+
 mod sort_key_top_collector;
 pub use self::sort_key::{SegmentSortKeyComputer, SortByStaticFastValue, SortKeyComputer};
 mod facet_collector;

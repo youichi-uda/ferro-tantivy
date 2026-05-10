@@ -385,6 +385,51 @@ pub fn build_and_write_sort_cursors(
     Ok(vec![sort_by.field])
 }
 
+/// Builds and persists the auxiliary sort cursor file for a single,
+/// caller-supplied (field, order) pair, **bypassing**
+/// `IndexSettings::sort_by_field`.
+///
+/// **FerroSearch extension (Wave 17-2 backfill).** Unlike
+/// [`build_and_write_sort_cursors`], which reads the index-level
+/// `sort_by_field` setting and is invoked at commit / merge time, this
+/// helper takes the field + order from the caller and is the building
+/// block for `IndexWriter::backfill_sort_cursor` — the post-creation
+/// "operator just enabled `index.sort.field`, please backfill the
+/// existing segments" admin path.
+///
+/// Returns `Ok(true)` when a cursor file was written, `Ok(false)` when
+/// the segment had `max_doc == 0` (skipped), and an `Err` when the fast
+/// field column for `field` could not be resolved (e.g. the field is
+/// not declared FAST in the schema, or its type is not numeric/date —
+/// see [`build_sort_cursor_from_fast_fields`]).
+///
+/// On success, syncs the directory so the cursor file's directory
+/// entry is durably visible before the caller publishes the updated
+/// `SegmentMeta::sort_cursor_fields`.  Mirrors the Phase H-5 sync rule
+/// in [`build_and_write_sort_cursors`].
+pub fn build_and_write_sort_cursor_for(
+    segment: &mut crate::index::Segment,
+    field: &str,
+    order: crate::index::Order,
+) -> crate::Result<bool> {
+    use common::TerminatingWrite;
+
+    let max_doc = segment.meta().max_doc();
+    if max_doc == 0 {
+        return Ok(false);
+    }
+    let reader = crate::index::SegmentReader::open(segment)?;
+    let cursor = build_sort_cursor_from_fast_fields(reader.fast_fields(), field, order, max_doc)?;
+    let mut writer = segment.open_sort_cursor_write(field)?;
+    cursor.write(&mut writer)?;
+    writer.terminate()?;
+    // Same Phase H-5 reasoning as `build_and_write_sort_cursors`: sync
+    // the directory entry so a later reader's `MmapDirectory` open
+    // doesn't race the buffered cursor file write.
+    segment.index().directory().sync_directory()?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

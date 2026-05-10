@@ -13,8 +13,8 @@ use crate::directory::{DirectoryLock, GarbageCollectionResult, TerminatingWrite}
 use crate::error::TantivyError;
 use crate::fastfield::write_alive_bitset;
 use crate::index::{
-    build_and_write_sort_cursors, Index, Segment, SegmentComponent, SegmentId, SegmentMeta,
-    SegmentReader,
+    build_and_write_sort_cursor_for, build_and_write_sort_cursors, Index, Order, Segment,
+    SegmentComponent, SegmentId, SegmentMeta, SegmentReader,
 };
 use crate::indexer::delete_queue::{DeleteCursor, DeleteQueue};
 use crate::indexer::doc_opstamp_mapping::DocToOpstampMapping;
@@ -566,6 +566,125 @@ impl<D: Document> IndexWriter<D> {
         let merge_operation = self.segment_updater.make_merge_operation(segment_ids);
         let segment_updater = self.segment_updater.clone();
         segment_updater.start_merge(merge_operation)
+    }
+
+    /// **FerroSearch Wave 17-2 backfill.**
+    ///
+    /// Walks every committed segment in this index and writes the
+    /// auxiliary [`SortCursorIndex`](crate::index::SortCursorIndex)
+    /// file for `(field, order)` on segments that do not already
+    /// advertise it.  The updated `SegmentMeta::sort_cursor_fields`
+    /// list is published to the segment manager and the new
+    /// `meta.json` is written to disk synchronously.
+    ///
+    /// Returns the number of segments whose cursor was newly written
+    /// (excludes segments that already had the cursor and empty
+    /// segments).
+    ///
+    /// This is the post-creation companion to the on-commit / on-merge
+    /// cursor builds (Wave 15 Phase A + H-1): it lets an operator
+    /// enable `index.sort.field` after the index already has data, and
+    /// then run a single REST call to backfill the existing segments
+    /// without paying the cost of a full force-merge.
+    ///
+    /// # Concurrency
+    ///
+    /// The implementation acquires no merge lock and does not pause
+    /// in-flight writes.  In practice the caller should treat this as
+    /// an admin operation: ingest can continue, but a concurrent merge
+    /// that lands while we are mid-walk may race with the segment
+    /// manager update.  For a deterministic "rebuild every segment
+    /// once" workflow, drain ingest and call
+    /// [`Self::wait_merging_threads`](Self::wait_merging_threads)
+    /// before invoking this method.  Subsequent commits / merges
+    /// continue to honour the index-level `sort_by_field` setting via
+    /// the existing on-commit / on-merge paths — this method only
+    /// covers segments that were already on disk when the setting was
+    /// added.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchemaError` when `field` is not declared `FAST` in
+    /// the schema or its type is not numeric/date.  Returns IO errors
+    /// from the cursor file write if the directory rejects the write
+    /// (e.g. read-only mount).  On error, the segments processed
+    /// before the failure are left with their cursor files written
+    /// but the segment manager / meta.json are not updated — the
+    /// caller can retry safely (the per-segment `with_sort_cursor_fields`
+    /// add is idempotent).
+    pub fn backfill_sort_cursor(&self, field: &str, order: Order) -> crate::Result<usize> {
+        let segment_manager = self.segment_updater().segment_manager();
+        let original_entries = segment_manager.committed_segment_entries();
+
+        let mut updated_entries: Vec<SegmentEntry> = Vec::with_capacity(original_entries.len());
+        let mut backfilled_count: usize = 0;
+
+        for entry in &original_entries {
+            let meta = entry.meta();
+            // Skip empty segments (no docs to sort) and segments that
+            // already advertise the cursor.  Both checks are cheap and
+            // make the operation idempotent — operator can run it
+            // repeatedly without incurring extra writes.
+            if meta.max_doc() == 0 {
+                updated_entries.push(entry.clone());
+                continue;
+            }
+            let already_present = meta.sort_cursor_fields().iter().any(|f| f == field);
+            if already_present {
+                updated_entries.push(entry.clone());
+                continue;
+            }
+
+            // Build + write the cursor file for this segment.  The
+            // helper bypasses `IndexSettings::sort_by_field` so the
+            // backfill works even when the in-memory IndexSettings
+            // hasn't been updated to reflect the new index.sort.
+            let mut segment = self.index.segment(meta.clone());
+            let written = build_and_write_sort_cursor_for(&mut segment, field, order)?;
+            if !written {
+                // Defensive: should not happen since we already
+                // checked max_doc above, but keep the original entry
+                // if `build_and_write_sort_cursor_for` reports a
+                // no-op so we don't lose the segment from the manager.
+                updated_entries.push(entry.clone());
+                continue;
+            }
+
+            // Build a fresh `SegmentMeta` that advertises the new
+            // cursor field, append-style so any pre-existing fields
+            // from earlier backfill / commit cycles are preserved.
+            let mut all_cursor_fields: Vec<String> = meta.sort_cursor_fields().to_vec();
+            all_cursor_fields.push(field.to_string());
+            let new_meta = meta.clone().with_sort_cursor_fields(all_cursor_fields);
+
+            // Clone the existing entry to keep the same delete_cursor
+            // and alive_bitset, then swap in the updated meta.  This
+            // avoids reaching into `&mut self` borrows on the iterator
+            // and preserves all transient state the segment manager
+            // expects.
+            let mut new_entry = entry.clone();
+            new_entry.set_meta(new_meta);
+            updated_entries.push(new_entry);
+            backfilled_count += 1;
+        }
+
+        if backfilled_count == 0 {
+            // Nothing changed — skip the segment manager / meta.json
+            // write entirely so the operation is truly zero-cost on a
+            // re-run.
+            return Ok(0);
+        }
+
+        // Replace the committed register with the updated entries and
+        // persist the new meta.json.  `commit` here is the segment
+        // manager's "swap committed" — it does not produce a new
+        // tantivy commit opstamp; we reuse the most recent one so the
+        // index's stamper / search-after cursor semantics remain
+        // consistent with the existing committed state.
+        segment_manager.commit(updated_entries);
+        let opstamp = self.committed_opstamp;
+        self.segment_updater().save_metas(opstamp, None)?;
+        Ok(backfilled_count)
     }
 
     /// Closes the current document channel send.
@@ -2918,6 +3037,137 @@ mod tests {
             "rebuilt cursor must walk Desc by value across all merged docs"
         );
 
+        Ok(())
+    }
+
+    /// FerroSearch Wave 17-2 backfill test: an index created **without**
+    /// `IndexSettings::sort_by_field` (so existing segments lack the
+    /// auxiliary cursor) gains the cursor on every committed segment
+    /// after a single `IndexWriter::backfill_sort_cursor` call.
+    /// Mirrors the operator workflow:
+    ///   1. Create + populate an index (no sort_by_field)
+    ///   2. Operator decides to enable index sort
+    ///   3. Calls the backfill API
+    ///   4. Subsequent search hits the Wave 15 Phase B early-term path
+    #[test]
+    fn test_backfill_sort_cursor_on_existing_segments() -> crate::Result<()> {
+        use crate::index::Order;
+        use crate::schema::FAST;
+        let mut schema_builder = Schema::builder();
+        let value_field = schema_builder.add_i64_field("value", FAST);
+        // No `IndexSettings::sort_by_field` here — the cursor is NOT
+        // built at commit time.  This is the rolling-deploy starting
+        // state we're targeting with backfill.
+        let index = Index::create_in_ram(schema_builder.build());
+
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.add_document(doc!(value_field=>10i64))?;
+        writer.add_document(doc!(value_field=>40i64))?;
+        writer.commit()?;
+        writer.add_document(doc!(value_field=>20i64))?;
+        writer.add_document(doc!(value_field=>30i64))?;
+        writer.commit()?;
+        writer.add_document(doc!(value_field=>5i64))?;
+        writer.add_document(doc!(value_field=>15i64))?;
+        writer.commit()?;
+
+        // Sanity check: 3 segments, none advertise the cursor.
+        let reader_pre = index.reader()?;
+        let searcher_pre = reader_pre.searcher();
+        assert_eq!(searcher_pre.segment_readers().len(), 3);
+        for seg in searcher_pre.segment_readers() {
+            assert!(
+                seg.sort_cursor_fields().next().is_none(),
+                "no cursor expected pre-backfill",
+            );
+            assert!(seg.sort_cursor("value").is_none());
+        }
+
+        // Backfill — this is the operator's single REST call shape.
+        let count = writer.backfill_sort_cursor("value", Order::Desc)?;
+        assert_eq!(count, 3, "backfill should write a cursor for every populated segment");
+
+        // Second invocation must be a no-op (idempotent) — segments
+        // already advertise the cursor so we skip the rebuild.
+        let count_idempotent = writer.backfill_sort_cursor("value", Order::Desc)?;
+        assert_eq!(count_idempotent, 0, "second backfill call must be a no-op");
+
+        // Reload and verify every segment now has the cursor + walks Desc.
+        let reader_post = index.reader()?;
+        reader_post.reload()?;
+        let searcher = reader_post.searcher();
+        assert_eq!(searcher.segment_readers().len(), 3);
+        for seg in searcher.segment_readers() {
+            let advertised: Vec<&str> = seg.sort_cursor_fields().collect();
+            assert_eq!(advertised, vec!["value"]);
+            let cursor = seg
+                .sort_cursor("value")
+                .expect("backfilled cursor must be readable");
+            assert_eq!(cursor.order(), Order::Desc);
+            assert!(!cursor.is_empty());
+            // Verify Desc order via the fast field column for this segment.
+            let column = seg.fast_fields().i64("value")?;
+            let mut prev: Option<i64> = None;
+            for doc in cursor.iter() {
+                let v = column.first(doc).expect("value present");
+                if let Some(p) = prev {
+                    assert!(p >= v, "cursor must be Desc, got {p} then {v}");
+                }
+                prev = Some(v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Wave 17-2 — backfill on an index that already had a cursor on a
+    /// different field must extend `sort_cursor_fields`, not replace.
+    /// Pins the additive contract for future multi-field cursor v2.
+    #[test]
+    fn test_backfill_appends_to_existing_sort_cursor_fields() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField, Order};
+        use crate::schema::FAST;
+
+        let mut schema_builder = Schema::builder();
+        let v1 = schema_builder.add_i64_field("v1", FAST);
+        let v2 = schema_builder.add_i64_field("v2", FAST);
+        let index = Index::builder()
+            .schema(schema_builder.build())
+            .settings(IndexSettings {
+                // Index is committed with `v1` as the index sort, so
+                // every segment gets a cursor for v1 from Phase A.
+                sort_by_field: Some(IndexSortByField {
+                    field: "v1".to_string(),
+                    order: Order::Desc,
+                }),
+                ..Default::default()
+            })
+            .create_in_ram()?;
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.add_document(doc!(v1=>10i64, v2=>100i64))?;
+        writer.add_document(doc!(v1=>20i64, v2=>200i64))?;
+        writer.commit()?;
+
+        // Before backfill: every segment has v1 cursor only.
+        let reader = index.reader()?;
+        for seg in reader.searcher().segment_readers() {
+            let f: Vec<&str> = seg.sort_cursor_fields().collect();
+            assert_eq!(f, vec!["v1"]);
+        }
+
+        // Operator decides to also enable v2 as a sort field.
+        let count = writer.backfill_sort_cursor("v2", Order::Asc)?;
+        assert!(count >= 1);
+
+        // After backfill: segments advertise BOTH v1 and v2.
+        reader.reload()?;
+        for seg in reader.searcher().segment_readers() {
+            let f: Vec<&str> = seg.sort_cursor_fields().collect();
+            assert!(f.contains(&"v1"), "v1 cursor must be preserved");
+            assert!(f.contains(&"v2"), "v2 cursor must be added");
+            assert_eq!(seg.sort_cursor("v1").unwrap().order(), Order::Desc);
+            assert_eq!(seg.sort_cursor("v2").unwrap().order(), Order::Asc);
+        }
+        let _ = (v1, v2);
         Ok(())
     }
 }

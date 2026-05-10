@@ -20,5 +20,6 @@ pub use self::segment_component::SegmentComponent;
 pub use self::segment_id::SegmentId;
 pub use self::segment_reader::{FieldMetadata, SegmentReader};
 pub use self::sort_cursor::{
-    build_and_write_sort_cursors, build_sort_cursor_from_fast_fields, SortCursorIndex,
+    build_and_write_sort_cursor_for, build_and_write_sort_cursors,
+    build_sort_cursor_from_fast_fields, SortCursorIndex,
 };

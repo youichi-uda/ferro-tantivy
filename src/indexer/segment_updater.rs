@@ -317,6 +317,17 @@ pub(crate) struct InnerSegmentUpdater {
     merge_operations: MergeOperationInventory,
 }
 
+impl InnerSegmentUpdater {
+    /// **FerroSearch Wave 17-2.** Crate-internal accessor for the
+    /// segment manager so `IndexWriter::backfill_sort_cursor` can
+    /// read the committed register and publish updated entries.  Not
+    /// exposed in the public API — callers should go through
+    /// `IndexWriter`.
+    pub(crate) fn segment_manager(&self) -> &SegmentManager {
+        &self.segment_manager
+    }
+}
+
 impl SegmentUpdater {
     pub fn create(
         index: Index,

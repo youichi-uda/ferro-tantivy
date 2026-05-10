@@ -193,11 +193,30 @@ impl SegmentMeta {
     /// **FerroSearch extension (Wave 15).** Used by `SegmentWriter::finalize`
     /// to advertise the cursor files via `SegmentMeta::list_files`, so the
     /// directory GC retains them across writer cycles.
+    ///
+    /// `fields` is the **complete** list of cursor fields the new
+    /// SegmentMeta should advertise — callers wishing to append to an
+    /// existing list (Wave 17-2 backfill) must read
+    /// [`Self::sort_cursor_fields`] first and pass the union.  This
+    /// method does not merge automatically because the segment-meta
+    /// inventory is intern-style and silently swallowing a "second"
+    /// call would mask a class of bugs we hit in Wave 15 H-1 (a fresh
+    /// SegmentMeta should have an empty cursor field list; if it
+    /// doesn't, the caller has confused themselves about which meta
+    /// is which).
     #[must_use]
     pub fn with_sort_cursor_fields(self, fields: Vec<String>) -> SegmentMeta {
         assert!(
-            self.tracked.sort_cursor_fields.is_empty(),
-            "with_sort_cursor_fields called twice"
+            self.tracked.sort_cursor_fields.is_empty()
+                || (self.tracked.sort_cursor_fields.len() <= fields.len()
+                    && self
+                        .tracked
+                        .sort_cursor_fields
+                        .iter()
+                        .all(|existing| fields.iter().any(|f| f == existing))),
+            "with_sort_cursor_fields second call must be a strict superset of the previous call's fields (existing={:?}, new={:?})",
+            self.tracked.sort_cursor_fields,
+            fields,
         );
         let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
             segment_id: inner_meta.segment_id,

@@ -101,6 +101,13 @@ impl CursorSortVal {
     }
 }
 
+/// Crate-public re-export of [`cmp_sort_val`] for the Wave 18-2 mix
+/// dispatcher in
+/// [`crate::collector::early_term_or_fallback_collector_multi`].
+pub(crate) fn cmp_sort_val_pub(a: &CursorSortVal, b: &CursorSortVal, order: Order) -> Ordering {
+    cmp_sort_val(a, b, order)
+}
+
 /// Lex-compares two [`CursorSortVal`]s under `order`, honouring the
 /// `missing="_last"` rule (a missing value always sorts after a
 /// present one regardless of `order`).  Variants of different kinds
@@ -370,6 +377,36 @@ pub struct EarlyTermSortByCursorMultiSegmentCollector {
     segment_ord: u32,
     matched_bitset: BitSet,
     start_after: Option<Vec<CursorSortVal>>,
+}
+
+impl EarlyTermSortByCursorMultiSegmentCollector {
+    /// Crate-public constructor used by the Wave 18-2 mix dispatcher
+    /// (`EarlyTermOrFallbackCollectorMulti`) to delegate the cursor
+    /// path on a per-segment basis.  Passes the same wiring the
+    /// outer collector's `for_segment` would build, so behaviour is
+    /// identical to a direct dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_test_or_mix(
+        cursor: Option<Arc<SortCursorIndexV2>>,
+        fields: Vec<(String, Order)>,
+        value_kinds: Vec<ValueKind>,
+        str_columns: Vec<Option<columnar::StrColumn>>,
+        limit: usize,
+        segment_ord: u32,
+        matched_bitset: BitSet,
+        start_after: Option<Vec<CursorSortVal>>,
+    ) -> Self {
+        Self {
+            cursor,
+            fields,
+            value_kinds,
+            str_columns,
+            limit,
+            segment_ord,
+            matched_bitset,
+            start_after,
+        }
+    }
 }
 
 impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {

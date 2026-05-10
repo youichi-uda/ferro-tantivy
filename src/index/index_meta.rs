@@ -218,6 +218,12 @@ impl SegmentMeta {
             self.tracked.sort_cursor_fields,
             fields,
         );
+        log::info!(
+            "Wave 15 H-trace: with_sort_cursor_fields applied segment={} fields={:?} max_doc={}",
+            self.tracked.segment_id.uuid_string(),
+            fields,
+            self.tracked.max_doc,
+        );
         let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
             segment_id: inner_meta.segment_id,
             max_doc: inner_meta.max_doc,

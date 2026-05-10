@@ -1090,11 +1090,24 @@ pub fn build_and_write_sort_cursors(
         // later reader's `Segment::meta().sort_cursor_fields()` listing
         // (which carries field names verbatim) finds it.
         let primary_field = pairs[0].0.clone();
+        let segment_id_str = segment.id().uuid_string();
+        log::info!(
+            "Wave 15 H-trace: cursor v2 write begin segment={} primary_field={} max_doc={}",
+            segment_id_str, primary_field, max_doc
+        );
         let mut writer = segment.open_sort_cursor_write(&primary_field)?;
         cursor.write(&mut writer)?;
         writer.terminate()?;
+        log::info!(
+            "Wave 15 H-trace: cursor v2 write+terminate done segment={} primary_field={}",
+            segment_id_str, primary_field
+        );
         // Same Phase H-5 reasoning as the v1 path below.
         segment.index().directory().sync_directory()?;
+        log::info!(
+            "Wave 15 H-trace: cursor v2 sync_directory done segment={} primary_field={}",
+            segment_id_str, primary_field
+        );
         return Ok(vec![primary_field]);
     }
 
@@ -1109,9 +1122,18 @@ pub fn build_and_write_sort_cursors(
         sort_by.order,
         max_doc,
     )?;
+    let segment_id_str = segment.id().uuid_string();
+    log::info!(
+        "Wave 15 H-trace: cursor v1 write begin segment={} field={} max_doc={}",
+        segment_id_str, sort_by.field, max_doc
+    );
     let mut writer = segment.open_sort_cursor_write(&sort_by.field)?;
     cursor.write(&mut writer)?;
     writer.terminate()?;
+    log::info!(
+        "Wave 15 H-trace: cursor v1 write+terminate done segment={} field={}",
+        segment_id_str, sort_by.field
+    );
     // **FerroSearch Wave 15 Phase H-5.** Sync the directory so the cursor
     // file's directory entry is durably visible before the caller
     // publishes `SegmentMeta::sort_cursor_fields = [<field>]`.  Phase H-4
@@ -1129,6 +1151,10 @@ pub fn build_and_write_sort_cursors(
     // with how `save_metas` already syncs the dir before the atomic
     // meta.json swap.
     segment.index().directory().sync_directory()?;
+    log::info!(
+        "Wave 15 H-trace: cursor v1 sync_directory done segment={} field={}",
+        segment_id_str, sort_by.field
+    );
     Ok(vec![sort_by.field])
 }
 

@@ -171,6 +171,24 @@ gpu = ["tantivy-gpu"]
 # nvCOMP Bitcomp when ferro-compress is built with `nvcomp`).
 ferro-compress = ["dep:ferro-compress"]
 
+# Phase 2 C-5 Wave 8.B — swap the wgpu BitmapOpKernel inside
+# `try_gpu_bool` for ferro-compress's CUDA driver-API kernel
+# (PTX from `crates/ferro-compress/src/cuda_kernels/bitmap_op.cu`,
+# sm_89 baseline, forward-portable to Hopper / Blackwell via JIT).
+# NVIDIA only — when this feature is off the wgpu path stays in
+# place as the cross-vendor fallback. Enabling pulls ferro-compress
+# with the `nvcomp` feature so cudart + cuda driver libs link and
+# the kernel PTX is built into the binary via `include_bytes!`.
+#
+# Wave 8.A re-bench on RTX 4070 Ti SUPER (mega_cohort: wgpu 37.24 ms
+# vs CPU 1.71 ms = 21.7× SLOWER) traced the loss to wgpu's ~3 ms
+# per-dispatch floor × 11 pairwise reductions. The CUDA backend
+# dispatches in ~100 µs per launch (cf. parallel-session bc1f522
+# kernel-only bench: 17-34× CPU win on the same hardware), so the
+# query-path numerator finally lands in the win column once this
+# feature is enabled at production build time.
+cuda-bitmap-kernel = ["gpu", "ferro-compress", "ferro-compress/nvcomp"]
+
 [workspace]
 members = [
     "query-grammar",

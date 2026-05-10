@@ -56,6 +56,8 @@
 //!   Phase 2 C-5.
 
 pub mod container;
+#[cfg(all(feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub mod cuda_dispatch;
 pub mod decoder;
 pub mod encoder;
 pub mod ferro_compress_bridge;

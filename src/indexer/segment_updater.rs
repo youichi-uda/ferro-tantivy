@@ -145,7 +145,21 @@ fn merge(
     // We use the same `with_max_doc` → `build_and_write_sort_cursors`
     // → `with_sort_cursor_fields` sequence that
     // `IndexWriter::index_documents` runs after a fresh segment write.
-    if index.settings().sort_by_field.is_some() && num_docs > 0 {
+    //
+    // **Wave 18-2 fix (2026-05-11).** Originally this gate only
+    // checked `sort_by_field` (singular, Wave 15 single-field path),
+    // missing the Wave 18-1 multi-field `sort_by_fields` case. On
+    // multi-field-only indices every background merge + force-merge
+    // dropped the cursor, leaving the merged segment with empty
+    // `sort_cursor_fields`. The Phase G 5M-doc EC2 bench
+    // (2026-05-11) caught this — operator-issued
+    // `POST /_rebuild_sort_cursor` after force-merge papered over
+    // the missing cursor file but the merge hook itself was wrong.
+    // `build_and_write_sort_cursors` already dispatches v2 when
+    // `sort_by_fields` is set, so just widening the gate is enough.
+    let needs_cursor_rebuild = index.settings().sort_by_field.is_some()
+        || index.settings().sort_by_fields.is_some();
+    if needs_cursor_rebuild && num_docs > 0 {
         let mut merged_with_max = merged_segment.clone().with_max_doc(num_docs);
         let cursor_fields = crate::index::build_and_write_sort_cursors(&mut merged_with_max)?;
         if !cursor_fields.is_empty() {
@@ -265,7 +279,12 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     // settings advertise an index sort, the merged-into-output-dir
     // segment must also carry the auxiliary sort cursor so a post-merge
     // searcher's Phase E dispatch can find it.
-    if target_settings.sort_by_field.is_some() && num_docs > 0 {
+    // Wave 18-2 fix (2026-05-11): see in-place `merge()` for the
+    // Phase G EC2 root-cause narrative.  `sort_by_fields` was
+    // dropped at merge time; widen the gate.
+    let needs_cursor_rebuild = target_settings.sort_by_field.is_some()
+        || target_settings.sort_by_fields.is_some();
+    if needs_cursor_rebuild && num_docs > 0 {
         let mut merged_with_max = merged_segment.with_max_doc(num_docs);
         let cursor_fields = crate::index::build_and_write_sort_cursors(&mut merged_with_max)?;
         if !cursor_fields.is_empty() {
@@ -1258,6 +1277,117 @@ mod tests {
             values.push(column.first(doc).expect("value present"));
         }
         assert_eq!(values, vec![40, 30, 20, 10], "cursor walks Desc by value");
+
+        Ok(())
+    }
+
+    /// **FerroSearch Wave 18-2 regression test** (2026-05-11). For an
+    /// index that configures `IndexSettings::sort_by_fields` (Wave 18-1
+    /// multi-field) — `sort_by_field` is `None` and only
+    /// `sort_by_fields` carries the sort order — the merge hook must
+    /// still rebuild the cursor on the merged segment, advertise it
+    /// in `SegmentMeta::sort_cursor_fields`, and the resulting cursor
+    /// file must internally record ALL configured fields (not just
+    /// the primary). Without this fix every background merge +
+    /// force-merge leaves the merged segment with empty
+    /// `sort_cursor_fields`, and the Phase E v2 multi-field dispatch
+    /// declines for the whole shard.  Caught by the Phase G 5M-doc
+    /// EC2 bench (2026-05-11).
+    #[test]
+    fn test_merge_rebuilds_multi_field_sort_cursor_wave_18_2() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField, Order, SortCursorAny};
+
+        let ts_field;
+        let id_field;
+        let mut schema_builder = Schema::builder();
+        ts_field = schema_builder.add_i64_field("ts", FAST);
+        id_field = schema_builder.add_i64_field("id", FAST);
+        let schema = schema_builder.build();
+
+        let index = Index::builder()
+            .schema(schema.clone())
+            .settings(IndexSettings {
+                // Wave 18-1 multi-field: sort_by_fields set, sort_by_field None.
+                sort_by_fields: Some(vec![
+                    IndexSortByField {
+                        field: "ts".to_string(),
+                        order: Order::Desc,
+                    },
+                    IndexSortByField {
+                        field: "id".to_string(),
+                        order: Order::Asc,
+                    },
+                ]),
+                ..Default::default()
+            })
+            .create_in_ram()?;
+
+        // Two commits → at least 2 segments → in-place merge fires.
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter =
+                index.writer_for_tests()?;
+            writer.add_document(doc!(ts_field=>100i64, id_field=>3i64))?;
+            writer.add_document(doc!(ts_field=>100i64, id_field=>1i64))?;
+            writer.add_document(doc!(ts_field=>50i64, id_field=>2i64))?;
+            writer.commit()?;
+        }
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter =
+                index.writer_for_tests()?;
+            writer.add_document(doc!(ts_field=>200i64, id_field=>5i64))?;
+            writer.add_document(doc!(ts_field=>200i64, id_field=>4i64))?;
+            writer.commit()?;
+        }
+
+        // Force a single-segment merge to exercise the merge hook.
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter =
+                index.writer_for_tests()?;
+            let segment_ids = index.searchable_segment_ids()?;
+            assert!(
+                segment_ids.len() >= 2,
+                "test fixture should have at least 2 pre-merge segments, got {}",
+                segment_ids.len()
+            );
+            writer.merge(&segment_ids).wait()?;
+            writer.wait_merging_operations()?;
+        }
+
+        // The merged segment must advertise the cursor.
+        let merged_segments = index.searchable_segments()?;
+        assert_eq!(merged_segments.len(), 1, "expected 1 merged segment");
+        let merged_meta = merged_segments[0].meta();
+        let advertised: Vec<&str> = merged_meta
+            .sort_cursor_fields()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            advertised,
+            vec!["ts"],
+            "merged segment must advertise the v2 cursor under its primary field name"
+        );
+
+        // The cursor file must exist and parse as v2 with BOTH fields.
+        let segment = index.segment(merged_meta.clone());
+        let slice = segment.open_sort_cursor_read("ts")?;
+        let any = SortCursorAny::open(slice)?;
+        let cursor = match any {
+            SortCursorAny::V2(c) => c,
+            SortCursorAny::V1(_) => panic!(
+                "Wave 18-2 regression: merge hook wrote a v1 cursor when multi-field config is set"
+            ),
+        };
+        let fields: Vec<(&str, Order)> = cursor
+            .fields()
+            .iter()
+            .map(|(n, o, _)| (n.as_str(), *o))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![("ts", Order::Desc), ("id", Order::Asc)],
+            "v2 cursor must record both configured fields with their orders"
+        );
 
         Ok(())
     }

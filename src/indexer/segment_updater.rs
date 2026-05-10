@@ -114,7 +114,16 @@ fn merge(
         .collect();
 
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger = IndexMerger::open(index.schema(), &segments[..])?;
+    // Wave 15 Phase H-2: thread the index-time sort field through so
+    // the merger physically reorders alive docs to match the sort.
+    // After this, the merged segment's doc-id sequence == sort order
+    // and the existing `SortByStaticFastValue` SIMD top-K threshold
+    // filter early-terminates naturally on subsequent queries.
+    let merger: IndexMerger = IndexMerger::open_with_sort_by_field(
+        index.schema(),
+        &segments[..],
+        index.settings().sort_by_field.clone(),
+    )?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
     let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
@@ -237,8 +246,16 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     )?;
     let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
-    let merger: IndexMerger =
-        IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?;
+    // Wave 15 Phase H-2: cross-index merge variant.  Same sort-order
+    // reorder hook as the in-place `merge` path, gated on the target
+    // settings rather than per-source-segment settings (cross-index
+    // merge always emits into a fresh target with `target_settings`).
+    let merger: IndexMerger = IndexMerger::open_with_custom_alive_set_and_sort(
+        merged_index.schema(),
+        segments,
+        filter_doc_ids,
+        target_settings.sort_by_field.clone(),
+    )?;
     let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
     let num_docs = merger.write(segment_serializer)?;
 

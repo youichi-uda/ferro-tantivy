@@ -703,4 +703,103 @@ mod tests {
         }
         Ok(())
     }
+
+    /// **FerroSearch Wave 15 Phase H-2 (Alternative-A-at-merge).** After
+    /// force-merging, the merged segment's *physical doc-id sequence*
+    /// must match the index sort order — not just the cursor's
+    /// permutation.  When that is true, the cursor is a strict identity
+    /// (`cursor.iter()` yields `0, 1, 2, ..., max_doc-1`) and the
+    /// existing `SortByStaticFastValue` SIMD top-K threshold filter
+    /// naturally early-terminates because doc-id-ascending iteration
+    /// coincides with sort order — the heap fills with the K extreme
+    /// values immediately and the SIMD `mask == 0` block-skip kicks in
+    /// for every subsequent block.
+    ///
+    /// Without H-2, the cursor would be a non-identity permutation
+    /// (e.g. `[2, 3, 4, 1, 0, 5]` for the H-1 test's input) — the
+    /// per-segment cursor still serves Phase E's early-term collector
+    /// correctly, but the WARM-cache + SIMD baseline would walk in
+    /// doc-id order and pay the full O(N log K) heap cost with no
+    /// SIMD block-skip win.
+    #[test]
+    fn post_force_merge_segment_doc_ids_match_sort_order() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField};
+        use crate::indexer::NoMergePolicy;
+        use crate::schema::{Schema, FAST};
+        use crate::{Index, IndexWriter, TantivyDocument};
+
+        let mut schema_builder = Schema::builder();
+        let value_field = schema_builder.add_i64_field("value", FAST);
+        let schema = schema_builder.build();
+        let settings = IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "value".to_string(),
+                order: Order::Desc,
+            }),
+            ..Default::default()
+        };
+        let index = Index::builder()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()?;
+
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+
+        // Build 3 segments with intentionally scrambled per-segment
+        // value orderings so the H-2 reorder must do real work to
+        // produce a strictly Desc post-merge sequence.
+        for batch in [&[10i64, 15][..], &[40, 30][..], &[20, 5][..]] {
+            for v in batch {
+                let mut doc = TantivyDocument::default();
+                doc.add_i64(value_field, *v);
+                writer.add_document(doc)?;
+            }
+            writer.commit()?;
+        }
+
+        let segment_ids = index.searchable_segment_ids()?;
+        assert_eq!(segment_ids.len(), 3);
+        writer.merge(&segment_ids).wait()?;
+        writer.wait_merging_threads()?;
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let seg = searcher.segment_reader(0);
+        let column = seg.fast_fields().i64("value")?;
+
+        // The killer assertion: merged segment doc-id 0 has the LARGEST
+        // value, doc-id 1 the next-largest, etc.  This is strict
+        // monotonicity by doc-id — the property the existing
+        // `SortByStaticFastValue` SIMD top-K filter needs to early-
+        // terminate without a separate cursor walk.
+        let max_doc = seg.max_doc();
+        let mut values_by_doc_id: Vec<i64> = Vec::with_capacity(max_doc as usize);
+        for doc in 0..max_doc {
+            values_by_doc_id.push(column.first(doc).expect("value present"));
+        }
+        assert_eq!(
+            values_by_doc_id,
+            vec![40, 30, 20, 15, 10, 5],
+            "Phase H-2: merged segment's doc-id sequence must match sort order \
+             (identity cursor); without H-2 the order would still be the \
+             input-segment concatenation"
+        );
+
+        // Cursor must STILL be present (Phase H-1 hook still runs after
+        // H-2 reorder — the cursor file is now an identity permutation
+        // and the dispatch gate keeps working).
+        let cursor = seg
+            .sort_cursor("value")
+            .expect("cursor must still be written by H-1 hook");
+        let cursor_doc_ids: Vec<u32> = cursor.iter().collect();
+        assert_eq!(
+            cursor_doc_ids,
+            vec![0, 1, 2, 3, 4, 5],
+            "Phase H-2: post-reorder cursor is the identity permutation"
+        );
+
+        Ok(())
+    }
 }

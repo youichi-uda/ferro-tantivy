@@ -93,10 +93,7 @@ impl ColumnValues for BitpackedReader {
             return;
         }
         // Check if indexes are sequential — if so, use batch decode.
-        let is_sequential = indexes.len() > 1
-            && indexes
-                .windows(2)
-                .all(|w| w[1] == w[0] + 1);
+        let is_sequential = indexes.len() > 1 && indexes.windows(2).all(|w| w[1] == w[0] + 1);
         if is_sequential && self.bit_unpacker.bit_width() <= 32 {
             self.get_range(indexes[0] as u64, output);
         } else {

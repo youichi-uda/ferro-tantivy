@@ -90,7 +90,9 @@ impl BlockCache {
     fn lock_cache<'a>(
         cache: &'a Mutex<LruCache<usize, Block>>,
     ) -> std::sync::MutexGuard<'a, LruCache<usize, Block>> {
-        cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn get_from_cache(&self, pos: usize) -> Option<Block> {
@@ -645,9 +647,7 @@ mod tests {
         use std::sync::Arc;
 
         let cache = Arc::new(BlockCache {
-            cache: Some(Mutex::new(LruCache::new(
-                NonZeroUsize::new(4).unwrap(),
-            ))),
+            cache: Some(Mutex::new(LruCache::new(NonZeroUsize::new(4).unwrap()))),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
         });

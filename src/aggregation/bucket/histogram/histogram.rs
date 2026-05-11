@@ -146,8 +146,9 @@ pub struct HistogramAggregation {
     #[serde(default)]
     pub keyed: bool,
     /// Whether the values are normalized to the fastfield-storage units (microseconds, since
-    /// `common::DateTime` switched from nanoseconds to microseconds). Kept as `is_normalized_to_ns`
-    /// for serde-wire compatibility with older snapshots. Defaults to false.
+    /// `common::DateTime` switched from nanoseconds to microseconds). Kept as
+    /// `is_normalized_to_ns` for serde-wire compatibility with older snapshots. Defaults to
+    /// false.
     #[serde(default)]
     pub is_normalized_to_ns: bool,
 }
@@ -214,9 +215,7 @@ pub struct HistogramBounds {
 }
 
 fn deserialize_date_or_num<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
+where D: serde::Deserializer<'de> {
     let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
 
     // Check if the value is a string representing an Rfc3339 formatted date

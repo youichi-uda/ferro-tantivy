@@ -2,9 +2,8 @@ use std::marker::PhantomData;
 
 use columnar::Column;
 
-use crate::collector::sort_key::NaturalComparator;
+use crate::collector::sort_key::{Comparator, NaturalComparator};
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
-use crate::collector::sort_key::Comparator;
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::{DocId, Order, Score, SegmentReader};
 

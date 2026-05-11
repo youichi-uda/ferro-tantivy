@@ -1092,7 +1092,7 @@ impl VramCompressedCht {
     ) -> Result<u64, super::persist::DumpError> {
         use super::persist::{
             finalise_atomic_write, open_tmp_writer, write_chtkey, write_file_header,
-            write_file_trailer, DumpError, MAGIC_V3,
+            write_file_trailer, DumpError, MAGIC_V4,
         };
         use std::io::Write;
         let snapshot: Vec<(ChtKey, Arc<VramCompressedTermEntry>)> = {
@@ -1105,21 +1105,16 @@ impl VramCompressedCht {
         };
         let entry_count = snapshot.len() as u64;
         let mut writer = open_tmp_writer(path)?;
-        write_file_header(&mut writer, MAGIC_V3, entry_count)?;
+        write_file_header(&mut writer, MAGIC_V4, entry_count)?;
         for (i, (key, entry)) in snapshot.iter().enumerate() {
-            // Wave Z-6 #2: MAGIC_V3 dump format encodes one
-            // compressed payload per entry; multi-chunk entries
-            // (chunk_count > 1) await the MAGIC_V4 wire format in
-            // Z-6 #4 and currently trip a debug_assert. In release
-            // builds, a snapshot containing a multi-chunk entry
-            // would dump only `chunks[0]` (via the back-compat
-            // shim) and load back as a corrupt single-chunk entry
-            // — to be replaced by per-chunk dump records in Z-6 #4.
-            debug_assert_eq!(
-                entry.chunk_count(),
-                1,
-                "dump_to_path(): multi-chunk entry requires Z-6 #4 MAGIC_V4 wire format"
-            );
+            // Wave Z-6 #4: MAGIC_V4 per-term body emits `chunk_count`
+            // followed by `N` `(compressed_bytes: u32, body bytes)`
+            // records. Each chunk's `uncompressed_bytes` is derivable
+            // at load time from the bucket-boundary chunking invariant
+            // (chunk k covers `[k * BUCKETS_PER_CHUNK, min((k+1) *
+            // BUCKETS_PER_CHUNK, bucket_count))`), so the wire doesn't
+            // need to carry it. Single-chunk entries collapse to
+            // `chunk_count = 1` with one record — no special case.
             write_chtkey(&mut writer, key)?;
             // bucket_count + per-bucket (high16, word_offset) pairs.
             let bucket_count = u32::try_from(entry.bucket_index.len()).unwrap_or(u32::MAX);
@@ -1128,34 +1123,42 @@ impl VramCompressedCht {
                 writer.write_all(&high16.to_le_bytes())?;
                 writer.write_all(&word_offset.to_le_bytes())?;
             }
-            // uncompressed_bytes + compressed_bytes (both u64).
+            // uncompressed_bytes (total across all chunks) + chunk_count.
             writer.write_all(&(entry.uncompressed_bytes as u64).to_le_bytes())?;
-            let bytes = entry.compressed_bytes();
-            writer.write_all(&(bytes as u64).to_le_bytes())?;
-            // Stage the device-resident compressed payload back to
-            // host for write. Single-chunk path — the `debug_assert`
-            // above guarantees `chunks.len() == 1` until Z-6 #4 walks
-            // per-chunk records via MAGIC_V4.
-            let mut host_staging: Vec<u8> = vec![0u8; bytes];
-            // SAFETY: chunks()[0].d_compressed points to `bytes` of
-            // device memory owned by this Arc (Z-6 #2 invariant);
-            // host_staging holds `bytes` of valid host memory.
-            let rc = unsafe {
-                cudaMemcpy(
-                    host_staging.as_mut_ptr() as *mut c_void,
-                    entry.chunks()[0].d_compressed as *const c_void,
-                    bytes,
-                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
-                )
-            };
-            if rc != CUDA_SUCCESS {
-                return Err(DumpError::Cuda {
-                    entry_index: i as u64,
-                    bytes,
-                    code: rc,
-                });
+            let chunk_count =
+                u32::try_from(entry.chunk_count()).unwrap_or(u32::MAX);
+            writer.write_all(&chunk_count.to_le_bytes())?;
+            // Per-chunk records. Each chunk's compressed payload is
+            // staged D→H individually so the same fixed-size staging
+            // buffer can be reused across chunks (each ≤
+            // `BITCOMP_CHUNK_BYTES`, post-compress typically much
+            // smaller).
+            for chunk in entry.chunks() {
+                let comp_size = u32::try_from(chunk.compressed_bytes)
+                    .unwrap_or(u32::MAX);
+                writer.write_all(&comp_size.to_le_bytes())?;
+                let mut host_staging: Vec<u8> = vec![0u8; chunk.compressed_bytes];
+                // SAFETY: `chunk.d_compressed` points to
+                // `chunk.compressed_bytes` of device memory owned by
+                // this entry's Arc; `host_staging` holds that many
+                // valid host bytes.
+                let rc = unsafe {
+                    cudaMemcpy(
+                        host_staging.as_mut_ptr() as *mut c_void,
+                        chunk.d_compressed as *const c_void,
+                        chunk.compressed_bytes,
+                        cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                    )
+                };
+                if rc != CUDA_SUCCESS {
+                    return Err(DumpError::Cuda {
+                        entry_index: i as u64,
+                        bytes: chunk.compressed_bytes,
+                        code: rc,
+                    });
+                }
+                writer.write_all(&host_staging)?;
             }
-            writer.write_all(&host_staging)?;
         }
         write_file_trailer(&mut writer)?;
         finalise_atomic_write(writer, path)?;
@@ -1174,12 +1177,20 @@ impl VramCompressedCht {
         path: &std::path::Path,
     ) -> Result<u64, super::persist::LoadError> {
         use super::persist::{
-            open_reader, read_and_validate_file_header,
+            open_reader, read_and_validate_file_header_multi,
             read_and_validate_file_trailer, read_chtkey, read_exact_or_truncated,
-            read_u16_le, read_u32_le, read_u64_le, MAGIC_V3,
+            read_u16_le, read_u32_le, read_u64_le, MAGIC_V3, MAGIC_V4,
         };
         let mut reader = open_reader(path)?;
-        let entry_count = read_and_validate_file_header(&mut reader, MAGIC_V3)?;
+        // Wave Z-6 #4: dispatch on file magic — MAGIC_V4 is the
+        // multi-chunk wire format produced by current binaries;
+        // MAGIC_V3 is retained for back-compat with operator-
+        // snapshotted dumps from pre-Z-6-#4 binaries (lifted into a
+        // 1-chunk Multi entry at load time).
+        let (magic, entry_count) = read_and_validate_file_header_multi(
+            &mut reader,
+            &[MAGIC_V4, MAGIC_V3],
+        )?;
         let mut loaded: u64 = 0;
         for i in 0..entry_count {
             let key = read_chtkey(&mut reader, i)?;
@@ -1191,53 +1202,117 @@ impl VramCompressedCht {
                 bucket_index.push((high16, word_offset));
             }
             let uncompressed_bytes = read_u64_le(&mut reader)? as usize;
-            let compressed_bytes = read_u64_le(&mut reader)? as usize;
-            let body = read_exact_or_truncated(&mut reader, compressed_bytes)?;
+            // Per-magic body decode: V4 = chunk_count + N records;
+            // V3 = single `compressed_bytes: u64` + body. Both collect
+            // into the same shape `Vec<(comp_size, host_bytes)>` so
+            // the device-side install logic below is unified.
+            let chunks_data: Vec<(usize, Vec<u8>)> = if magic == MAGIC_V4 {
+                let chunk_count = read_u32_le(&mut reader)? as usize;
+                let mut chunks_data = Vec::with_capacity(chunk_count);
+                for _ in 0..chunk_count {
+                    let comp_size = read_u32_le(&mut reader)? as usize;
+                    let body = read_exact_or_truncated(&mut reader, comp_size)?;
+                    chunks_data.push((comp_size, body));
+                }
+                chunks_data
+            } else {
+                // MAGIC_V3 — legacy single u64 compressed_bytes + body.
+                let compressed_bytes = read_u64_le(&mut reader)? as usize;
+                let body = read_exact_or_truncated(&mut reader, compressed_bytes)?;
+                vec![(compressed_bytes, body)]
+            };
             // Cross-check: uncompressed_bytes must match the
-            // bucket_count expansion (same invariant as v2).
+            // bucket_count expansion (same invariant as v2 / pre-Z-6).
             let expected_uncomp = bucket_count * BITMAP_CONTAINER_WORDS * 4;
             if expected_uncomp != uncompressed_bytes {
                 continue;
             }
+            // Cross-check: sum of derived per-chunk uncompressed_bytes
+            // (bucket-boundary chunking invariant) must equal the
+            // wire's `uncompressed_bytes`. Defensive against malformed
+            // V4 dumps where `chunk_count` and `bucket_count` are
+            // inconsistent.
+            let n_chunks = chunks_data.len();
+            let total_chunk_uncomp: usize = (0..n_chunks)
+                .map(|k| {
+                    let chunk_first = k * BUCKETS_PER_CHUNK;
+                    let chunk_last = std::cmp::min(
+                        (k + 1) * BUCKETS_PER_CHUNK,
+                        bucket_count,
+                    );
+                    chunk_last.saturating_sub(chunk_first)
+                        * BITMAP_CONTAINER_WORDS
+                        * 4
+                })
+                .sum();
+            if total_chunk_uncomp != uncompressed_bytes {
+                continue;
+            }
             // Budget gate: if the entire compressed entry exceeds
             // the budget, skip (matches the runtime insert path).
-            if (compressed_bytes as u64) > self.budget_bytes {
+            let total_compressed: usize =
+                chunks_data.iter().map(|(s, _)| *s).sum();
+            if (total_compressed as u64) > self.budget_bytes {
                 continue;
             }
-            // Allocate device buffer + H2D for the compressed payload.
-            let mut d_compressed: *mut c_void = null_mut();
-            // SAFETY: cudaMalloc writes the device pointer on success.
-            let rc = unsafe { cudaMalloc(&mut d_compressed, compressed_bytes) };
-            if rc != CUDA_SUCCESS {
-                continue;
-            }
-            // SAFETY: d_compressed just allocated of `compressed_bytes`;
-            // body.as_ptr() holds the right bytes.
-            let rc = unsafe {
-                cudaMemcpy(
+            // Build `Vec<DeviceChunkSlice>` — per-chunk cudaMalloc +
+            // H2D into freshly allocated device buffers. On any
+            // failure mid-loop, free already-allocated chunks and
+            // skip this entry (no resource leak).
+            let mut chunks: Vec<DeviceChunkSlice> = Vec::with_capacity(n_chunks);
+            let mut chunk_install_failed = false;
+            for (k, (comp_size, body)) in chunks_data.iter().enumerate() {
+                let chunk_first = k * BUCKETS_PER_CHUNK;
+                let chunk_last = std::cmp::min(
+                    (k + 1) * BUCKETS_PER_CHUNK,
+                    bucket_count,
+                );
+                let chunk_buckets = chunk_last.saturating_sub(chunk_first);
+                let chunk_uncompressed = chunk_buckets * BITMAP_CONTAINER_WORDS * 4;
+                let mut d_compressed: *mut c_void = null_mut();
+                // SAFETY: cudaMalloc writes the device pointer on success.
+                let rc = unsafe { cudaMalloc(&mut d_compressed, *comp_size) };
+                if rc != CUDA_SUCCESS {
+                    chunk_install_failed = true;
+                    break;
+                }
+                // SAFETY: d_compressed just allocated of `comp_size`;
+                // body holds `comp_size` valid host bytes.
+                let rc = unsafe {
+                    cudaMemcpy(
+                        d_compressed,
+                        body.as_ptr() as *const c_void,
+                        *comp_size,
+                        cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    )
+                };
+                if rc != CUDA_SUCCESS {
+                    // SAFETY: just allocated above.
+                    unsafe {
+                        let _ = cudaFree(d_compressed);
+                    }
+                    chunk_install_failed = true;
+                    break;
+                }
+                chunks.push(DeviceChunkSlice {
                     d_compressed,
-                    body.as_ptr() as *const c_void,
-                    compressed_bytes,
-                    cudaMemcpyKind::cudaMemcpyHostToDevice,
-                )
-            };
-            if rc != CUDA_SUCCESS {
-                // SAFETY: just allocated above.
-                unsafe {
-                    let _ = cudaFree(d_compressed);
+                    compressed_bytes: *comp_size,
+                    uncompressed_bytes: chunk_uncompressed,
+                });
+            }
+            if chunk_install_failed {
+                // SAFETY: free chunks we already pushed before bailing.
+                for chunk in chunks.drain(..) {
+                    unsafe {
+                        if !chunk.d_compressed.is_null() {
+                            let _ = cudaFree(chunk.d_compressed);
+                        }
+                    }
                 }
                 continue;
             }
-            // MAGIC_V3 = single-chunk-per-entry; build a 1-element
-            // chunks vec so the Drop / accessor invariants hold. Z-6 #4
-            // will introduce MAGIC_V4 with multi-chunk records and a
-            // load-time dispatch on magic.
             let entry = VramCompressedTermEntry {
-                chunks: vec![DeviceChunkSlice {
-                    d_compressed,
-                    compressed_bytes,
-                    uncompressed_bytes,
-                }],
+                chunks,
                 uncompressed_bytes,
                 bucket_index,
             };
@@ -1870,6 +1945,216 @@ mod tests {
             ),
             "hash_function drift must reject as HashFunctionMismatch, got {err:?}"
         );
+    }
+
+    #[test]
+    fn cht_v3_dump_then_load_multi_chunk_roundtrip_byte_equal() {
+        // Wave Z-6 #4 acceptance gate: a multi-chunk entry dumps as
+        // MAGIC_V4 with `chunk_count + N×(comp_size + body)` records
+        // and loads back into a `Vec<DeviceChunkSlice>` whose per-
+        // chunk compressed bytes, derived uncompressed_bytes, and
+        // device payloads are byte-identical to the source. The
+        // fixture forces 3 chunks (2 × full BITCOMP_CHUNK_BYTES + 1
+        // partial last chunk) so the partial-last derivation
+        // (`bucket_count - 2 * BUCKETS_PER_CHUNK` buckets in the tail)
+        // is exercised.
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v3_multichunk.bin");
+        let src = VramCompressedCht::with_budget(256 * 1024 * 1024).unwrap();
+        // 2 entries: one multi-chunk (3 chunks) + one single-chunk
+        // (to keep the V3 / V4 single-chunk degenerate case covered
+        // in the same dump's load loop).
+        let k_multi = dummy_key(0xC6_04_01, 0x4C04_4C04_4C04_4C04);
+        let k_single = dummy_key(0xC6_04_02, 0x5C04_5C04_5C04_5C04);
+        let rp_multi = multi_chunk_roaring(BUCKETS_PER_CHUNK * 2 + 1);
+        let rp_single = small_roaring();
+        src.insert(k_multi.clone(), &rp_multi).unwrap();
+        src.insert(k_single.clone(), &rp_single).unwrap();
+
+        // Capture expected per-chunk shape + host-staged bytes.
+        struct ExpectedChunk {
+            compressed_bytes: usize,
+            uncompressed_bytes: usize,
+            host_payload: Vec<u8>,
+        }
+        struct ExpectedEntry {
+            uncompressed_bytes: usize,
+            bucket_index: Vec<(u16, u32)>,
+            chunks: Vec<ExpectedChunk>,
+        }
+        let snapshot_keys = vec![k_multi.clone(), k_single.clone()];
+        let mut expected: Vec<ExpectedEntry> = Vec::with_capacity(2);
+        for k in &snapshot_keys {
+            let e = src.get(k).expect("hit");
+            let mut chunks_expected = Vec::with_capacity(e.chunk_count());
+            for chunk in e.chunks() {
+                let mut staging = vec![0u8; chunk.compressed_bytes];
+                let rc = unsafe {
+                    cudaMemcpy(
+                        staging.as_mut_ptr() as *mut c_void,
+                        chunk.d_compressed as *const c_void,
+                        chunk.compressed_bytes,
+                        cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                    )
+                };
+                assert_eq!(rc, CUDA_SUCCESS);
+                chunks_expected.push(ExpectedChunk {
+                    compressed_bytes: chunk.compressed_bytes,
+                    uncompressed_bytes: chunk.uncompressed_bytes,
+                    host_payload: staging,
+                });
+            }
+            expected.push(ExpectedEntry {
+                uncompressed_bytes: e.uncompressed_bytes(),
+                bucket_index: e.bucket_index().to_vec(),
+                chunks: chunks_expected,
+            });
+        }
+        // Multi-chunk fixture sanity — pin chunk_count so the test
+        // doesn't silently regress to a single-chunk roundtrip.
+        assert_eq!(
+            expected[0].chunks.len(),
+            3,
+            "multi-chunk fixture must produce exactly 3 chunks (2 full + 1 partial-last)"
+        );
+        assert_eq!(expected[1].chunks.len(), 1);
+
+        let n_dumped = src.dump_to_path(&path).unwrap();
+        assert_eq!(n_dumped, 2);
+
+        // Fresh cache; load via the magic-aware dispatch path.
+        let dst = VramCompressedCht::with_budget(256 * 1024 * 1024).unwrap();
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, 2);
+
+        for (k, expected_entry) in snapshot_keys.iter().zip(expected.iter()) {
+            let got = dst.get(k).expect("loaded entry must hit");
+            assert_eq!(got.chunk_count(), expected_entry.chunks.len());
+            assert_eq!(got.uncompressed_bytes(), expected_entry.uncompressed_bytes);
+            assert_eq!(got.bucket_index(), expected_entry.bucket_index.as_slice());
+            for (got_chunk, exp_chunk) in got.chunks().iter().zip(expected_entry.chunks.iter()) {
+                assert_eq!(got_chunk.compressed_bytes, exp_chunk.compressed_bytes);
+                assert_eq!(got_chunk.uncompressed_bytes, exp_chunk.uncompressed_bytes);
+                // Compressed payload byte-equal: stage D→H from the
+                // loaded chunk and compare to the dumped host bytes.
+                let mut staging = vec![0u8; got_chunk.compressed_bytes];
+                let rc = unsafe {
+                    cudaMemcpy(
+                        staging.as_mut_ptr() as *mut c_void,
+                        got_chunk.d_compressed as *const c_void,
+                        got_chunk.compressed_bytes,
+                        cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                    )
+                };
+                assert_eq!(rc, CUDA_SUCCESS);
+                assert_eq!(
+                    staging, exp_chunk.host_payload,
+                    "loaded chunk payload must be byte-equal to dumped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cht_v3_load_magic_v3_back_compat_lifts_to_single_chunk() {
+        // Wave Z-6 #4 back-compat acceptance: a MAGIC_V3 (pre-Z-6-#4)
+        // dump produced by an old binary must still load via the new
+        // magic-aware loader, lifted into a 1-chunk Multi entry whose
+        // shape mirrors what the live `insert` admission would produce.
+        // We hand-craft a synthetic MAGIC_V3 dump using payload bytes
+        // staged off a real single-chunk entry — the compressed bytes
+        // themselves are wire-format-independent, so the same payload
+        // round-trips correctly through the V3 read path.
+        if !cuda_available() {
+            return;
+        }
+        use std::io::Write;
+
+        // Build a real single-chunk entry to source valid bytes.
+        let src_cache = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let key = dummy_key(0xC6_04_03, 0x3C04_3C04_3C04_3C04);
+        src_cache.insert(key.clone(), &small_roaring()).unwrap();
+        let entry = src_cache.get(&key).expect("hit");
+        let bucket_index_clone = entry.bucket_index().to_vec();
+        let uncompressed_bytes_clone = entry.uncompressed_bytes();
+        let chunk0 = &entry.chunks()[0];
+        let comp_bytes = chunk0.compressed_bytes;
+        let mut payload = vec![0u8; comp_bytes];
+        let rc = unsafe {
+            cudaMemcpy(
+                payload.as_mut_ptr() as *mut c_void,
+                chunk0.d_compressed as *const c_void,
+                comp_bytes,
+                cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            )
+        };
+        assert_eq!(rc, CUDA_SUCCESS);
+        drop(entry);
+        drop(src_cache);
+
+        // Hand-craft a MAGIC_V3 dump file containing 1 entry.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v3_v3_backcompat.bin");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&super::super::persist::MAGIC_V3.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::WIRE_VERSION.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::HASH_FN_FXHASHER_V1.to_le_bytes())
+            .unwrap();
+        f.write_all(&1u64.to_le_bytes()).unwrap(); // entry_count
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // reserved
+        // Per-term: chtkey + bucket_count + bucket_index + uncomp:u64
+        // + comp:u64 + payload.
+        super::super::persist::write_chtkey(&mut f, &key).unwrap();
+        let bucket_count =
+            u32::try_from(bucket_index_clone.len()).unwrap_or(u32::MAX);
+        f.write_all(&bucket_count.to_le_bytes()).unwrap();
+        for (high16, word_offset) in &bucket_index_clone {
+            f.write_all(&high16.to_le_bytes()).unwrap();
+            f.write_all(&word_offset.to_le_bytes()).unwrap();
+        }
+        f.write_all(&(uncompressed_bytes_clone as u64).to_le_bytes())
+            .unwrap();
+        f.write_all(&(comp_bytes as u64).to_le_bytes()).unwrap();
+        f.write_all(&payload).unwrap();
+        f.write_all(&super::super::persist::MAGIC_END.to_le_bytes())
+            .unwrap();
+        drop(f);
+
+        // Load via the V4-default loader; MAGIC_V3 must lift cleanly
+        // into a 1-chunk Multi entry.
+        let dst = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, 1);
+        let loaded = dst.get(&key).expect("V3 back-compat load must hit");
+        assert_eq!(
+            loaded.chunk_count(),
+            1,
+            "MAGIC_V3 dump must lift into a 1-chunk Multi entry"
+        );
+        assert_eq!(loaded.uncompressed_bytes(), uncompressed_bytes_clone);
+        assert_eq!(loaded.bucket_index(), bucket_index_clone.as_slice());
+        assert_eq!(loaded.chunks()[0].compressed_bytes, comp_bytes);
+        assert_eq!(
+            loaded.chunks()[0].uncompressed_bytes,
+            uncompressed_bytes_clone
+        );
+        // Compressed payload byte-equal vs the synthetic dump's body.
+        let mut staging = vec![0u8; loaded.chunks()[0].compressed_bytes];
+        let rc = unsafe {
+            cudaMemcpy(
+                staging.as_mut_ptr() as *mut c_void,
+                loaded.chunks()[0].d_compressed as *const c_void,
+                loaded.chunks()[0].compressed_bytes,
+                cudaMemcpyKind::cudaMemcpyDeviceToHost,
+            )
+        };
+        assert_eq!(rc, CUDA_SUCCESS);
+        assert_eq!(staging, payload);
     }
 
     #[test]

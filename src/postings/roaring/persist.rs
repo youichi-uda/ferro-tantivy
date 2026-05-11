@@ -98,8 +98,21 @@ pub const MAGIC_V1: u32 = u32::from_le_bytes(*b"FCV1");
 pub const MAGIC_V2: u32 = u32::from_le_bytes(*b"FCV2");
 
 /// Tier-specific file magic for the v3 Bitcomp-compressed VRAM CHT
-/// dump. On disk: `"FCV3"`.
+/// dump (single-chunk per entry — pre-Wave-Z-6-#4 wire format). On
+/// disk: `"FCV3"`. Loaded by [`super::vram_cht_v3::VramCompressedCht::load_from_path`]
+/// as a legacy 1-chunk Multi entry for backward compatibility with
+/// dumps produced by pre-Z-6-#4 binaries.
 pub const MAGIC_V3: u32 = u32::from_le_bytes(*b"FCV3");
+
+/// Tier-specific file magic for the v3 Bitcomp-compressed VRAM CHT
+/// dump with multi-chunk records (Wave Z-6 #4 wire format). On disk:
+/// `"FCV4"`. Per-term body emits `chunk_count: u32` followed by `N`
+/// `(compressed_bytes: u32, body: comp_size bytes)` records; per-chunk
+/// `uncompressed_bytes` is derived at load time from `bucket_count`
+/// and `chunk_count` (bucket-boundary chunking invariant). Replaces
+/// [`MAGIC_V3`] as the default dump magic; the V3 load path stays for
+/// back-compat with operator-snapshotted dumps in the wild.
+pub const MAGIC_V4: u32 = u32::from_le_bytes(*b"FCV4");
 
 /// End-of-stream sentinel. On disk: `"ENDV"`. Located 4 bytes
 /// before EOF; loaders observing a missing / mismatched trailer
@@ -398,6 +411,45 @@ pub fn read_and_validate_file_header<R: Read>(
     let entry_count = read_u64_le(r)?;
     let _reserved = read_u32_le(r)?;
     Ok(entry_count)
+}
+
+/// Same as [`read_and_validate_file_header`] but accepts a slice of
+/// allowed magics and returns the matched magic alongside the entry
+/// count. Used by tier loaders that support multiple wire-format
+/// versions in parallel (e.g. v3 cache accepting both [`MAGIC_V3`]
+/// single-chunk and [`MAGIC_V4`] multi-chunk dumps for back-compat).
+///
+/// `WrongMagic` reports the first (= "primary" / preferred) element
+/// of `expected_magics` as the expected value when no magic matches —
+/// the variant is informational, not exhaustive.
+pub fn read_and_validate_file_header_multi<R: Read>(
+    r: &mut R,
+    expected_magics: &[u32],
+) -> Result<(u32, u64), LoadError> {
+    let magic = read_u32_le(r)?;
+    if !expected_magics.iter().any(|&m| m == magic) {
+        return Err(LoadError::WrongMagic {
+            expected: *expected_magics.first().unwrap_or(&0),
+            got: magic,
+        });
+    }
+    let version = read_u32_le(r)?;
+    if version != WIRE_VERSION {
+        return Err(LoadError::VersionMismatch {
+            expected: WIRE_VERSION,
+            got: version,
+        });
+    }
+    let hash_fn = read_u32_le(r)?;
+    if hash_fn != HASH_FN_FXHASHER_V1 {
+        return Err(LoadError::HashFunctionMismatch {
+            expected: HASH_FN_FXHASHER_V1,
+            got: hash_fn,
+        });
+    }
+    let entry_count = read_u64_le(r)?;
+    let _reserved = read_u32_le(r)?;
+    Ok((magic, entry_count))
 }
 
 /// Write the trailing [`MAGIC_END`] sentinel.

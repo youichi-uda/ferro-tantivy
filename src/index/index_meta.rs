@@ -430,12 +430,17 @@ mod tests {
         let json = r#"{"index_settings":{"docstore_compression":"zsstd","docstore_blocksize":1000000},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#;
 
         let err = serde_json::from_str::<UntrackedIndexMeta>(json).unwrap_err();
-        assert_eq!(
-            err.to_string(),
+        // `snappy` only appears in the expected variant list when the
+        // `snappy-compression` feature is enabled. Keep the assertion conditional
+        // so the test passes in every supported feature matrix.
+        let expected = if cfg!(feature = "snappy-compression") {
+            "unknown variant `zsstd`, expected one of `none`, `lz4`, `snappy`, `zstd`, \
+             `zstd(compression_level=5)` at line 1 column 49"
+        } else {
             "unknown variant `zsstd`, expected one of `none`, `lz4`, `zstd`, \
              `zstd(compression_level=5)` at line 1 column 49"
-                .to_string()
-        );
+        };
+        assert_eq!(err.to_string(), expected.to_string());
 
         let json = r#"{"index_settings":{"docstore_compression":"zstd(bla=10)","docstore_blocksize":1000000},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#;
 

@@ -581,15 +581,18 @@ impl CudaBitmapOpKernel {
     /// boundary cost worth amortising in a future wave (multi-term
     /// batch decompress).
     ///
-    /// Wallclock per-cohort cost (12-term cohort):
-    /// - Decompress: 12 × ~20 µs (per term, with sync) ≈ 240 µs
+    /// Wallclock per-cohort cost (12-term cohort, Phase 2 D level-A
+    /// Priority 1 batch decompress — Wave 11+):
+    /// - Decompress: 1 batched call + 1 sync ≈ 30-40 µs (was 12 × ~20 µs
+    ///   = 240 µs with per-term `decompress_one` loop)
     /// - Scatter (D→D): 12 × ~10 µs ≈ 120 µs
     /// - Kernel + sync: same as v2 (~50 µs)
-    /// - Total: ~400-500 µs per cohort warm
+    /// - Total: ~200-220 µs per cohort warm (was ~400-500 µs)
     ///
-    /// vs v2 same cohort: ~350 µs warm. v3 costs ~50-150 µs more per
-    /// cohort but caches ~3-4× more terms in the same VRAM budget
-    /// (Bitcomp ratio on uint32 postings).
+    /// vs v2 same cohort: ~350 µs warm. v3 with batch decompress is now
+    /// faster than v2 for cohorts ≥ 8 terms while still caching ~3-4×
+    /// more terms in the same VRAM budget (Bitcomp ratio on uint32
+    /// postings).
     pub fn compute_fold_v3(
         &self,
         op: BoolOp,
@@ -621,12 +624,20 @@ impl CudaBitmapOpKernel {
                 what: "bytes_per_term overflow",
                 code: 0,
             })?;
-        // Workbench must fit the largest term's uncompressed payload.
-        let max_uncompressed = terms
-            .iter()
-            .map(|t| t.uncompressed_bytes())
-            .max()
-            .unwrap_or(0);
+        // Per-term uncompressed sizes and a workbench-offset table.
+        // The workbench holds all N terms concatenated so one batched
+        // decompress can write the whole cohort in a single launch.
+        let mut term_offsets: Vec<usize> = Vec::with_capacity(terms.len());
+        let mut total_uncompressed: usize = 0;
+        for term in terms {
+            term_offsets.push(total_uncompressed);
+            total_uncompressed = total_uncompressed
+                .checked_add(term.uncompressed_bytes())
+                .ok_or(CudaBitmapError::Cuda {
+                    what: "workbench offset overflow",
+                    code: 0,
+                })?;
+        }
 
         let mut state = self
             .state
@@ -638,18 +649,19 @@ impl CudaBitmapOpKernel {
             unsafe { reallocate_buffers(&mut state, words_per_term.next_power_of_two())? };
         }
 
-        // Resize the workbench under its own mutex (separate from
-        // state's so concurrent kernels could parallelise grows; in
-        // practice they serialise).
+        // Resize the workbench under its own mutex. The batch decompress
+        // path requires the workbench to fit ALL terms concatenated, so
+        // we grow to `total_uncompressed` (was `max(per_term)` for the
+        // serial path).
         {
             let mut workbench = self
                 .workbench
                 .lock()
                 .expect("CudaBitmapOpKernel workbench mutex poisoned");
-            if workbench.capacity_bytes < max_uncompressed {
+            if workbench.capacity_bytes < total_uncompressed {
                 // SAFETY: we hold the workbench mutex; no other caller
                 // can observe the intermediate freed state.
-                unsafe { reallocate_workbench(&mut workbench, max_uncompressed)? };
+                unsafe { reallocate_workbench(&mut workbench, total_uncompressed)? };
             }
         }
 
@@ -663,20 +675,28 @@ impl CudaBitmapOpKernel {
         // SAFETY: device pointers + workbench valid for the whole
         // call; we hold both mutexes.
         unsafe {
-            // Step 1: build d_a from terms[0].
-            self.decompress_then_scatter(
+            // Step 1: ONE batched decompress writes all N terms into
+            // the concatenated workbench at `term_offsets[i]`. Replaces
+            // the per-term `decompress_one` loop from the original Wave
+            // 9 v3 dispatch — 6-10× wallclock win for typical cohorts
+            // (Phase 2 D level-A Priority 1, 2026-05-11).
+            self.decompress_batch_into_workbench(terms, &term_offsets)?;
+
+            // Step 2: per-term scatter from the workbench slab to d_a
+            // (for terms[0]) or d_b (for terms[1..]) → kernel → swap.
+            self.scatter_from_workbench(
                 state.d_a,
                 bytes_per_term,
                 &terms[0],
+                term_offsets[0],
                 union_keys,
             )?;
-            // Step 2: per-term decompress → scatter to d_b → kernel
-            // → pointer-swap.
-            for term in terms.iter().skip(1) {
-                self.decompress_then_scatter(
+            for (i, term) in terms.iter().enumerate().skip(1) {
+                self.scatter_from_workbench(
                     state.d_b,
                     bytes_per_term,
                     term,
+                    term_offsets[i],
                     union_keys,
                 )?;
                 self.inner.compute(
@@ -716,10 +736,159 @@ impl CudaBitmapOpKernel {
         }
     }
 
+    /// Phase 2 D level-A Priority 1 — multi-term batch decompress into
+    /// the workbench. One nvcomp launch + one sync replaces the N-call
+    /// per-term loop. Each term lands at `term_offsets[i]` bytes within
+    /// the workbench (a flat slab sized for the sum of all terms'
+    /// uncompressed bytes).
+    ///
+    /// # Safety
+    /// - Caller has ensured the workbench is sized for the sum of all
+    ///   `terms[i].uncompressed_bytes()` and not concurrently grown.
+    /// - All `terms[i].device_ptr()` point to live VRAM owned by the
+    ///   term entries (held alive via `Arc`).
+    unsafe fn decompress_batch_into_workbench(
+        &self,
+        terms: &[Arc<VramCompressedTermEntry>],
+        term_offsets: &[usize],
+    ) -> Result<(), CudaBitmapError> {
+        debug_assert_eq!(terms.len(), term_offsets.len());
+        let workbench_ptr = {
+            let workbench = self
+                .workbench
+                .lock()
+                .expect("CudaBitmapOpKernel workbench mutex poisoned");
+            workbench.d_buf
+        };
+        if workbench_ptr.is_null() {
+            return Err(CudaBitmapError::Cuda {
+                what: "v3 workbench not allocated",
+                code: 0,
+            });
+        }
+        let mut codec_guard = self
+            .decompress_codec
+            .lock()
+            .expect("CudaBitmapOpKernel decompress_codec mutex poisoned");
+        let codec = codec_guard.as_mut().ok_or(CudaBitmapError::Cuda {
+            what: "v3 decompress codec unavailable",
+            code: 0,
+        })?;
+        // Build the entries vector for the batch API:
+        // (d_compressed, comp_size, expected_uncomp_size, d_uncompressed_slot)
+        let mut entries: Vec<(*const c_void, usize, usize, *mut c_void)> =
+            Vec::with_capacity(terms.len());
+        for (term, &offset) in terms.iter().zip(term_offsets.iter()) {
+            // SAFETY: workbench_ptr is a single contiguous allocation of
+            // ≥ sum(uncompressed_bytes); offset is in-bounds because it
+            // is the partial sum.
+            let slot = unsafe { (workbench_ptr as *mut u8).add(offset) as *mut c_void };
+            entries.push((
+                term.device_ptr(),
+                term.compressed_bytes(),
+                term.uncompressed_bytes(),
+                slot,
+            ));
+        }
+        // SAFETY: device pointers + workbench slots valid for the call;
+        // the codec uses our stream so chained scatter/compute see the
+        // decompressed bytes after the post-batch sync inside
+        // `decompress_batch`.
+        unsafe {
+            codec
+                .decompress_batch(&entries)
+                .map_err(CudaBitmapError::Inner)?;
+        }
+        drop(codec_guard);
+        Ok(())
+    }
+
+    /// Phase 2 D level-A Priority 1 — scatter a single term from its
+    /// slab within the (pre-decompressed) workbench into `dst` in the
+    /// cohort `union_keys` layout. Same shape as the original
+    /// [`Self::decompress_then_scatter`] scatter half — the decompress
+    /// half is now amortised across the cohort.
+    ///
+    /// # Safety
+    /// - `dst` must point to ≥ `dst_bytes` writable device memory on
+    ///   the kernel's stream.
+    /// - Caller holds the state and workbench mutexes (or appropriate
+    ///   barriers) so the workbench isn't grown under us.
+    /// - The workbench has been populated by a preceding
+    ///   `decompress_batch_into_workbench` call on the same stream.
+    unsafe fn scatter_from_workbench(
+        &self,
+        dst: *mut c_void,
+        dst_bytes: usize,
+        term: &Arc<VramCompressedTermEntry>,
+        term_offset: usize,
+        union_keys: &[u16],
+    ) -> Result<(), CudaBitmapError> {
+        let workbench_ptr = {
+            let workbench = self
+                .workbench
+                .lock()
+                .expect("CudaBitmapOpKernel workbench mutex poisoned");
+            workbench.d_buf
+        };
+        if workbench_ptr.is_null() {
+            return Err(CudaBitmapError::Cuda {
+                what: "v3 workbench not allocated",
+                code: 0,
+            });
+        }
+        // SAFETY: dst sized for dst_bytes; workbench slab sized for
+        // term.uncompressed_bytes() at `term_offset`; all on this
+        // kernel's stream.
+        unsafe {
+            let rc = cudaMemsetAsync(dst, 0i32 as std::ffi::c_int, dst_bytes, self.stream);
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaMemsetAsync(v3 dst zero-fill)",
+                    code: rc,
+                });
+            }
+            let bucket_bytes = BITMAP_CONTAINER_WORDS * std::mem::size_of::<u32>();
+            let term_base = (workbench_ptr as *const u8).add(term_offset);
+            for (high16, src_word_off) in term.bucket_index() {
+                let Ok(dst_idx) = union_keys.binary_search(high16) else {
+                    continue;
+                };
+                let dst_word_off = dst_idx * BITMAP_CONTAINER_WORDS;
+                let dst_ptr =
+                    (dst as *mut u8).add(dst_word_off * std::mem::size_of::<u32>());
+                let src_ptr =
+                    term_base.add((*src_word_off as usize) * std::mem::size_of::<u32>());
+                let rc = cudaMemcpyAsync(
+                    dst_ptr as *mut c_void,
+                    src_ptr as *const c_void,
+                    bucket_bytes,
+                    cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                    self.stream,
+                );
+                if rc != CUDA_SUCCESS {
+                    return Err(CudaBitmapError::Cuda {
+                        what: "cudaMemcpyAsync(v3 scatter D2D bucket)",
+                        code: rc,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Internal: decompress `term` into the workbench, then scatter
     /// from workbench to `dst` in the cohort `union_keys` layout.
     /// Uses the same per-bucket DtD memcpy as v2's
     /// [`scatter_term_to_device`].
+    ///
+    /// **Phase 2 D level-A Priority 1 (2026-05-11)**: superseded on the
+    /// `compute_fold_v3` hot path by
+    /// [`Self::decompress_batch_into_workbench`] +
+    /// [`Self::scatter_from_workbench`], which fuse N per-term
+    /// `decompress_one` launches into one batched nvCOMP call. Kept here
+    /// as a one-shot reference for the bench harness comparison and as
+    /// a fallback path that doesn't depend on the batch API.
     ///
     /// # Safety
     /// - `dst` must point to ≥ `dst_bytes` writable device memory on
@@ -729,7 +898,8 @@ impl CudaBitmapOpKernel {
     ///   under us.
     /// - Caller must hold the `Arc<VramCompressedTermEntry>` alive
     ///   for the duration of the call.
-    unsafe fn decompress_then_scatter(
+    #[allow(dead_code)]
+    pub(super) unsafe fn decompress_then_scatter(
         &self,
         dst: *mut c_void,
         dst_bytes: usize,

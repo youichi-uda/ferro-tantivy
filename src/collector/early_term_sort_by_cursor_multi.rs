@@ -847,12 +847,27 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
             // `is_strictly_after_lex` honours score-tail search_after
             // (Wave 18-4 `[ts DESC, _score DESC]` pagination).
             if let Some(start_raw) = &self.start_after_raw {
-                let mut raw_view = raw_view_for_cursor_position(&cursor, cursor_idx, prefix_len);
-                if self.scoring.is_some() {
-                    let s = self.scores.get(doc as usize).copied().unwrap_or(0.0);
-                    raw_view.push(CursorSortVal::Score(s));
-                }
-                if !is_strictly_after_lex(&raw_view, start_raw, &orders) {
+                // **Profile-driven (perf record, 100K depth=50K):**
+                // Building `raw_view` via `raw_view_for_cursor_position`
+                // showed up as 19.8% self-time in `Vec::from_iter`
+                // (small-Vec churn per matched cursor position the walk
+                // visits, *most of which* fail the search_after check at
+                // mid-page depths so the alloc is pure overhead).  The
+                // inline variant reads `cursor.value(...)` on demand
+                // without materialising a `Vec`.  Semantics-identical
+                // to the build-then-compare path; covered by the
+                // `is_strictly_after_lex_raw_inline_*` parity tests.
+                let score_opt: Option<f32> = self.scoring.map(|_| {
+                    self.scores.get(doc as usize).copied().unwrap_or(0.0)
+                });
+                if !is_strictly_after_lex_raw_inline(
+                    &cursor,
+                    cursor_idx,
+                    prefix_len,
+                    score_opt,
+                    start_raw,
+                    &orders,
+                ) {
                     continue;
                 }
             }
@@ -1125,6 +1140,65 @@ fn is_strictly_after_lex(
     false
 }
 
+/// Semantics-identical alternative to building a `raw_view` via
+/// [`raw_view_for_cursor_position`] (+ optional trailing `Score(_)`)
+/// and passing it to [`is_strictly_after_lex`] — but reads
+/// `cursor.value(...)` on demand instead of materialising a
+/// `Vec<CursorSortVal>` per call.
+///
+/// `start` slots at prefix indices are expected to be
+/// `CursorSortVal::Numeric(_)` (produced by
+/// [`resolve_search_after_for_segment`] — the raw-form constructor —
+/// which encodes String dict-lookups as `Numeric(ord)`).  Trailing
+/// `Score(_)` is honoured when `score` is `Some`.  Any other kind in
+/// the prefix is treated by [`cmp_sort_val`]'s kind-mismatch arm
+/// (`Equal`), matching the build-then-compare path verbatim.
+///
+/// Invoked from the harvest hot loop *every cursor position the bitset
+/// matched* — at mid-page search_after depths most of those positions
+/// fail the strict-after check so eliminating the per-position Vec
+/// alloc removes pure overhead.
+#[inline]
+fn is_strictly_after_lex_raw_inline(
+    cursor: &SortCursorIndexV2,
+    cursor_idx: usize,
+    prefix_len: usize,
+    score: Option<f32>,
+    start: &[CursorSortVal],
+    orders: &[Order],
+) -> bool {
+    let total_len = prefix_len + usize::from(score.is_some());
+    let n = total_len.min(orders.len());
+    for i in 0..n {
+        let tuple_at_i: CursorSortVal = if i < prefix_len {
+            CursorSortVal::Numeric(cursor.value(cursor_idx, i))
+        } else {
+            // Single trailing score slot guaranteed by `total_len` math.
+            CursorSortVal::Score(score.expect("score must be present beyond prefix_len"))
+        };
+        let tuple_missing = tuple_at_i.is_missing();
+        let start_at_i = start.get(i);
+        let start_missing = match start_at_i {
+            None => true,
+            Some(v) => v.is_missing(),
+        };
+        match (tuple_missing, start_missing) {
+            (true, false) => return false,
+            (false, true) => return true,
+            (true, true) => continue,
+            (false, false) => match cmp_sort_val(&tuple_at_i, start_at_i.unwrap(), orders[i]) {
+                Ordering::Greater => return true,
+                Ordering::Less => return false,
+                Ordering::Equal => continue,
+            },
+        }
+    }
+    if start.len() > total_len && start[total_len..].iter().any(|s| !s.is_missing()) {
+        return false;
+    }
+    false
+}
+
 /// Inter-segment merge ordering for the multi-field fruit. Mirrors
 /// [`SortCursorIndexV2`]'s on-disk `missing="_last"` rule and the
 /// deterministic `(segment_ord, doc_id)` tie-break.  Kind-aware
@@ -1235,6 +1309,125 @@ mod tests {
     /// (matches v2 fruit shape for numeric fields).
     fn num(v: Option<u64>) -> CursorSortVal {
         CursorSortVal::Numeric(v)
+    }
+
+    /// **Profile-driven optimization parity test.**
+    ///
+    /// `is_strictly_after_lex_raw_inline` reads cursor values on
+    /// demand instead of building a temporary `Vec<CursorSortVal>`
+    /// per matched doc.  This test pins the two paths to identical
+    /// behaviour across every combination of cursor primary tuple,
+    /// start tuple, and order pair that the harvest hot loop can
+    /// see — drift here means the on-the-fly comparator and the
+    /// build-then-compare comparator disagree on whether a doc lies
+    /// strictly after the search_after boundary, which would silently
+    /// skip or duplicate cursor-paginated hits.
+    #[test]
+    fn is_strictly_after_lex_raw_inline_parity_two_field_numeric() {
+        // Two-field cursor: ts (any order), _id (any order). Build a
+        // 4-doc cursor with every interesting combination — both
+        // strictly larger/smaller, equal-primary tie cases, and
+        // missing slots — so the parity test exercises every branch
+        // of `cmp_sort_val`'s numeric arm and the missing-last rule.
+        let ts: Vec<Option<u64>> = vec![Some(100u64), Some(100), Some(200), None];
+        let id: Vec<Option<u64>> = vec![Some(7u64), Some(3), Some(5), Some(9)];
+        let cursor = build_cursor(
+            vec![
+                ("ts", Order::Desc, ValueKind::I64),
+                ("_id", Order::Asc, ValueKind::I64),
+            ],
+            vec![ts.clone(), id.clone()],
+            4,
+        );
+        let prefix_len = 2;
+
+        // Every interesting start_after tuple shape: full pair,
+        // missing primary, missing secondary, both missing.
+        let starts: Vec<Vec<CursorSortVal>> = vec![
+            vec![num(Some(100)), num(Some(3))],
+            vec![num(Some(100)), num(Some(7))],
+            vec![num(Some(50)), num(Some(0))],
+            vec![num(Some(250)), num(Some(0))],
+            vec![num(Some(100)), num(None)],
+            vec![num(None), num(Some(5))],
+            vec![num(None), num(None)],
+        ];
+        // Both order pairs the cursor records and a few of the
+        // dispatcher's other typical combinations.
+        let order_sets: Vec<Vec<Order>> = vec![
+            vec![Order::Desc, Order::Asc],
+            vec![Order::Asc, Order::Desc],
+            vec![Order::Desc, Order::Desc],
+            vec![Order::Asc, Order::Asc],
+        ];
+        for cursor_idx in 0..cursor.len() {
+            // Build the raw_view exactly like the harvest path used
+            // to (before the inline optimization), without scoring.
+            let raw_view = raw_view_for_cursor_position(&cursor, cursor_idx, prefix_len);
+            for start in &starts {
+                for orders in &order_sets {
+                    let old = is_strictly_after_lex(&raw_view, start, orders);
+                    let new = is_strictly_after_lex_raw_inline(
+                        &cursor, cursor_idx, prefix_len, None, start, orders,
+                    );
+                    assert_eq!(
+                        old, new,
+                        "parity mismatch at cursor_idx={cursor_idx} orders={orders:?} \
+                         start={start:?} raw_view={raw_view:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Parity test for the scoring-on (Wave 18-4) variant: harvest
+    /// pushes a trailing `Score(_)` slot on the raw view before the
+    /// lex compare.  The inline function takes the score as an
+    /// `Option<f32>` parameter and constructs the trailing
+    /// `CursorSortVal::Score` on the fly.  Both paths must agree on
+    /// every score / order combination.
+    #[test]
+    fn is_strictly_after_lex_raw_inline_parity_with_score_tail() {
+        let ts: Vec<Option<u64>> = vec![Some(100u64), Some(100), Some(200)];
+        let cursor = build_cursor(
+            vec![("ts", Order::Desc, ValueKind::I64)],
+            vec![ts],
+            3,
+        );
+        let prefix_len = 1;
+        // Scores include NaN-vs-anything to exercise the NaN-safe
+        // `partial_cmp` fallback in `cmp_sort_val`'s Score arm.
+        let probe_scores = [0.0_f32, 1.5, 5.0, f32::NAN];
+        let starts: Vec<Vec<CursorSortVal>> = vec![
+            vec![num(Some(100)), CursorSortVal::Score(1.0)],
+            vec![num(Some(100)), CursorSortVal::Score(5.0)],
+            vec![num(Some(50)), CursorSortVal::Score(0.0)],
+            vec![num(Some(250)), CursorSortVal::Score(2.0)],
+        ];
+        let order_sets: Vec<Vec<Order>> = vec![
+            vec![Order::Desc, Order::Desc],
+            vec![Order::Desc, Order::Asc],
+            vec![Order::Asc, Order::Desc],
+        ];
+        for cursor_idx in 0..cursor.len() {
+            for &score in &probe_scores {
+                let mut raw_view = raw_view_for_cursor_position(&cursor, cursor_idx, prefix_len);
+                raw_view.push(CursorSortVal::Score(score));
+                for start in &starts {
+                    for orders in &order_sets {
+                        let old = is_strictly_after_lex(&raw_view, start, orders);
+                        let new = is_strictly_after_lex_raw_inline(
+                            &cursor, cursor_idx, prefix_len, Some(score), start, orders,
+                        );
+                        assert_eq!(
+                            old, new,
+                            "parity mismatch at cursor_idx={cursor_idx} score={score} \
+                             orders={orders:?} start={start:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Single-field-as-multi: prefix_len=1 fruit shape for an

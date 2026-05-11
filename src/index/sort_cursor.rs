@@ -2350,4 +2350,114 @@ mod tests {
             "expected mutual-exclusion error from IndexBuilder, got: {err}"
         );
     }
+
+    /// **Wave 18 follow-up.** `Index::rewrite_settings_on_disk`
+    /// rewrites `meta.json` with new `IndexSettings`, preserving the
+    /// segment list / schema / opstamp / payload.  Pinned via a
+    /// round-trip: create an index with v1 `sort_by_field`, commit a
+    /// segment, rewrite to v2 `sort_by_fields`, then verify the
+    /// reloaded meta carries the new settings.
+    #[test]
+    fn rewrite_settings_on_disk_round_trip_v1_to_v2() {
+        use crate::schema::{FAST, INDEXED, STORED, Schema};
+        use crate::index::IndexSortByField;
+        use crate::{Index, IndexBuilder, IndexSettings};
+
+        let mut sb = Schema::builder();
+        let ts = sb.add_i64_field("ts", FAST | INDEXED | STORED);
+        let schema = sb.build();
+        let _ = ts;
+        let v1_settings = IndexSettings {
+            sort_by_field: Some(IndexSortByField {
+                field: "ts".to_string(),
+                order: Order::Desc,
+            }),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema.clone())
+            .settings(v1_settings)
+            .create_in_ram()
+            .unwrap();
+        // commit a segment so the rewrite has a non-trivial segment
+        // list to preserve.
+        let mut writer = index.writer_for_tests().unwrap();
+        let ts_field = index.schema().get_field("ts").unwrap();
+        writer
+            .add_document(doc!(ts_field => 100i64))
+            .unwrap();
+        writer.commit().unwrap();
+
+        // Sanity: pre-rewrite meta has v1 sort_by_field set, no
+        // sort_by_fields.
+        let pre = index.load_metas().unwrap();
+        assert!(pre.index_settings.sort_by_field.is_some());
+        assert!(pre.index_settings.sort_by_fields.is_none());
+        let segment_count_before = pre.segments.len();
+
+        // Wave 18 follow-up: rewrite settings in place.
+        let v2_settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "ts".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        index
+            .rewrite_settings_on_disk(v2_settings)
+            .expect("rewrite_settings_on_disk must succeed");
+
+        // Reload meta from disk + verify v2 shape.
+        let post = index.load_metas().unwrap();
+        assert!(
+            post.index_settings.sort_by_field.is_none(),
+            "post-rewrite sort_by_field must be cleared"
+        );
+        let sb_fields = post
+            .index_settings
+            .sort_by_fields
+            .as_ref()
+            .expect("sort_by_fields must be set post-rewrite");
+        assert_eq!(sb_fields.len(), 1);
+        assert_eq!(sb_fields[0].field, "ts");
+        assert_eq!(sb_fields[0].order, Order::Desc);
+        // Segment list / schema preserved.
+        assert_eq!(post.segments.len(), segment_count_before);
+        assert_eq!(post.schema, pre.schema);
+        assert_eq!(post.opstamp, pre.opstamp);
+    }
+
+    /// **Wave 18 follow-up.** Mirror test: rewriting to `IndexSettings::default()`
+    /// (no sort) clears both `sort_by_field` and `sort_by_fields`.
+    #[test]
+    fn rewrite_settings_on_disk_clears_sort_when_default() {
+        use crate::schema::{FAST, INDEXED, Schema};
+        use crate::index::IndexSortByField;
+        use crate::{Index, IndexBuilder, IndexSettings};
+
+        let mut sb = Schema::builder();
+        let ts = sb.add_i64_field("ts", FAST | INDEXED);
+        let schema = sb.build();
+        let _ = ts;
+        let v2 = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "ts".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema)
+            .settings(v2)
+            .create_in_ram()
+            .unwrap();
+
+        // Rewrite to default (no sort).
+        index
+            .rewrite_settings_on_disk(IndexSettings::default())
+            .expect("rewrite to default must succeed");
+        let post = index.load_metas().unwrap();
+        assert!(post.index_settings.sort_by_field.is_none());
+        assert!(post.index_settings.sort_by_fields.is_none());
+    }
 }

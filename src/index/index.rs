@@ -717,6 +717,58 @@ impl Index {
         Ok(())
     }
 
+    /// Rewrites `meta.json` on disk with new `IndexSettings` while
+    /// preserving the current segment list, opstamp, schema, and
+    /// payload.
+    ///
+    /// **FerroSearch extension (Wave 18 follow-up).** This exists to
+    /// support in-place migration of the `index.sort.*` shape — e.g.
+    /// upgrading an existing single-field `IndexSettings::sort_by_field`
+    /// (v1 cursor) deployment to the v2 multi-field
+    /// `IndexSettings::sort_by_fields` shape that Wave 18-1〜18-6 builds
+    /// on, so future segments committed after the migration also build
+    /// v2 cursors instead of relying on Wave 18-2's mix dispatcher
+    /// fallback path for them.
+    ///
+    /// Mirrors [`Self::rewrite_schema_on_disk`]: the call only
+    /// rewrites `meta.json` atomically.  The in-memory `Index`'s
+    /// settings cache is unchanged — re-open the directory with
+    /// [`Index::open`] (or update via [`Self::settings_mut`]) to
+    /// observe the new settings.
+    ///
+    /// The caller is responsible for:
+    ///   - Validating `new_settings` against [`IndexSettings::validate_sort_settings`]
+    ///     (`sort_by_field` and `sort_by_fields` are mutually exclusive
+    ///     at tantivy's invariant boundary; new fields beyond the cap
+    ///     are rejected at write time downstream).
+    ///   - Backfilling any per-segment auxiliary data the new settings
+    ///     imply.  In particular, switching from `sort_by_field` to
+    ///     `sort_by_fields` does NOT retroactively create v2 cursor
+    ///     files on existing segments — operators must pair this call
+    ///     with `IndexWriter::backfill_sort_cursor_v2` so the existing
+    ///     segments advertise the new cursor shape.
+    ///   - Draining / committing any in-flight writes and dropping the
+    ///     existing `IndexWriter` before calling, then re-opening the
+    ///     `Index` so subsequent writers use the new settings.  This
+    ///     method does not acquire the writer lock.
+    ///
+    /// After a successful call + re-open, the segment-finalize hook
+    /// in `build_and_write_sort_cursors` (see `src/index/sort_cursor.rs`)
+    /// reads the new `sort_by_fields` and starts emitting v2 cursors
+    /// on every subsequent commit.
+    pub fn rewrite_settings_on_disk(&self, new_settings: IndexSettings) -> crate::Result<()> {
+        let current = self.load_metas()?;
+        let new_meta = IndexMeta {
+            index_settings: new_settings,
+            segments: current.segments,
+            schema: current.schema,
+            opstamp: current.opstamp,
+            payload: current.payload,
+        };
+        save_metas(&new_meta, self.directory())?;
+        Ok(())
+    }
+
     /// Returns the list of segments that are searchable
     pub fn searchable_segments(&self) -> crate::Result<Vec<Segment>> {
         Ok(self

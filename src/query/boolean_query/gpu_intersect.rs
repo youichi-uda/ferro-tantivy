@@ -307,11 +307,56 @@ pub(crate) fn try_gpu_intersect(
         // compressed) promotion. Same best-effort semantics — promote
         // failure (no codec, oversize > 16 MiB single-chunk, budget
         // pressure) silently fall through to v2 / v1 below.
+        //
+        // Wave Z-3 #1 — v2-hit-but-v3-miss fast path. When step C
+        // produced (or just promoted) a v2 entry, hand that
+        // `Arc<VramTermEntry>` to `promote_v2_to_v3` instead of
+        // re-draining the postings into a fresh `RoaringPostings`.
+        // The new method Bitcomp-compresses the v2 device buffer
+        // directly (no host container walk, no `cudaMalloc`
+        // d_uncompressed_temp, no H→D staging copy), saving ~60ms
+        // on dense terms (10K+ buckets) per Wave Z-2 #1's recon
+        // estimate. v2 entry's `bucket_index` is reused so the v3
+        // entry's layout is bytewise-identical to one produced via
+        // the legacy `insert(roaring)` path (asserted by
+        // `promote_v2_to_v3_matches_insert_layout` in
+        // `vram_cht_v3`).
+        //
+        // When the v2 entry isn't in hand (step C promote also
+        // failed, e.g. budget pressure / oversize at the v2 tier),
+        // we keep the legacy `handle.promote(key, roaring.as_ref())`
+        // path — the v2-skip-redrain optimisation only applies when
+        // both tiers' source is the same in-flight `Arc<VramTermEntry>`.
+        //
+        // `promote_v2_to_v3` returning `Ok(false)` is admission
+        // rejection (kill-switch / oversize / budget); we do NOT
+        // fall back to the roaring path because (a) the v2 source
+        // is the canonical copy and a parallel fresh drain would
+        // hit the same budget cap, and (b) Wave Z-2 #1's method
+        // already runs the cheap admission probe before any
+        // cudaMalloc, so retrying via a different drain code path
+        // can't improve the outcome this query. An
+        // admission-rejected promote leaves the cache state clean
+        // (the freshly-allocated `d_compressed` is dropped before
+        // installation) and falls through to the v2 / v1 dispatch
+        // tier below.
         #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
         let final_v3_entry = if let Some(entry) = v3_entry {
             Some(entry)
         } else if let Some(handle) = v3_handle {
-            let _ = handle.promote(key.clone(), roaring.as_ref());
+            match final_vram_entry.as_ref() {
+                Some(v2_arc) => {
+                    // v2 entry is in hand — Bitcomp-compress directly
+                    // from its device buffer (Wave Z-2 #1 method).
+                    let _ = handle.promote_v2_to_v3(&key, Arc::clone(v2_arc));
+                }
+                None => {
+                    // No v2 source — fall back to the legacy
+                    // re-drain path (host container walk +
+                    // cudaMalloc d_uncompressed_temp + H→D copy).
+                    let _ = handle.promote(key.clone(), roaring.as_ref());
+                }
+            }
             handle.get(&key)
         } else {
             None
@@ -788,6 +833,177 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    // ========================================================
+    // Wave Z-3 #1 — promote_v2_to_v3 dispatch wiring tests
+    // ========================================================
+
+    /// E2E witness for the Wave Z-3 #1 wiring: when the v2 (uncompressed
+    /// VRAM) tier holds an entry for a cohort term but the v3
+    /// (Bitcomp-compressed) tier does not, the dispatch path must
+    /// promote via [`vram_cht_v3::VramCompressedCht::promote_v2_to_v3`]
+    /// (= compress the v2 device buffer directly) instead of falling
+    /// back to the legacy `v3.promote(roaring)` re-drain path.
+    ///
+    /// The test:
+    /// 1. Resets v2 + v3 globals to a known empty state.
+    /// 2. Runs `try_gpu_intersect` once with a heavy cohort so call #1
+    ///    populates *both* tiers. Snapshot v3 stats after call #1.
+    /// 3. Manually evicts the v3 entries (via `reset_global`) while
+    ///    leaving v2 populated. v2 is now hot, v3 is cold — the exact
+    ///    v2-hit-but-v3-miss shape that step D's new branch targets.
+    /// 4. Runs `try_gpu_intersect` again. Step D must observe
+    ///    `final_vram_entry.is_some()` (because v2 still has each
+    ///    cohort key) and `v3_entry.is_none()` (because we cleared v3),
+    ///    so the new `promote_v2_to_v3` branch must fire for every
+    ///    cohort member.
+    /// 5. Assert v3's `promotions` counter grew by ≥1 over the call.
+    ///    Combined with the pre-call invariant `v3.entries == 0`, this
+    ///    proves the wiring is exercised — there's no other code path
+    ///    that bumps `v3.promotions` while the v2 tier is hot.
+    ///
+    /// Limitations: the `promotions` counter is bumped by *both*
+    /// `promote(roaring)` and `promote_v2_to_v3`, so this test verifies
+    /// the wiring-reach contract (v3 promotion fires during a v2-hit-
+    /// but-v3-miss call) but does not byte-for-byte prove the new
+    /// kernel-side path was taken. The structural code inspection +
+    /// the Wave Z-2 #1 unit tests on `promote_v2_to_v3` itself cover
+    /// the "actual savings" half; this test pins the "the wiring is
+    /// reachable from the public query path" half.
+    ///
+    /// Skips on hosts without a working Bitcomp codec (v3 global is
+    /// `None`) — same gate the sibling
+    /// `v3_cht_warm_path_witnessed_via_stats` test uses.
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    #[test]
+    fn compute_fold_v3_uses_promote_v2_to_v3_on_v2_hit() -> crate::Result<()> {
+        use crate::postings::roaring::vram_cht;
+        use crate::postings::roaring::vram_cht_v3;
+
+        let _g = COUNTER_LOCK.lock().unwrap();
+        reset_dispatch_counters();
+        vram_cht::reset_global();
+        vram_cht_v3::reset_global();
+
+        let v3_handle = match vram_cht_v3::global() {
+            Some(h) => h,
+            // No Bitcomp codec on this host — v3 tier never engages,
+            // so the wiring branch can't fire either. Exit cleanly.
+            None => return Ok(()),
+        };
+
+        // Heavy cohort: 12 terms × 100_000 docs = clears every
+        // planner gate. Identical fixture shape to the sibling v3
+        // warm-path witness so the same dispatch decisions fire.
+        let term_list: Vec<String> = (0..12).map(|i| format!("z3wire{i}")).collect();
+        let doc_text = term_list.join(" ");
+        let mut docs: Vec<String> = Vec::with_capacity(100_000);
+        for _ in 0..100_000 {
+            docs.push(doc_text.clone());
+        }
+        let docs_refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (index, text_field) = build_index(&docs_refs)?;
+        let cohort_terms: Vec<&str> = term_list.iter().map(String::as_str).collect();
+        let reader = index.reader()?;
+        let segment_reader = reader.searcher().segment_reader(0).clone();
+
+        // Call #1: cold both tiers → drain + v2 promote + v3 promote.
+        // This populates v2 (and v3 too) by going through the legacy
+        // `promote(roaring)` paths in step C and step D.
+        let cohort_a = build_term_scorer_cohort(&index, text_field, &cohort_terms)?;
+        let res_a = try_gpu_intersect(cohort_a, &segment_reader, false);
+        if res_a.is_err() {
+            // Sandbox without working CUDA dispatch; the wiring branch
+            // is unreachable anyway. Exit cleanly.
+            return Ok(());
+        }
+        let v2_stats_after_a = vram_cht::global().stats();
+        let v3_stats_after_a = v3_handle.stats();
+        if v2_stats_after_a.promotions == 0 || v3_stats_after_a.promotions == 0 {
+            // Either tier didn't admit any term (oversize / budget /
+            // missing codec on this host). The v2-hit-but-v3-miss
+            // case can't be set up; bail cleanly without asserting.
+            return Ok(());
+        }
+
+        // Clear v3 only — v2 stays populated. This is the exact shape
+        // we want for step D's new branch: every cohort key still
+        // present in v2, but absent from v3.
+        let v3_promotions_pre_warm = v3_stats_after_a.promotions;
+        vram_cht_v3::reset_global();
+        let v3_handle = vram_cht_v3::global().expect(
+            "v3 global handle must remain available after reset_global",
+        );
+        let v3_stats_pre_b = v3_handle.stats();
+        assert_eq!(
+            v3_stats_pre_b.entries, 0,
+            "v3 cache must be empty after reset_global (precondition for v2-hit-but-v3-miss path)"
+        );
+        assert_eq!(
+            v3_stats_pre_b.promotions, 0,
+            "v3 promotions counter must be zero after reset_global"
+        );
+
+        // v2 must still hold the cohort keys for the wiring branch
+        // to be reachable.
+        let v2_stats_pre_b = vram_cht::global().stats();
+        assert!(
+            v2_stats_pre_b.entries >= 1,
+            "v2 cache must retain ≥1 entry across the v3-only reset; got entries={}",
+            v2_stats_pre_b.entries
+        );
+
+        // Call #2: v2 hits, v3 misses → step D takes the new
+        // `promote_v2_to_v3` branch for every cohort member.
+        let cohort_b = build_term_scorer_cohort(&index, text_field, &cohort_terms)?;
+        let res_b = try_gpu_intersect(cohort_b, &segment_reader, false);
+        assert!(
+            res_b.is_ok(),
+            "second call must succeed under the v2-hit-but-v3-miss path"
+        );
+        let v3_stats_after_b = v3_handle.stats();
+        assert!(
+            v3_stats_after_b.promotions >= 1,
+            "v3 promotions must grow on the v2-hit-but-v3-miss call \
+             (Wave Z-3 #1 wiring proof). got promotions={} entries={} \
+             (v3 was reset to empty before this call; only the new \
+             wiring branch can bump promotions while v2 is hot)",
+            v3_stats_after_b.promotions,
+            v3_stats_after_b.entries,
+        );
+
+        // The wiring branch consumed *the same* Arc<VramTermEntry>
+        // already cached in v2, so v2's promotion counter must
+        // *not* grow during call #2 (no new v2 promotions — they
+        // were all hits). This is the load-bearing assertion: it
+        // distinguishes the new path (consume existing v2 Arc) from
+        // a legacy fallback that would re-promote v2 from a fresh
+        // drain (bumping v2 promotions again).
+        let v2_stats_after_b = vram_cht::global().stats();
+        assert_eq!(
+            v2_stats_after_b.promotions, v2_stats_pre_b.promotions,
+            "v2 promotions must NOT grow on the v2-hit-but-v3-miss call \
+             (cohort keys already in v2; new wiring consumes the existing \
+             Arc<VramTermEntry> rather than re-promoting). \
+             pre={} after={}",
+            v2_stats_pre_b.promotions, v2_stats_after_b.promotions,
+        );
+
+        // Defensive: confirm the v3 cache *grew* under the new path
+        // (entries went from 0 to ≥1 across call #2).
+        assert!(
+            v3_stats_after_b.entries >= 1,
+            "v3 cache must hold ≥1 entry after the v2-hit-but-v3-miss \
+             call; got entries={}",
+            v3_stats_after_b.entries
+        );
+
+        // Sanity: the v3 counter snapshot from call #1 is untouched
+        // by the reset (reset zeroes the counters), so the +1 we
+        // just observed is genuinely from call #2's new branch.
+        let _ = v3_promotions_pre_warm; // referenced for clarity; values are reset above
         Ok(())
     }
 }

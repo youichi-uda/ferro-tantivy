@@ -94,7 +94,6 @@ use ferro_compress::nvcomp_sys::cuda::{
     cudaFree, cudaMalloc, cudaMemcpy, cudaMemcpyKind, CUDA_SUCCESS,
 };
 
-use crate::index::SegmentId;
 use crate::postings::roaring::cht::ChtKey;
 use crate::postings::roaring::container::{BitmapContainer, Container};
 use crate::postings::roaring::encoder::RoaringPostings;
@@ -888,6 +887,7 @@ pub fn reset_global() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::SegmentId;
     use crate::postings::roaring::encoder::RoaringEncoder;
 
     fn small_roaring() -> RoaringPostings {

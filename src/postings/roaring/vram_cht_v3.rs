@@ -73,7 +73,6 @@ use ferro_compress::nvcomp_sys::cuda::{
 };
 use ferro_compress::{BitcompDataType, BitcompDeviceCodec, Error as FcError};
 
-use crate::index::SegmentId;
 use crate::postings::roaring::cht::ChtKey;
 use crate::postings::roaring::container::{BitmapContainer, Container};
 use crate::postings::roaring::encoder::RoaringPostings;
@@ -967,6 +966,7 @@ pub fn kill_switch_active() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::SegmentId;
     use crate::postings::roaring::encoder::RoaringEncoder;
 
     fn small_roaring() -> RoaringPostings {
@@ -1175,7 +1175,7 @@ mod tests {
             let _ = cht_v3.insert(key, fix);
         }
         let v3_entries = cht_v3.stats().entries;
-        let v3_live_uncompressed = cht_v3.stats().uncompressed_bytes_total;
+        let _v3_live_uncompressed = cht_v3.stats().uncompressed_bytes_total;
 
         // Run the same test on v2 (using the v2 cache for parallel
         // construction). v2 entry size = uncompressed bitmap

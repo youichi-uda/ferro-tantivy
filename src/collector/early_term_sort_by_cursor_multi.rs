@@ -310,8 +310,14 @@ impl EarlyTermSortByCursorCollectorMulti {
 
     /// Returns `true` iff `segment_reader` advertises a v2 sort cursor
     /// whose primary field == `self.fields()[0].0` AND whose recorded
-    /// `(field, order)` prefix matches `self.fields()` exactly.
-    /// Callers MUST gate dispatch on this predicate.
+    /// `(field, order)` prefix is compatible with `self.fields()`.
+    ///
+    /// **Wave 20.** "Compatible" widens past the original Wave 18
+    /// strict-equality rule: a single-field request whose order is the
+    /// opposite of the stored cursor's order is also accepted —
+    /// harvest reverse-walks the cursor so the emitted values match
+    /// the request's order. Multi-field mixed-direction requests
+    /// remain rejected (see [`CursorMatchMode`]).
     pub fn can_handle_segment(&self, segment_reader: &SegmentReader) -> bool {
         let Some(primary) = self.fields.first() else {
             return false;
@@ -319,24 +325,62 @@ impl EarlyTermSortByCursorCollectorMulti {
         let Some(cursor) = segment_reader.sort_cursor_v2(&primary.0) else {
             return false;
         };
-        cursor_prefix_matches(&cursor, &self.fields)
+        cursor_match_mode(&cursor, &self.fields) != CursorMatchMode::NoMatch
     }
 }
 
-/// Returns `true` when the cursor's recorded `(field, order)` list
-/// starts with `prefix`. Field name comparison is exact (no `keyword`/
-/// `.raw` rewriting — that happens upstream of the collector).
-fn cursor_prefix_matches(cursor: &SortCursorIndexV2, prefix: &[(String, Order)]) -> bool {
-    if prefix.len() > cursor.fields().len() {
-        return false;
+/// **Wave 20.** Dispatch outcome for matching a request's sort prefix
+/// against an on-disk v2 cursor's recorded `(field, order)` list.
+///
+/// * `Forward` — names AND orders match exactly. Harvest iterates the
+///   cursor low→high in stored order; this is the Wave 18 baseline.
+/// * `ReverseSingleField` — single-field request whose order is the
+///   opposite of the cursor's stored order. Harvest iterates the
+///   cursor high→low so the emitted values match the request's order.
+///   Multi-field reverse walks would require flipping tie-group lex
+///   order which the current harvest doesn't support; we only enable
+///   the optimisation for `prefix.len() == 1`.
+/// * `NoMatch` — names disagree at some position, the prefix is longer
+///   than the cursor's recorded fields, or it's a multi-field
+///   request with a mixed-order disagreement we can't reverse-walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorMatchMode {
+    Forward,
+    ReverseSingleField,
+    NoMatch,
+}
+
+/// **Wave 20.** Classifies how a request's `prefix` can be answered
+/// from the cursor's recorded fields. See [`CursorMatchMode`] for the
+/// three outcomes. Field-name comparison is exact (no `keyword` /
+/// `.raw` rewriting — that happens upstream).
+pub(crate) fn cursor_match_mode(
+    cursor: &SortCursorIndexV2,
+    prefix: &[(String, Order)],
+) -> CursorMatchMode {
+    if prefix.is_empty() || prefix.len() > cursor.fields().len() {
+        return CursorMatchMode::NoMatch;
     }
-    for (i, (req_name, req_order)) in prefix.iter().enumerate() {
-        let (cur_name, cur_order, _) = &cursor.fields()[i];
-        if cur_name != req_name || cur_order != req_order {
-            return false;
+    for (i, (req_name, _)) in prefix.iter().enumerate() {
+        if &cursor.fields()[i].0 != req_name {
+            return CursorMatchMode::NoMatch;
         }
     }
-    true
+    let exact = prefix
+        .iter()
+        .enumerate()
+        .all(|(i, (_, req_order))| &cursor.fields()[i].1 == req_order);
+    if exact {
+        return CursorMatchMode::Forward;
+    }
+    // Single-field opposite-order = reverse walk emits values in the
+    // request's order from the same stored cursor. Multi-field mixed
+    // direction can't be reversed in a single pass — fall through to
+    // NoMatch so the dispatch falls back to the v1 / fast-field path.
+    if prefix.len() == 1 && cursor.fields()[0].1 != prefix[0].1 {
+        return CursorMatchMode::ReverseSingleField;
+    }
+    CursorMatchMode::NoMatch
 }
 
 impl Collector for EarlyTermSortByCursorCollectorMulti {
@@ -365,15 +409,27 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
         segment_local_id: SegmentOrdinal,
         segment_reader: &SegmentReader,
     ) -> crate::Result<Self::Child> {
-        // Resolve the cursor only when the prefix matches and the limit
-        // is non-zero — the disabled path becomes a cheap no-op.
-        let cursor_opt = if self.limit == 0 {
-            None
+        // **Wave 20.** Resolve the cursor *with its match mode* — when
+        // the request's single-field order is the opposite of the
+        // stored order, we accept the cursor and flip the harvest's
+        // iteration direction (`reverse_walk = true`). The disabled
+        // path (`limit == 0` or no compatible cursor) stays a cheap
+        // no-op.
+        let (cursor_opt, reverse_walk) = if self.limit == 0 {
+            (None, false)
         } else {
-            self.fields
+            let cur_opt = self
+                .fields
                 .first()
-                .and_then(|(primary, _)| segment_reader.sort_cursor_v2(primary))
-                .filter(|cursor| cursor_prefix_matches(cursor, &self.fields))
+                .and_then(|(primary, _)| segment_reader.sort_cursor_v2(primary));
+            match cur_opt {
+                Some(cursor) => match cursor_match_mode(&cursor, &self.fields) {
+                    CursorMatchMode::Forward => (Some(cursor), false),
+                    CursorMatchMode::ReverseSingleField => (Some(cursor), true),
+                    CursorMatchMode::NoMatch => (None, false),
+                },
+                None => (None, false),
+            }
         };
 
         let Some(cursor) = cursor_opt else {
@@ -389,6 +445,7 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
                 scoring: None,
                 scores: Vec::new(),
                 start_after_raw: None,
+                reverse_walk: false,
             });
         };
 
@@ -481,6 +538,7 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
             scoring: self.scoring,
             scores,
             start_after_raw,
+            reverse_walk,
         })
     }
 
@@ -556,6 +614,14 @@ pub struct EarlyTermSortByCursorMultiSegmentCollector {
     /// falls through to the slow bytes-compare path on the decoded
     /// tuple (existing Wave 18-3 baseline).
     start_after_raw: Option<Vec<CursorSortVal>>,
+    /// **Wave 20.** When `true`, harvest walks `cursor` from end to
+    /// start so the emitted primary values match the request's order
+    /// despite the stored cursor being sorted the opposite way. Set
+    /// by [`Collector::for_segment`] from
+    /// [`cursor_match_mode`] = [`CursorMatchMode::ReverseSingleField`].
+    /// Mix dispatcher constructors leave it `false` — they are
+    /// Wave 18 Forward-only.
+    reverse_walk: bool,
 }
 
 impl EarlyTermSortByCursorMultiSegmentCollector {
@@ -591,6 +657,12 @@ impl EarlyTermSortByCursorMultiSegmentCollector {
             // verbatim, which is the existing baseline these
             // constructors were authored against.
             start_after_raw: None,
+            // Wave 20: mix dispatcher is Forward-only (its own gate at
+            // `cursor_prefix_matches` in `early_term_or_fallback_collector_multi`
+            // already rejects opposite-order). Tests that need reverse
+            // walk use the public `for_segment` path which derives this
+            // from `cursor_match_mode`.
+            reverse_walk: false,
         }
     }
 
@@ -623,6 +695,8 @@ impl EarlyTermSortByCursorMultiSegmentCollector {
             scoring,
             scores,
             start_after_raw: None,
+            // Wave 20: see `new_for_test_or_mix` note.
+            reverse_walk: false,
         }
     }
 }
@@ -730,7 +804,27 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
         // docs are in the same tie group iff their primary tuples
         // are identical under `==`.
         let mut buffer_primary: Option<Vec<Option<u64>>> = None;
-        for cursor_idx in 0..cursor.len() {
+        // **Wave 20.** Direction-aware iteration: when the cursor is
+        // stored in the opposite order vs the request, iterate the
+        // cursor end→start so the emitted primary values match the
+        // request's order. Tie-group boundary detection
+        // (`cur_primary != buffer_primary`) is direction-agnostic
+        // because equal primaries remain adjacent under reverse
+        // iteration. `is_strictly_after_lex` is evaluated against
+        // `orders` (the **request's** order, not the cursor's stored
+        // order), so search_after stays correct in both directions.
+        // The "next group is strictly worse → early-break" property
+        // also flips with direction: in a reverse walk, the *next*
+        // cursor index has a primary that's *larger* in stored order
+        // which means *worse in request order* (the request is the
+        // opposite of stored). The flush + early-break logic below is
+        // therefore unchanged.
+        let cursor_iter: Box<dyn Iterator<Item = usize>> = if self.reverse_walk {
+            Box::new((0..cursor.len()).rev())
+        } else {
+            Box::new(0..cursor.len())
+        };
+        for cursor_idx in cursor_iter {
             let doc = cursor.doc_ids()[cursor_idx];
             if !self.matched_bitset.contains(doc) {
                 continue;
@@ -1092,6 +1186,21 @@ mod tests {
         start_after: Option<Vec<CursorSortVal>>,
         matched: &[DocId],
     ) -> Vec<(Vec<CursorSortVal>, DocAddress)> {
+        harvest_with_matched_dir(cursor, fields, limit, start_after, matched, false)
+    }
+
+    /// **Wave 20** test helper variant: same as `harvest_with_matched`
+    /// but lets the test toggle the segment collector's `reverse_walk`
+    /// flag directly, so the reverse-direction unit tests don't have
+    /// to construct a full `SegmentReader`.
+    fn harvest_with_matched_dir(
+        cursor: Arc<SortCursorIndexV2>,
+        fields: Vec<(&str, Order)>,
+        limit: usize,
+        start_after: Option<Vec<CursorSortVal>>,
+        matched: &[DocId],
+        reverse_walk: bool,
+    ) -> Vec<(Vec<CursorSortVal>, DocAddress)> {
         let max_doc = cursor.max_doc();
         let mut bitset = BitSet::with_max_value(max_doc);
         for &d in matched {
@@ -1117,6 +1226,7 @@ mod tests {
             scoring: None,
             scores: Vec::new(),
             start_after_raw: None,
+            reverse_walk,
         };
         segment.harvest()
     }
@@ -1293,8 +1403,12 @@ mod tests {
 
     /// `can_handle_segment` rejects when the requested prefix is
     /// LONGER than the cursor's recorded fields.
+    ///
+    /// **Wave 20.** Migrated from the pre-Wave-20 `cursor_prefix_matches`
+    /// helper to its successor [`cursor_match_mode`]: the longer-than
+    /// prefix case still yields [`CursorMatchMode::NoMatch`].
     #[test]
-    fn cursor_prefix_matches_rejects_too_long_prefix() {
+    fn cursor_match_mode_rejects_too_long_prefix() {
         let cursor = build_cursor(
             vec![("ts", Order::Desc, ValueKind::I64)],
             vec![vec![Some(1u64)]],
@@ -1304,13 +1418,19 @@ mod tests {
             ("ts".to_string(), Order::Desc),
             ("_id".to_string(), Order::Asc),
         ];
-        assert!(!cursor_prefix_matches(&cursor, &prefix));
+        assert_eq!(
+            cursor_match_mode(&cursor, &prefix),
+            CursorMatchMode::NoMatch
+        );
     }
 
     /// `can_handle_segment` rejects when the order on a field
-    /// disagrees.
+    /// disagrees AND we can't fall back to reverse-walk (multi-field
+    /// mixed-direction).  Pinned for Wave 20: the single-field flip
+    /// case becomes [`CursorMatchMode::ReverseSingleField`], while a
+    /// name mismatch remains [`CursorMatchMode::NoMatch`].
     #[test]
-    fn cursor_prefix_matches_rejects_order_mismatch() {
+    fn cursor_match_mode_rejects_order_mismatch() {
         let cursor = build_cursor(
             vec![
                 ("ts", Order::Desc, ValueKind::I64),
@@ -1322,9 +1442,21 @@ mod tests {
         let prefix_ok = vec![("ts".to_string(), Order::Desc)];
         let prefix_bad_order = vec![("ts".to_string(), Order::Asc)];
         let prefix_bad_name = vec![("other".to_string(), Order::Desc)];
-        assert!(cursor_prefix_matches(&cursor, &prefix_ok));
-        assert!(!cursor_prefix_matches(&cursor, &prefix_bad_order));
-        assert!(!cursor_prefix_matches(&cursor, &prefix_bad_name));
+        assert_eq!(
+            cursor_match_mode(&cursor, &prefix_ok),
+            CursorMatchMode::Forward
+        );
+        // Wave 20: single-field opposite-order is now a reverse walk,
+        // not NoMatch — this widens the pre-Wave-20 assertion.
+        assert_eq!(
+            cursor_match_mode(&cursor, &prefix_bad_order),
+            CursorMatchMode::ReverseSingleField
+        );
+        // Name mismatch stays NoMatch regardless of direction.
+        assert_eq!(
+            cursor_match_mode(&cursor, &prefix_bad_name),
+            CursorMatchMode::NoMatch
+        );
     }
 
     /// `merge_fruits` produces a stable lex-ordered top-K across
@@ -2353,5 +2485,134 @@ mod tests {
             .collect();
         // Cursor walks DESC so US (ord 1) comes before JP (ord 0).
         assert_eq!(bytes, vec![b"US".as_slice(), b"JP".as_slice()]);
+    }
+
+    // ─── Wave 20: v2 multi collector reverse-walk ──────────────────────
+
+    /// **Wave 20.** Single-field request whose order is the opposite
+    /// of the stored cursor's order: harvest reverse-walks the cursor
+    /// so the emitted primary values come back in the request's
+    /// (ASC) order even though the cursor is stored DESC.
+    #[test]
+    fn wave_20_v2_reverse_walk_single_field() {
+        // Cursor sorted DESC on ts: stored order = 5, 4, 3, 2, 1.
+        let ts: Vec<Option<u64>> = vec![5i64, 4, 3, 2, 1]
+            .into_iter()
+            .map(|v| Some(v.to_u64()))
+            .collect();
+        let cursor = build_cursor(
+            vec![("ts", Order::Desc, ValueKind::I64)],
+            vec![ts],
+            5,
+        );
+        // Request ASC, limit=3. Reverse walk should yield 1, 2, 3.
+        let hits = harvest_with_matched_dir(
+            cursor,
+            vec![("ts", Order::Asc)],
+            3,
+            None,
+            &[0, 1, 2, 3, 4],
+            true,
+        );
+        let vals: Vec<u64> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::Numeric(Some(u)) => i64::from_u64(*u) as u64,
+                _ => panic!("unexpected slot kind"),
+            })
+            .collect();
+        assert_eq!(vals, vec![1u64, 2, 3]);
+        // The corresponding doc_ids should be the docs that originally
+        // held those ts values. Cursor was built from inputs in stored
+        // (DESC) order, so per-doc-index mapping is doc_id 0=ts5,
+        // 1=ts4, 2=ts3, 3=ts2, 4=ts1. Reverse-walking the cursor
+        // emits doc 4 first (ts=1), then 3 (ts=2), then 2 (ts=3).
+        let docs: Vec<DocId> = hits.iter().map(|(_, a)| a.doc_id).collect();
+        assert_eq!(docs, vec![4u32, 3, 2]);
+    }
+
+    /// **Wave 20.** Reverse walk with a `search_after` constraint:
+    /// request ASC against a DESC cursor with `search_after = 2`
+    /// should keep only docs with primary strictly greater than 2.
+    #[test]
+    fn wave_20_v2_reverse_walk_with_search_after() {
+        let ts: Vec<Option<u64>> = vec![5i64, 4, 3, 2, 1]
+            .into_iter()
+            .map(|v| Some(v.to_u64()))
+            .collect();
+        let cursor = build_cursor(
+            vec![("ts", Order::Desc, ValueKind::I64)],
+            vec![ts],
+            5,
+        );
+        let start_after = vec![num(Some(2i64.to_u64()))];
+        let hits = harvest_with_matched_dir(
+            cursor,
+            vec![("ts", Order::Asc)],
+            10,
+            Some(start_after),
+            &[0, 1, 2, 3, 4],
+            true,
+        );
+        let vals: Vec<u64> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::Numeric(Some(u)) => i64::from_u64(*u) as u64,
+                _ => panic!(),
+            })
+            .collect();
+        // ASC strictly-after 2 in ASC order = 3, 4, 5.
+        assert_eq!(vals, vec![3u64, 4, 5]);
+    }
+
+    /// **Wave 20.** Multi-field reverse-walk dispatch is rejected:
+    /// `can_handle_segment` returns `false` (and `cursor_match_mode`
+    /// returns `NoMatch`) when the request asks for multi-field
+    /// flipped direction against a single-cursor recording the
+    /// opposite stored direction. Only single-field reverse walks are
+    /// supported (multi-field would require flipping tie-group lex
+    /// order which the harvest doesn't implement).
+    #[test]
+    fn wave_20_v2_multi_field_reverse_rejected() {
+        let ts: Vec<Option<u64>> = vec![100i64, 100]
+            .into_iter()
+            .map(|v| Some(v.to_u64()))
+            .collect();
+        let st: Vec<Option<u64>> = vec![1i64, 2]
+            .into_iter()
+            .map(|v| Some(v.to_u64()))
+            .collect();
+        let cursor = build_cursor(
+            vec![
+                ("ts", Order::Desc, ValueKind::I64),
+                ("status", Order::Desc, ValueKind::I64),
+            ],
+            vec![ts, st],
+            2,
+        );
+        // Multi-field request whose primary direction is flipped.
+        // Names match, prefix length OK, but >1 field means reverse
+        // walk would also need to flip the within-tie-group lex tail
+        // — we explicitly do NOT support that.
+        let prefix = vec![
+            ("ts".to_string(), Order::Asc),
+            ("status".to_string(), Order::Desc),
+        ];
+        assert_eq!(
+            cursor_match_mode(&cursor, &prefix),
+            CursorMatchMode::NoMatch
+        );
+        // Sanity: single-field flip on `ts` only ⇒ ReverseSingleField.
+        let prefix_single = vec![("ts".to_string(), Order::Asc)];
+        assert_eq!(
+            cursor_match_mode(&cursor, &prefix_single),
+            CursorMatchMode::ReverseSingleField
+        );
+        // Sanity: full forward prefix ⇒ Forward.
+        let prefix_forward = vec![("ts".to_string(), Order::Desc)];
+        assert_eq!(
+            cursor_match_mode(&cursor, &prefix_forward),
+            CursorMatchMode::Forward
+        );
     }
 }

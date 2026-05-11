@@ -2460,4 +2460,183 @@ mod tests {
         assert!(post.index_settings.sort_by_field.is_none());
         assert!(post.index_settings.sort_by_fields.is_none());
     }
+
+    /// **Wave 15 Phase H-6 follow-up.**
+    /// [`build_and_write_sort_cursor_v2_for`] is exposed as a primitive
+    /// to callers outside of `IndexWriter::backfill_sort_cursor_v2`
+    /// (the in-tree caller).  The writer-level path filters
+    /// `max_doc == 0` segments *before* invoking the primitive, so the
+    /// primitive's own short-circuit branch is otherwise unexercised —
+    /// pin it here so future refactors can't quietly drop it.
+    #[test]
+    fn build_and_write_sort_cursor_v2_for_max_doc_zero_short_circuits() -> crate::Result<()> {
+        use crate::schema::{Schema, FAST};
+        let mut schema_builder = Schema::builder();
+        let _ts = schema_builder.add_i64_field("ts", FAST);
+        let _id = schema_builder.add_i64_field("id", FAST);
+        let index = crate::Index::create_in_ram(schema_builder.build());
+        let mut segment = index.new_segment();
+        assert_eq!(segment.meta().max_doc(), 0, "fresh segment must be empty");
+
+        let pairs = vec![
+            ("ts".to_string(), Order::Desc),
+            ("id".to_string(), Order::Asc),
+        ];
+        let written = build_and_write_sort_cursor_v2_for(&mut segment, &pairs)?;
+        assert!(
+            !written,
+            "max_doc=0 segment must short-circuit to Ok(false)"
+        );
+
+        // Defensive: an empty segment must not leave a cursor file on
+        // disk (a stale file with no segment publication would either
+        // be a GC orphan or — pre Phase H-6 — racy under further
+        // segment activity).
+        let cursor_path = segment.meta().sort_cursor_path("ts");
+        assert!(
+            !index.directory().exists(&cursor_path).unwrap(),
+            "max_doc=0 must not produce a cursor file on disk"
+        );
+        Ok(())
+    }
+
+    /// **Wave 15 Phase H-6 follow-up.**  Empty `pairs` are rejected at
+    /// the primitive boundary *before* the segment is touched.
+    /// The IndexWriter wrapper has the same check, but the primitive
+    /// is `pub` (re-exported via `crate::index`) so it is a real
+    /// surface to defend.
+    #[test]
+    fn build_and_write_sort_cursor_v2_for_rejects_empty_pairs() {
+        use crate::schema::{Schema, FAST};
+        let mut schema_builder = Schema::builder();
+        let _ts = schema_builder.add_i64_field("ts", FAST);
+        let index = crate::Index::create_in_ram(schema_builder.build());
+        let mut segment = index.new_segment();
+
+        let err = build_and_write_sort_cursor_v2_for(&mut segment, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("at least one field"),
+            "expected empty-pairs error, got: {err}"
+        );
+        // Sanity: nothing was written either way.
+        let cursor_path = segment.meta().sort_cursor_path("anything");
+        assert!(!index.directory().exists(&cursor_path).unwrap());
+    }
+
+    /// **Wave 15 Phase H-6 follow-up.**  `pairs.len() > SORT_CURSOR_MAX_FIELDS`
+    /// is rejected at the primitive boundary with a clear error.
+    #[test]
+    fn build_and_write_sort_cursor_v2_for_rejects_too_many_pairs() {
+        use crate::schema::{Schema, FAST};
+        let mut schema_builder = Schema::builder();
+        let _ts = schema_builder.add_i64_field("ts", FAST);
+        let index = crate::Index::create_in_ram(schema_builder.build());
+        let mut segment = index.new_segment();
+
+        let too_many: Vec<(String, Order)> = (0..=SORT_CURSOR_MAX_FIELDS as u32)
+            .map(|i| (format!("f{i}"), Order::Asc))
+            .collect();
+        let err = build_and_write_sort_cursor_v2_for(&mut segment, &too_many).unwrap_err();
+        assert!(
+            err.to_string().contains("at most"),
+            "expected too-many-fields error, got: {err}"
+        );
+    }
+
+    /// **Wave 15 Phase H-6 contract.**  After
+    /// [`build_and_write_sort_cursor_v2_for`] returns `Ok(true)` the
+    /// cursor file is *marked pending* (via the
+    /// [`crate::index::Segment::open_sort_cursor_write`] internal call
+    /// to [`crate::directory::Directory::mark_pending`]) and therefore
+    /// must survive a GC pass even when `living_files` does not yet
+    /// list it — this is exactly the race that Phase H-4 captured
+    /// (T+0.535 sync → T+0.721 GC delete, 150 ms gap) and that
+    /// Phase H-6 closed.  Releasing the pending mark + re-running GC
+    /// then reclaims the file, confirming the pending bucket is not a
+    /// permanent retention path.
+    #[test]
+    fn build_and_write_sort_cursor_v2_for_marks_pending_protects_from_gc() -> crate::Result<()> {
+        use crate::schema::{Schema, FAST};
+        use crate::{IndexWriter, TantivyDocument};
+        use std::collections::HashSet;
+        use std::path::PathBuf;
+
+        let mut schema_builder = Schema::builder();
+        let ts_field = schema_builder.add_i64_field("ts", FAST);
+        let id_field = schema_builder.add_i64_field("id", FAST);
+        // No `IndexSettings::sort_by_fields` — segments commit without a
+        // cursor file, mirroring the post-creation backfill setting where
+        // an operator just turned `index.sort.field` into a multi-field
+        // array and asked tantivy to retrofit existing segments.
+        let mut index = crate::Index::create_in_ram(schema_builder.build());
+
+        let mut writer: IndexWriter = index.writer_for_tests()?;
+        for (ts, id) in [(100i64, 7i64), (200, 3), (50, 9)] {
+            let mut doc = TantivyDocument::default();
+            doc.add_i64(ts_field, ts);
+            doc.add_i64(id_field, id);
+            writer.add_document(doc)?;
+        }
+        writer.commit()?;
+        drop(writer);
+
+        let metas = index.searchable_segment_metas()?;
+        assert_eq!(metas.len(), 1, "single commit → single segment");
+        let pre_meta = metas[0].clone();
+        // Sanity: the committed meta carries no advertised cursor
+        // (we deliberately did not set IndexSettings::sort_by_fields).
+        assert!(pre_meta.sort_cursor_fields().is_empty());
+        let cursor_path = pre_meta.sort_cursor_path("ts");
+
+        let mut segment = index.segment(pre_meta.clone());
+        let pairs = vec![
+            ("ts".to_string(), Order::Desc),
+            ("id".to_string(), Order::Asc),
+        ];
+        let written = build_and_write_sort_cursor_v2_for(&mut segment, &pairs)?;
+        assert!(written, "non-empty segment must write a cursor file");
+        assert!(
+            index.directory().exists(&cursor_path).unwrap(),
+            "cursor file must exist on disk after primitive returns Ok(true)"
+        );
+
+        // Build `living_files` from the *original* committed meta, i.e.
+        // pre-advertisement — `sort_cursor_fields` is still empty, so
+        // the cursor path is NOT in the living set.  Without Phase H-6
+        // protection, this GC would delete the freshly written cursor
+        // file before the segment-updater task can advertise it.
+        let living: HashSet<PathBuf> = pre_meta.list_files();
+        assert!(
+            !living.contains(&cursor_path),
+            "test setup invariant: pre-publication living-files must \
+             exclude the cursor path so the GC race is reproducible"
+        );
+
+        index
+            .directory_mut()
+            .garbage_collect(|| living.clone())
+            .expect("GC should succeed");
+        assert!(
+            index.directory().exists(&cursor_path).unwrap(),
+            "Phase H-6: in-flight cursor file must survive GC while pending"
+        );
+
+        // Release the pending mark — this is what
+        // `IndexWriter::backfill_sort_cursor_v2` does after the segment
+        // manager has committed the updated meta.  In the unit-test
+        // scope we have NOT advertised the cursor via
+        // `with_sort_cursor_fields`, so the file is a true orphan and
+        // the next GC pass must reclaim it.
+        index.directory().release_pending(&cursor_path);
+        index
+            .directory_mut()
+            .garbage_collect(|| living)
+            .expect("GC should succeed");
+        assert!(
+            !index.directory().exists(&cursor_path).unwrap(),
+            "after release_pending, the orphan cursor file must be reclaimed by GC"
+        );
+        let _ = (ts_field, id_field);
+        Ok(())
+    }
 }

@@ -2,7 +2,7 @@ use super::Scorer;
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::index::SegmentReader;
 use crate::query::Explanation;
-use crate::{DocId, DocSet, Score, TERMINATED};
+use crate::{DocId, DocSet, Score, Term, TERMINATED};
 
 /// Iterates through all of the documents and scores matched by the DocSet
 /// `DocSet`.
@@ -70,6 +70,20 @@ pub trait Weight: Send + Sync + 'static {
     ///
     /// See [`Query`](crate::query::Query).
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> crate::Result<Box<dyn Scorer>>;
+
+    /// If this `Weight` is a single-term weight, return its [`Term`].
+    /// Otherwise return `None`. Default implementation returns `None`.
+    ///
+    /// This is the trait surface that lets the Phase 2 D-1 GPU bool-AND
+    /// fast path build content-stable [`crate::postings::roaring::cht::ChtKey`]
+    /// values without downcasting the trait object. Only `TermWeight`
+    /// overrides this (Wave 11). Adding an override on another `Weight`
+    /// impl that does NOT produce a `TermScorer` would not be
+    /// observable today, since the fast path gates on
+    /// `Scorer::is::<TermScorer>()` separately.
+    fn term(&self) -> Option<&Term> {
+        None
+    }
 
     /// Returns an [`Explanation`] for the given document.
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> crate::Result<Explanation>;

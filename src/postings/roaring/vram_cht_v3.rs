@@ -10,7 +10,8 @@
 //! ## v3 scope
 //!
 //! - **Device-memory cache** keyed on the same [`ChtKey`] as v1/v2
-//!   (`(segment_id, posting_data_addr, posting_data_len)`).
+//!   (`(segment_id, field_id, term_hash)` as of Wave 11 — content-stable
+//!   across process restarts; see `cht::ChtKey` for migration details).
 //! - **Per-term Bitcomp blob** stored in a single `cudaMalloc`
 //!   allocation; uncompressed buffer rebuilt at query time into a
 //!   workbench buffer via [`ferro_compress::BitcompDeviceCodec`].
@@ -783,11 +784,11 @@ mod tests {
         RoaringEncoder::from_doc_ids(&docs)
     }
 
-    fn dummy_key(addr: usize, len: usize) -> ChtKey {
+    fn dummy_key(field: u32, term_hash: u64) -> ChtKey {
         ChtKey {
             segment_id: SegmentId::generate_random(),
-            posting_data_addr: addr,
-            posting_data_len: len,
+            field,
+            term_hash,
         }
     }
 
@@ -975,7 +976,7 @@ mod tests {
         // should be ≥ 4 (= budget / per-entry).
         let cht_v3 = VramCompressedCht::with_budget(budget).unwrap();
         for (i, fix) in fixtures.iter().enumerate() {
-            let key = dummy_key(0x10000 + i, 100);
+            let key = dummy_key(0x10000_u32 + i as u32, 100);
             let _ = cht_v3.insert(key, fix);
         }
         let v3_entries = cht_v3.stats().entries;
@@ -987,7 +988,7 @@ mod tests {
         let cht_v2 =
             crate::postings::roaring::vram_cht::VramCht::with_budget(budget);
         for (i, fix) in fixtures.iter().enumerate() {
-            let key = dummy_key(0x10000 + i, 100);
+            let key = dummy_key(0x10000_u32 + i as u32, 100);
             let _ = cht_v2.insert(key, fix);
         }
         let v2_entries = cht_v2.stats().entries;

@@ -1547,16 +1547,18 @@ mod tests {
 
     /// Helper: insert a `RoaringPostings` into a fresh `VramCht` and
     /// return the `Arc<VramTermEntry>`. Returns None if CUDA insert
-    /// fails (driver-missing host).
+    /// fails (driver-missing host). `term_hash` is the
+    /// disambiguator analogous to the historical `addr` parameter —
+    /// tests pass any distinct u64 to get distinct keys.
     fn vram_term_entry(
         rp: &crate::postings::roaring::encoder::RoaringPostings,
         cache: &crate::postings::roaring::vram_cht::VramCht,
-        addr: usize,
+        term_hash: u64,
     ) -> Option<Arc<crate::postings::roaring::vram_cht::VramTermEntry>> {
         let key = crate::postings::roaring::cht::ChtKey {
             segment_id: crate::index::SegmentId::generate_random(),
-            posting_data_addr: addr,
-            posting_data_len: 100,
+            field: 0,
+            term_hash,
         };
         let inserted = cache.insert(key.clone(), rp).ok()?;
         if !inserted {
@@ -1715,16 +1717,17 @@ mod tests {
 
     /// Helper: insert a `RoaringPostings` into a fresh `VramCompressedCht`
     /// and return the `Arc<VramCompressedTermEntry>`. Returns None if
-    /// CUDA insert fails (driver-missing host).
+    /// CUDA insert fails (driver-missing host). `term_hash` is the
+    /// disambiguator analogous to the historical `addr` parameter.
     fn vram_v3_term_entry(
         rp: &crate::postings::roaring::encoder::RoaringPostings,
         cache: &crate::postings::roaring::vram_cht_v3::VramCompressedCht,
-        addr: usize,
+        term_hash: u64,
     ) -> Option<Arc<crate::postings::roaring::vram_cht_v3::VramCompressedTermEntry>> {
         let key = crate::postings::roaring::cht::ChtKey {
             segment_id: crate::index::SegmentId::generate_random(),
-            posting_data_addr: addr,
-            posting_data_len: 100,
+            field: 0,
+            term_hash,
         };
         let inserted = cache.insert(key.clone(), rp).ok()?;
         if !inserted {

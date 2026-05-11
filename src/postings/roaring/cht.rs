@@ -22,10 +22,24 @@
 //!   = different key, so stale entries never produce wrong results
 //!   (only waste budget).
 //!
+//! ## Wave 11 — content-stable keys
+//!
+//! As of Wave 11 the key is `(segment_id, field_id, term_hash)` where
+//! `term_hash` is a deterministic 64-bit `FxHash` of the term's serialized
+//! value bytes. This replaces the v1 pragmatic scheme that keyed on the
+//! `BlockSegmentPostings` data slice address (which was ASLR-randomised
+//! across process restarts and so unusable as a persistence key). Keys
+//! are now stable across process restarts, unlocking D-5 warm-restart
+//! persistence.
+//!
 //! ## Lookup pattern
 //!
 //! ```ignore
-//! let key = ChtKey { segment_id, field, term_bytes };
+//! let key = ChtKey {
+//!     segment_id,
+//!     field: term.field().field_id(),
+//!     term_hash: hash_term_bytes(term.serialized_value_bytes()),
+//! };
 //! let roaring = match cht().get(&key) {
 //!     Some(cached) => cached,                              // hit — skip drain
 //!     None => {
@@ -87,37 +101,56 @@ pub fn estimated_bytes(rp: &RoaringPostings) -> usize {
 
 /// Cache key for a single posting list in a segment.
 ///
-/// **Pragmatic v1 design**: instead of `(segment_id, field, term_bytes)`
-/// (which would require threading `Term` info through `try_gpu_intersect`
-/// from upstream `BooleanWeight::scorer`), we key on the underlying
-/// `BlockSegmentPostings` data slice's (address, length) pair.
-/// `BlockSegmentPostings::data_slice_id` exposes this; the slice is
-/// `Arc<FileSlice>`-backed so the pointer is stable for the lifetime
-/// of the owning `SegmentReader`.
+/// **Wave 11 — content-stable design**: keyed on
+/// `(segment_id, field_id, term_hash)`, where `term_hash` is the
+/// deterministic 64-bit `FxHash` of `Term::serialized_value_bytes()`.
+/// This replaces the v1 pragmatic scheme that keyed on the
+/// `BlockSegmentPostings` data slice's (address, length) pair (an
+/// ASLR-randomised pointer that could not be persisted).
 ///
 /// Properties:
-/// - **Unique** within a process: two different (field, term) tuples
-///   in the same segment have different posting list slices, therefore
-///   different addresses.
-/// - **Stable** across queries while the `SegmentReader` is alive.
-/// - **Resets across re-opens**: a fresh `SegmentReader` mmap gets a
-///   new slice address; the cache sees a new key and the old entry
-///   LRU-evicts naturally. Aligns with v1's "in-process only, no warm
-///   restart" scope (D-5 ships persistence).
-/// - **Survives merges that produce a new segment**: new segment_id +
-///   new slice address = new key; old entries evict.
+/// - **Unique** within a segment: two different `(field, term)` tuples
+///   in the same segment hash to different `(field_id, term_hash)`
+///   pairs (collision probability is `2⁻⁶⁴` per field, negligible at
+///   any practical cardinality).
+/// - **Stable** across queries and **across process restarts**:
+///   `FxHasher` is deterministic (no random seed), `field_id` is a
+///   schema-stable `u32`, and `segment_id` is the on-disk UUID. A
+///   re-opened index produces byte-equal keys for the same term, so
+///   D-5 dump/load preserves cache hits across restart.
+/// - **Survives merges that produce a new segment**: new `segment_id`
+///   = new key, old entries evict naturally. Same segment re-opened =
+///   same key, entry survives the re-open.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct ChtKey {
-    /// Tantivy segment UUID (stable per segment file set).
+    /// Tantivy segment UUID (stable per segment file set, persisted
+    /// in `meta.json`).
     pub segment_id: SegmentId,
-    /// Address of the underlying `OwnedBytes` slice (treated as an
-    /// opaque integer for hashing; never dereferenced via the
-    /// `ChtKey`).
-    pub posting_data_addr: usize,
-    /// Length of the underlying `OwnedBytes` slice. Combined with
-    /// `posting_data_addr` to disambiguate the rare case of two
-    /// terms sharing a prefix slice address.
-    pub posting_data_len: usize,
+    /// Field id (`Field::field_id()`) — stable per schema.
+    pub field: u32,
+    /// 64-bit `FxHash` of `Term::serialized_value_bytes()`. Stable
+    /// across process restarts (no random seed). See
+    /// [`hash_term_bytes`].
+    pub term_hash: u64,
+}
+
+/// Deterministic 64-bit hash of a term value's serialized bytes. Used
+/// to build the [`ChtKey::term_hash`] component. `FxHasher` is the
+/// content-stable choice: no random seed, no version drift inside a
+/// `rustc-hash` crate version. The hash is **not** cryptographic; we
+/// rely on the 64-bit space to keep collision probability negligible
+/// for the cohort sizes the planner admits (≤ 32 terms per AND).
+///
+/// The hash function is part of the persistence contract for D-5 — if
+/// it changes, the on-disk wire format version must bump in lockstep
+/// (`FCV1`/`FCV2`/`FCV3` magics in the dump headers).
+#[inline]
+#[must_use]
+pub fn hash_term_bytes(term_value_bytes: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(term_value_bytes);
+    hasher.finish()
 }
 
 /// Observable counters for the CHT. All `Relaxed` — cheap to read
@@ -354,13 +387,13 @@ mod tests {
         RoaringEncoder::from_doc_ids(&docs)
     }
 
-    fn dummy_key(addr: usize, len: usize) -> ChtKey {
+    fn dummy_key(field: u32, term_hash: u64) -> ChtKey {
         ChtKey {
             // SegmentId::generate_random() exists and is the
             // intended way to construct a fresh ID for tests.
             segment_id: SegmentId::generate_random(),
-            posting_data_addr: addr,
-            posting_data_len: len,
+            field,
+            term_hash,
         }
     }
 
@@ -466,6 +499,44 @@ mod tests {
         let est = estimated_bytes(&rp);
         // At least one Bitmap container worth of bytes.
         assert!(est >= 8192, "estimated bytes for Bitmap-class should be ≥ 8192, got {est}");
+    }
+
+    #[test]
+    fn chtkey_hash_stable_across_construction() {
+        // Wave 11 acceptance: same term bytes must hash to the same
+        // ChtKey across independent construction sites. This is the
+        // load-bearing invariant for D-5 warm-restart persistence —
+        // an on-disk dump key must equal the key constructed at first
+        // query post-restart.
+        let bytes_a: &[u8] = &[0x10, 0x00, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o'];
+        let bytes_b: &[u8] = &[0x10, 0x00, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o'];
+        let bytes_c: &[u8] = &[0x10, 0x00, 0x00, 0x00, b'w', b'o', b'r', b'l', b'd'];
+        let h_a = hash_term_bytes(bytes_a);
+        let h_b = hash_term_bytes(bytes_b);
+        let h_c = hash_term_bytes(bytes_c);
+        assert_eq!(
+            h_a, h_b,
+            "identical term bytes must hash to the same term_hash \
+             (FxHasher determinism — load-bearing for D-5 persistence)"
+        );
+        assert_ne!(
+            h_a, h_c,
+            "distinct term bytes must hash to distinct term_hash \
+             (probabilistic, but pinned for these fixtures)"
+        );
+        // Empty value bytes must produce a well-defined, finite hash
+        // (not a panic / UB), since some term kinds have zero-length
+        // value bytes (e.g. a sentinel empty-string token). We assert
+        // determinism — every call returns the same value — but do
+        // not pin the literal value (FxHasher's empty-input state is
+        // an implementation detail; D-5 wire format versions the hash
+        // function explicitly).
+        let h_empty_1 = hash_term_bytes(b"");
+        let h_empty_2 = hash_term_bytes(b"");
+        assert_eq!(
+            h_empty_1, h_empty_2,
+            "empty-input hash must be deterministic across calls"
+        );
     }
 
     #[test]

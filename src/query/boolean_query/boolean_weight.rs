@@ -226,6 +226,24 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
         score_combiner_fn: impl Fn() -> TComplexScoreCombiner,
     ) -> crate::Result<SpecializedScorer> {
         let num_docs = reader.num_docs();
+
+        // Wave 11 — snapshot the `Term` from each MUST sub-weight in
+        // `self.weights` iteration order BEFORE building scorers. Used
+        // only by the GPU bool-AND fast path below to build content-
+        // stable CHT keys. The order matches `must_scorers` 1:1 *iff*
+        // the special-scorer filter below removes nothing (it only
+        // touches `AllScorer` / `EmptyScorer`, neither of which can
+        // come from a `TermWeight`, so the alignment is preserved
+        // whenever the fast path gates clear — see the fast-path
+        // entry condition).
+        #[cfg(feature = "gpu")]
+        let must_terms: Vec<Option<crate::Term>> = self
+            .weights
+            .iter()
+            .filter(|(occur, _)| *occur == Occur::Must)
+            .map(|(_, w)| w.term().cloned())
+            .collect();
+
         let mut per_occur_scorers = self.per_occur_scorers(reader, boost)?;
 
         // Indicate how should clauses are combined with must clauses.
@@ -277,16 +295,38 @@ impl<TScoreCombiner: ScoreCombiner> BooleanWeight<TScoreCombiner> {
             && must_special_scorer_counts.num_all_scorers == 0
             && should_special_scorer_counts.num_all_scorers == 0
             && must_scorers.len() >= 2
+            // Wave 11 — every MUST sub-weight must surface a Term for
+            // the content-stable CHT key build. If any returns None
+            // (non-TermWeight in a MUST clause whose `scorer()`
+            // happens to be a TermScorer, e.g. a wrapper Weight), the
+            // GPU path can't produce a stable key and we fall through
+            // to the legacy CPU path. Length must also match — the
+            // special-scorer filter above only removes
+            // AllScorer/EmptyScorer (neither of which is a
+            // TermScorer), so under the fast-path entry conditions
+            // (num_all_scorers == 0, num_empty_scorers == 0 enforced
+            // by the early-return above) the lengths align.
+            && must_terms.len() == must_scorers.len()
+            && must_terms.iter().all(|t| t.is_some())
         {
+            // Pair Terms with scorers in iteration order — must_terms[i]
+            // corresponds to must_scorers[i] under the alignment
+            // invariant above.
+            let cohort: Vec<(crate::Term, Box<dyn Scorer>)> = must_terms
+                .iter()
+                .map(|t| t.clone().expect("all-Some checked above"))
+                .zip(must_scorers.into_iter())
+                .collect();
             match super::gpu_intersect::try_gpu_intersect(
-                must_scorers,
+                cohort,
                 reader,
                 self.scoring_enabled,
             ) {
                 Ok(gpu_scorer) => return Ok(SpecializedScorer::Other(gpu_scorer)),
                 Err(recovered) => {
-                    // Recover the original cohort and fall through to
-                    // the legacy CPU path below.
+                    // Recover the original cohort (scorers only — the
+                    // legacy CPU path doesn't need Terms) and fall
+                    // through to the legacy CPU path below.
                     must_scorers = recovered;
                 }
             }

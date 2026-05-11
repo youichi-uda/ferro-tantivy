@@ -52,6 +52,7 @@ use crate::postings::roaring::{
 use crate::query::roaring_materialised_scorer::RoaringMaterialisedScorer;
 use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
+use crate::Term;
 
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 use crate::postings::roaring::try_gpu_bool_v3;
@@ -79,8 +80,11 @@ use crate::postings::roaring::vram_cht_v3::VramCompressedTermEntry;
 ///
 /// # Arguments
 ///
-/// - `must_scorers`: the cohort's MUST-occur scorers, in arbitrary
-///   order. The helper only takes ownership on the `Some` path.
+/// - `must_scorers`: the cohort's MUST-occur scorers paired with their
+///   originating [`Term`]s, in arbitrary order. The `Term` is used to
+///   build a content-stable
+///   [`crate::postings::roaring::cht::ChtKey`] (Wave 11 migration).
+///   The helper only takes ownership on the `Some` path.
 /// - `reader`: segment reader for `num_docs()` (drives the field-doc
 ///   ratio gate).
 /// - `scoring_enabled`: when `true`, returns `None` immediately — see
@@ -93,12 +97,15 @@ use crate::postings::roaring::vram_cht_v3::VramCompressedTermEntry;
 /// - `Ok(None)` — gate failed; caller falls through to legacy CPU
 ///   intersection. `must_scorers` is returned via the `Err` arm of
 ///   the inner `try_gpu_intersect` so the caller can recover the
-///   `Vec<Box<dyn Scorer>>`.
+///   `Vec<Box<dyn Scorer>>`. The recovered shape is the scorer-only
+///   `Vec<Box<dyn Scorer>>` (Terms are dropped on the err path —
+///   BooleanWeight reconstructs the legacy CPU cohort from scorers
+///   alone).
 /// - `Err(must_scorers)` — same as `Ok(None)` semantically; we use the
 ///   `Result<Option<…>, Vec<…>>` shape to make the move-vs-keep
 ///   contract explicit at the call site.
 pub(crate) fn try_gpu_intersect(
-    must_scorers: Vec<Box<dyn Scorer>>,
+    must_scorers: Vec<(Term, Box<dyn Scorer>)>,
     reader: &SegmentReader,
     scoring_enabled: bool,
 ) -> Result<Box<dyn Scorer>, Vec<Box<dyn Scorer>>> {
@@ -107,7 +114,7 @@ pub(crate) fn try_gpu_intersect(
     // contributions we cannot satisfy them; punt to CPU.
     if scoring_enabled {
         record_cpu_fallback();
-        return Err(must_scorers);
+        return Err(must_scorers.into_iter().map(|(_, s)| s).collect());
     }
 
     // ----- Gate 2: cohort size -----
@@ -119,7 +126,7 @@ pub(crate) fn try_gpu_intersect(
     // gate below.
     if must_scorers.len() < 2 {
         record_cpu_fallback();
-        return Err(must_scorers);
+        return Err(must_scorers.into_iter().map(|(_, s)| s).collect());
     }
 
     // ----- Gate 3: every cohort member must be a TermScorer -----
@@ -131,9 +138,9 @@ pub(crate) fn try_gpu_intersect(
     // streaming non-term scorer dominates the GPU win at the cohort
     // sizes the planner approves; leave it for Wave 8 if the bench
     // demands it.
-    if !must_scorers.iter().all(|s| s.is::<TermScorer>()) {
+    if !must_scorers.iter().all(|(_, s)| s.is::<TermScorer>()) {
         record_cpu_fallback();
-        return Err(must_scorers);
+        return Err(must_scorers.into_iter().map(|(_, s)| s).collect());
     }
 
     // ----- Gate 4: planner threshold -----
@@ -147,7 +154,7 @@ pub(crate) fn try_gpu_intersect(
     let num_docs_in_segment = reader.num_docs();
     let stats: Vec<TermStat> = must_scorers
         .iter()
-        .map(|scorer| {
+        .map(|(_, scorer)| {
             // Downcast is infallible here — gate 3 verified.
             let term_scorer: &TermScorer = scorer
                 .downcast_ref::<TermScorer>()
@@ -160,7 +167,7 @@ pub(crate) fn try_gpu_intersect(
         .collect();
     if !should_dispatch_gpu(&stats) {
         record_cpu_fallback();
-        return Err(must_scorers);
+        return Err(must_scorers.into_iter().map(|(_, s)| s).collect());
     }
 
     // ----- Drain step -----
@@ -173,8 +180,9 @@ pub(crate) fn try_gpu_intersect(
     //
     // We collect into Vec<RoaringPostings>, then build a Vec of refs
     // for try_gpu_bool's `&[&RoaringPostings]` signature.
-    // Phase 2 D-1 — CHT lookup before drain. The cache key is
-    // `(segment_id, posting_data_addr, posting_data_len)` (see
+    // Phase 2 D-1 — CHT lookup before drain. Wave 11 migrated the
+    // cache key to a content-stable scheme
+    // `(segment_id, field_id, term_hash)` (see
     // `crate::postings::roaring::cht::ChtKey` doc); on hit we skip
     // `drain_block_segment_to_roaring` entirely (the ~700 ms / 10 M-doc
     // bottleneck per Wave 8 / C re-bench). On miss we drain as today,
@@ -218,7 +226,7 @@ pub(crate) fn try_gpu_intersect(
     #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
     let mut v3_hit_count: u32 = 0;
     let mut drain_us_total: u128 = 0;
-    for scorer in must_scorers {
+    for (term, scorer) in must_scorers {
         // Infallible per gate 3. Box<dyn Scorer>::downcast moves the
         // value (so we don't lose ownership on success) — see
         // downcast_rs.
@@ -226,12 +234,15 @@ pub(crate) fn try_gpu_intersect(
             .downcast::<TermScorer>()
             .map_err(|_| ())
             .expect("gate 3 should have rejected non-TermScorer");
-        let (data_addr, data_len) =
-            term_scorer.segment_postings().block_cursor.data_slice_id();
+        // Wave 11 content-stable key. `term.field().field_id()` is the
+        // u32 schema-stable field id; `cht::hash_term_bytes` is the
+        // deterministic FxHash of the serialized term value bytes.
+        // Both are stable across process restarts — D-5 dump/load
+        // depends on this property.
         let key = cht::ChtKey {
             segment_id,
-            posting_data_addr: data_addr,
-            posting_data_len: data_len,
+            field: term.field().field_id(),
+            term_hash: cht::hash_term_bytes(term.serialized_value_bytes()),
         };
         // Step A0: VRAM CHT v3 lookup (Bitcomp-compressed, fastest
         // capacity-multiplier tier). v3 only makes sense if the
@@ -445,22 +456,23 @@ mod tests {
         Ok((index, text_field))
     }
 
-    /// Build a `Vec<Box<dyn Scorer>>` of `TermScorer`s, one per term
-    /// string, for the first segment of `index`.
+    /// Build a `Vec<(Term, Box<dyn Scorer>)>` of `(Term, TermScorer)`
+    /// pairs, one per term string, for the first segment of `index`.
+    /// The shape matches the Wave 11 `try_gpu_intersect` cohort type.
     fn build_term_scorer_cohort(
         index: &Index,
         text_field: crate::schema::Field,
         terms: &[&str],
-    ) -> crate::Result<Vec<Box<dyn Scorer>>> {
+    ) -> crate::Result<Vec<(Term, Box<dyn Scorer>)>> {
         use crate::query::TermQuery;
         let reader = index.reader()?;
         let searcher = reader.searcher();
         let segment_reader = searcher.segment_reader(0);
         let enable_scoring = EnableScoring::enabled_from_searcher(&searcher);
-        let mut out: Vec<Box<dyn Scorer>> = Vec::with_capacity(terms.len());
+        let mut out: Vec<(Term, Box<dyn Scorer>)> = Vec::with_capacity(terms.len());
         for term_str in terms {
-            let term_query =
-                TermQuery::new(Term::from_field_text(text_field, term_str), IndexRecordOption::Basic);
+            let term = Term::from_field_text(text_field, term_str);
+            let term_query = TermQuery::new(term.clone(), IndexRecordOption::Basic);
             let weight = term_query.specialized_weight(enable_scoring)?;
             let scorer = weight
                 .term_scorer_for_test(segment_reader, 1.0)?
@@ -469,16 +481,23 @@ mod tests {
                         "no posting list for term '{term_str}'"
                     ))
                 })?;
-            out.push(Box::new(scorer));
+            out.push((term, Box::new(scorer)));
         }
         Ok(out)
     }
 
-    /// Helper: a synthetic non-TermScorer that satisfies the trait
-    /// bounds but whose presence in the cohort should fail gate 3.
-    /// We use the existing AllScorer as a proxy.
-    fn build_all_scorer_proxy(num_docs: u32) -> Box<dyn Scorer> {
-        Box::new(crate::query::AllScorer::new(num_docs))
+    /// Helper: a synthetic non-TermScorer paired with a placeholder
+    /// `Term` (the cohort element shape is `(Term, Box<dyn Scorer>)`,
+    /// but the `AllScorer` will fail gate 3 before the `Term` is ever
+    /// read).
+    fn build_all_scorer_proxy(
+        text_field: crate::schema::Field,
+        num_docs: u32,
+    ) -> (Term, Box<dyn Scorer>) {
+        (
+            Term::from_field_text(text_field, "__all_proxy__"),
+            Box::new(crate::query::AllScorer::new(num_docs)),
+        )
     }
 
     #[test]
@@ -513,7 +532,7 @@ mod tests {
         let (index, text_field) = build_index(&["alpha beta", "alpha gamma"])?;
         let mut cohort = build_term_scorer_cohort(&index, text_field, &["alpha"])?;
         // Inject a non-TermScorer (AllScorer) so gate 3 fails.
-        cohort.push(build_all_scorer_proxy(2));
+        cohort.push(build_all_scorer_proxy(text_field, 2));
         let reader = index.reader()?;
         let segment_reader = reader.searcher().segment_reader(0).clone();
         let res = try_gpu_intersect(cohort, &segment_reader, false);

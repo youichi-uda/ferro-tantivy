@@ -11,10 +11,11 @@
 //! ## v2 scope
 //!
 //! - **Device-memory cache** keyed on the same `ChtKey` as host CHT v1
-//!   (`(segment_id, posting_data_addr, posting_data_len)`). Stable per
-//!   `SegmentReader` mmap; survives merges that produce a new segment
-//!   ID; resets across re-opens (= warm-restart out of v2 scope, deferred
-//!   to D-5 per the v1 doc).
+//!   (`(segment_id, field_id, term_hash)` as of Wave 11 — content-stable
+//!   across process restarts; see `cht::ChtKey` for the migration
+//!   rationale). Stable per segment file set; survives merges that
+//!   produce a new segment ID; survives process restart at the key
+//!   level — restart-roundtrip persistence ships in D-5.
 //! - **Per-term VRAM layout**: each cached entry stores all
 //!   non-empty buckets of THIS term, expanded to the kernel's expected
 //!   `[u32; BITMAP_CONTAINER_WORDS]`-per-bucket form, stacked
@@ -62,8 +63,12 @@
 //! ## Lookup pattern
 //!
 //! ```ignore
-//! // Inside try_gpu_intersect, per cohort scorer:
-//! let key = ChtKey { segment_id, posting_data_addr, posting_data_len };
+//! // Inside try_gpu_intersect, per cohort (Term, scorer) pair:
+//! let key = ChtKey {
+//!     segment_id,
+//!     field: term.field().field_id(),
+//!     term_hash: cht::hash_term_bytes(term.serialized_value_bytes()),
+//! };
 //! let vram_entry = vram_cht().get(&key);
 //! match vram_entry {
 //!     Some(entry) => vram_entries.push(entry),  // v2 fast path
@@ -682,11 +687,11 @@ mod tests {
         RoaringEncoder::from_doc_ids(&docs)
     }
 
-    fn dummy_key(addr: usize, len: usize) -> ChtKey {
+    fn dummy_key(field: u32, term_hash: u64) -> ChtKey {
         ChtKey {
             segment_id: SegmentId::generate_random(),
-            posting_data_addr: addr,
-            posting_data_len: len,
+            field,
+            term_hash,
         }
     }
 
@@ -951,7 +956,7 @@ mod tests {
             let cht = std::sync::Arc::clone(&cht);
             handles.push(std::thread::spawn(move || {
                 for i in 0..16u32 {
-                    let key = dummy_key(0x10000 + (w * 100 + i) as usize, 100);
+                    let key = dummy_key(0x10000 + (w * 100 + i), 100);
                     let rp = dense_roaring(w * 100 + i);
                     let _ = cht.insert(key, &rp);
                 }
@@ -962,7 +967,7 @@ mod tests {
             let cht = std::sync::Arc::clone(&cht);
             handles.push(std::thread::spawn(move || {
                 for i in 0..32u32 {
-                    let key = dummy_key(0x10000 + (r * 100 + i) as usize, 100);
+                    let key = dummy_key(0x10000 + (r * 100 + i), 100);
                     let _ = cht.get(&key);
                 }
             }));

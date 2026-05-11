@@ -479,6 +479,91 @@ pub fn try_gpu_bool_vram(
 }
 
 // ============================================================
+// Phase 2 D-4 v3 — Bitcomp-compressed VRAM fold dispatch.
+// ============================================================
+//
+// `try_gpu_bool_v3` is the v3 device-resident equivalent: takes
+// `&[Arc<VramCompressedTermEntry>]` (Bitcomp-compressed entries
+// from `vram_cht_v3`) and dispatches via
+// `CudaBitmapOpKernel::compute_fold_v3` (decompress-on-read).
+//
+// Caller invariants are identical to `try_gpu_bool_vram`'s.
+
+/// Like [`try_gpu_bool_vram`], but with Bitcomp-compressed inputs from
+/// the v3 cache. Decompress-on-read into the kernel's persistent
+/// workbench, then fold via the same kernel as v2.
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub fn try_gpu_bool_v3(
+    op: BoolOp,
+    terms: &[std::sync::Arc<crate::postings::roaring::vram_cht_v3::VramCompressedTermEntry>],
+) -> Option<RoaringPostings> {
+    if terms.len() < 2 {
+        CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let kernel = match gpu_resources() {
+        Some(k) => k,
+        None => {
+            CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    let mut set: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for term in terms {
+        for (high16, _) in term.bucket_index() {
+            set.insert(*high16);
+        }
+    }
+    if set.is_empty() {
+        GPU_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        return Some(RoaringPostings::default());
+    }
+    let union_keys: Vec<u16> = set.into_iter().collect();
+    let num_words = union_keys.len() * BITMAP_CONTAINER_WORDS;
+
+    let acc = match kernel.compute_fold_v3(op, terms, &union_keys) {
+        Ok(v) => {
+            debug_assert_eq!(v.len(), num_words);
+            v
+        }
+        Err(_) => {
+            CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    GPU_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // Decode the flat result back to a RoaringPostings (same tail as
+    // try_gpu_bool / try_gpu_bool_vram).
+    let mut out = Vec::with_capacity(union_keys.len());
+    for (i, &high16) in union_keys.iter().enumerate() {
+        let start = i * BITMAP_CONTAINER_WORDS;
+        let end = start + BITMAP_CONTAINER_WORDS;
+        let chunk = &acc[start..end];
+        let mut words: Box<[u32; BITMAP_CONTAINER_WORDS]> =
+            Box::new([0u32; BITMAP_CONTAINER_WORDS]);
+        words.copy_from_slice(chunk);
+        let bm = BitmapContainer::from_words(words);
+        if bm.cardinality() == 0 {
+            continue;
+        }
+        let optimized = Container::Bitmap(bm).optimize();
+        out.push((high16, optimized));
+    }
+    Some(RoaringPostings { containers: out })
+}
+
+/// Stub for the no-feature / no-cuda path.
+#[cfg(not(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel")))]
+pub fn try_gpu_bool_v3(
+    _op: BoolOp,
+    _terms: &[std::sync::Arc<()>],
+) -> Option<RoaringPostings> {
+    CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+// ============================================================
 // Internal helpers.
 // ============================================================
 

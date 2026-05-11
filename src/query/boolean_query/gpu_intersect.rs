@@ -54,11 +54,17 @@ use crate::query::term_query::TermScorer;
 use crate::query::Scorer;
 
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+use crate::postings::roaring::try_gpu_bool_v3;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 use crate::postings::roaring::try_gpu_bool_vram;
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 use crate::postings::roaring::vram_cht;
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 use crate::postings::roaring::vram_cht::VramTermEntry;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+use crate::postings::roaring::vram_cht_v3;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+use crate::postings::roaring::vram_cht_v3::VramCompressedTermEntry;
 
 /// Try to route a Bool-AND cohort through the Wave 6 GPU Roaring
 /// dispatch path.
@@ -191,8 +197,17 @@ pub(crate) fn try_gpu_intersect(
     // path bytewise-identically.
     #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
     let vram_handle = vram_cht::global();
+    // Phase 2 D-4 v3 — Bitcomp-compressed VRAM CHT lookup. May return
+    // None for the global if codec construction failed (no CUDA driver
+    // / no Bitcomp support), in which case v3 entries stay None across
+    // the cohort and we fall through to v2.
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    let v3_handle = vram_cht_v3::global();
     #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
     let mut vram_entries: Vec<Option<Arc<VramTermEntry>>> =
+        Vec::with_capacity(must_scorers.len());
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    let mut v3_entries: Vec<Option<Arc<VramCompressedTermEntry>>> =
         Vec::with_capacity(must_scorers.len());
     let mut owned_postings: Vec<Arc<RoaringPostings>> =
         Vec::with_capacity(must_scorers.len());
@@ -200,6 +215,8 @@ pub(crate) fn try_gpu_intersect(
     let mut host_hit_count: u32 = 0;
     #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
     let mut vram_hit_count: u32 = 0;
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    let mut v3_hit_count: u32 = 0;
     let mut drain_us_total: u128 = 0;
     for scorer in must_scorers {
         // Infallible per gate 3. Box<dyn Scorer>::downcast moves the
@@ -216,6 +233,15 @@ pub(crate) fn try_gpu_intersect(
             posting_data_addr: data_addr,
             posting_data_len: data_len,
         };
+        // Step A0: VRAM CHT v3 lookup (Bitcomp-compressed, fastest
+        // capacity-multiplier tier). v3 only makes sense if the
+        // process-global codec construction succeeded.
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        let v3_entry = v3_handle.and_then(|h| h.get(&key));
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        if v3_entry.is_some() {
+            v3_hit_count += 1;
+        }
         // Step A: VRAM CHT v2 lookup (under cuda-bitmap-kernel only).
         #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
         let vram_entry = vram_handle.get(&key);
@@ -266,8 +292,24 @@ pub(crate) fn try_gpu_intersect(
             vram_handle.get(&key)
         };
 
+        // Step D (Phase 2 D-4 v3): opportunistic v3 (Bitcomp-
+        // compressed) promotion. Same best-effort semantics — promote
+        // failure (no codec, oversize > 16 MiB single-chunk, budget
+        // pressure) silently fall through to v2 / v1 below.
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        let final_v3_entry = if let Some(entry) = v3_entry {
+            Some(entry)
+        } else if let Some(handle) = v3_handle {
+            let _ = handle.promote(key.clone(), roaring.as_ref());
+            handle.get(&key)
+        } else {
+            None
+        };
+
         #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
         vram_entries.push(final_vram_entry);
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        v3_entries.push(final_v3_entry);
         owned_postings.push(roaring);
         term_scorers.push(term_scorer);
     }
@@ -275,17 +317,32 @@ pub(crate) fn try_gpu_intersect(
 
     // ----- GPU dispatch -----
     let dispatch_t = std::time::Instant::now();
-    // Phase 2 D-3 v2 — choose the VRAM fold path iff every cohort
-    // member has a VRAM entry (cache hit OR successful first-touch
-    // promote-then-get). Mixed cohorts (some hits, some misses)
-    // fall back to the host fold path; the missing terms can promote
-    // on subsequent queries.
+    // Phase 2 D-4 v3 — 4-tier dispatch (highest preference first):
+    // 1. v3 (Bitcomp-compressed VRAM) iff every cohort member has a
+    //    v3 entry (decompress-on-read into workbench, then fold).
+    // 2. v2 (uncompressed VRAM) iff every cohort member has a v2
+    //    entry (no decompress overhead).
+    // 3. v1 host CHT (host fold path with flat_buffer + H→D).
+    //
+    // Mixed cohorts (some tiers hit, some miss) prefer the highest
+    // tier where ALL members hit. Missed-tier terms have already
+    // been opportunistically promoted in steps C/D; subsequent
+    // queries against the same cohort take the higher tier.
     #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
     let gpu_result = {
+        let all_have_v3 =
+            v3_entries.iter().all(|opt| opt.is_some()) && !v3_entries.is_empty();
         let all_have_vram = vram_entries.iter().all(|opt| opt.is_some())
             && !vram_entries.is_empty();
-        if all_have_vram {
-            // Move the Arcs out of the Option layer.
+        if all_have_v3 {
+            let v3_terms: Vec<Arc<VramCompressedTermEntry>> = v3_entries
+                .iter()
+                .map(|opt| {
+                    Arc::clone(opt.as_ref().expect("all_have_v3 pre-checked"))
+                })
+                .collect();
+            try_gpu_bool_v3(BoolOp::And, &v3_terms)
+        } else if all_have_vram {
             let vram_terms: Vec<Arc<VramTermEntry>> = vram_entries
                 .iter()
                 .map(|opt| {
@@ -312,12 +369,14 @@ pub(crate) fn try_gpu_intersect(
     #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
     log::debug!(
         target: "tantivy::query::boolean_query::gpu_intersect",
-        "Phase 2 D-3 timing: cohort_size={} host_cht_hits={} host_cht_misses={} vram_cht_hits={} vram_cht_misses={} drain_phase_us={} drain_only_us={} dispatch_phase_us={}",
+        "Phase 2 D-3/D-4 timing: cohort_size={} host_cht_hits={} host_cht_misses={} vram_cht_hits={} vram_cht_misses={} v3_cht_hits={} v3_cht_misses={} drain_phase_us={} drain_only_us={} dispatch_phase_us={}",
         cohort_size,
         host_hit_count,
         cohort_size as u32 - host_hit_count,
         vram_hit_count,
         cohort_size as u32 - vram_hit_count,
+        v3_hit_count,
+        cohort_size as u32 - v3_hit_count,
         drain_phase_us as u64,
         drain_us_total as u64,
         dispatch_phase_us as u64,
@@ -581,6 +640,78 @@ mod tests {
         assert!(
             stats_after_b.hits > stats_after_a.hits,
             "second try_gpu_intersect call must record at least one VRAM hit"
+        );
+        Ok(())
+    }
+
+    /// Phase 2 D-4 v3 — 4-tier dispatch integration test.
+    ///
+    /// Build a heavy cohort, call `try_gpu_intersect` twice on the
+    /// same scorers, and assert:
+    /// 1. After call #1, the v3 (Bitcomp-compressed) cache has at
+    ///    least one promoted entry (= the v3 promotion succeeded for
+    ///    at least one cohort member).
+    /// 2. After call #2, the v3 hit counter went up (= the second-
+    ///    call lookup found promoted v3 entries).
+    /// 3. Both calls succeed.
+    ///
+    /// Skips on hosts without a working CUDA driver / Bitcomp-capable
+    /// nvcomp (the v3 global returns None and the test exits cleanly).
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    #[test]
+    fn v3_cht_warm_path_witnessed_via_stats() -> crate::Result<()> {
+        use crate::postings::roaring::vram_cht_v3;
+
+        let _g = COUNTER_LOCK.lock().unwrap();
+        reset_dispatch_counters();
+        // Reset v2 + v3 globals so this test's stats start fresh.
+        crate::postings::roaring::vram_cht::reset_global();
+        vram_cht_v3::reset_global();
+
+        // Skip if v3 is unavailable on this host (no Bitcomp codec).
+        let v3_handle = match vram_cht_v3::global() {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+
+        // Same heavy cohort as v2's witness test.
+        let term_list: Vec<String> = (0..12).map(|i| format!("v3term{i}")).collect();
+        let doc_text = term_list.join(" ");
+        let mut docs: Vec<String> = Vec::with_capacity(100_000);
+        for _ in 0..100_000 {
+            docs.push(doc_text.clone());
+        }
+        let docs_refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (index, text_field) = build_index(&docs_refs)?;
+        let cohort_terms: Vec<&str> = term_list.iter().map(String::as_str).collect();
+        let reader = index.reader()?;
+        let segment_reader = reader.searcher().segment_reader(0).clone();
+
+        // Call #1: all v3 misses → drain + v3 promote.
+        let cohort_a = build_term_scorer_cohort(&index, text_field, &cohort_terms)?;
+        let res_a = try_gpu_intersect(cohort_a, &segment_reader, false);
+        let stats_after_a = v3_handle.stats();
+        let Ok(_scorer_a) = res_a else {
+            // Sandbox without working dispatch; nothing more to assert.
+            return Ok(());
+        };
+        assert!(
+            stats_after_a.promotions >= 1,
+            "first try_gpu_intersect call must promote ≥1 v3 entry, got promotions={}",
+            stats_after_a.promotions
+        );
+
+        // Call #2: warm cache, v3 hits expected.
+        let cohort_b = build_term_scorer_cohort(&index, text_field, &cohort_terms)?;
+        let res_b = try_gpu_intersect(cohort_b, &segment_reader, false);
+        let stats_after_b = v3_handle.stats();
+        assert!(
+            res_b.is_ok(),
+            "second call must succeed (warm cache, identical fixture)"
+        );
+        assert!(
+            stats_after_b.hits > stats_after_a.hits,
+            "second try_gpu_intersect call must record at least one v3 hit"
         );
         Ok(())
     }

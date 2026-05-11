@@ -68,6 +68,8 @@ pub mod gpu_dispatch;
 pub mod planner;
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 pub mod vram_cht;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub mod vram_cht_v3;
 
 pub use container::{
     ArrayContainer, BitmapContainer, Container, ContainerError, Run, RunContainer,
@@ -85,6 +87,8 @@ pub use gpu_dispatch::{
 };
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 pub use gpu_dispatch::try_gpu_bool_vram;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub use gpu_dispatch::try_gpu_bool_v3;
 pub use planner::{
     should_dispatch_gpu, TermStat, MIN_COHORT_DOCS, MIN_PER_TERM_CARDINALITY, MIN_RATIO,
 };

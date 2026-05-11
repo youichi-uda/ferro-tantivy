@@ -50,10 +50,14 @@ use ferro_compress::nvcomp_sys::cuda::{
     cudaFree, cudaMalloc, cudaMemcpyAsync, cudaMemcpyKind, cudaMemsetAsync, cudaStreamCreate,
     cudaStreamDestroy, cudaStreamSynchronize, cudaStream_t, CUDA_SUCCESS,
 };
-use ferro_compress::{BitmapOp as FcBitmapOp, BitmapOpKernel as InnerKernel, Error as FcError};
+use ferro_compress::{
+    BitcompDataType, BitcompDeviceCodec, BitmapOp as FcBitmapOp, BitmapOpKernel as InnerKernel,
+    Error as FcError,
+};
 
 use super::gpu_dispatch::BoolOp;
 use super::vram_cht::VramTermEntry;
+use super::vram_cht_v3::VramCompressedTermEntry;
 use super::BITMAP_CONTAINER_WORDS;
 use std::sync::Arc;
 
@@ -115,6 +119,23 @@ pub struct CudaBitmapOpKernel {
     /// kernel launch is serialised inside `InnerKernel` via its own
     /// mutex.
     state: Mutex<DeviceBuffers>,
+    /// Phase 2 D-4 v3 — Bitcomp decompress codec sharing this kernel's
+    /// stream so decompress→scatter→compute→sync chains on a single
+    /// stream. Wrapped in `Mutex` so concurrent
+    /// [`Self::compute_fold_v3`] callers serialise on the codec's
+    /// internal device singletons. `None` if the codec failed to
+    /// construct (e.g. driver-missing host); in that case
+    /// `compute_fold_v3` returns `Err(...)` for the whole call.
+    decompress_codec: Mutex<Option<BitcompDeviceCodec>>,
+    /// Phase 2 D-4 v3 — persistent device decompress workbench buffer.
+    /// Sized for the largest term's `uncompressed_bytes`; grows on
+    /// demand via [`reallocate_workbench`].
+    workbench: Mutex<DecompressWorkbench>,
+}
+
+struct DecompressWorkbench {
+    d_buf: *mut c_void,
+    capacity_bytes: usize,
 }
 
 struct DeviceBuffers {
@@ -192,10 +213,24 @@ impl CudaBitmapOpKernel {
                 return Err(e);
             }
         };
+        // Phase 2 D-4 v3 — try to construct a Bitcomp decompress codec
+        // sharing this kernel's stream. Failure is non-fatal; v3 just
+        // becomes unavailable on this kernel instance and `compute_fold_v3`
+        // surfaces an error per call.
+        let decompress_codec = BitcompDeviceCodec::with_stream(
+            BitcompDataType::Uint32,
+            stream,
+        )
+        .ok();
         Ok(Self {
             inner,
             stream,
             state: Mutex::new(buffers),
+            decompress_codec: Mutex::new(decompress_codec),
+            workbench: Mutex::new(DecompressWorkbench {
+                d_buf: null_mut(),
+                capacity_bytes: 0,
+            }),
         })
     }
 
@@ -517,6 +552,350 @@ impl CudaBitmapOpKernel {
         }
     }
 
+    /// Phase 2 D-4 v3 — fold device-resident **Bitcomp-compressed**
+    /// terms into a Bool-AND/OR/XOR result.
+    ///
+    /// Same dispatch shape as [`Self::compute_fold_vram`] but each
+    /// term is a [`VramCompressedTermEntry`] (stored compressed on
+    /// device via [`super::vram_cht_v3`]); this method:
+    ///
+    /// 1. Resizes the persistent kernel buffers (`d_a` / `d_b` /
+    ///    `d_out`) to fit `union_keys.len() * BITMAP_CONTAINER_WORDS`
+    ///    u32 words.
+    /// 2. Resizes the decompress workbench to fit the largest term's
+    ///    `uncompressed_bytes`.
+    /// 3. For `terms[0]`: decompresses into the workbench, scatters
+    ///    from workbench (using the entry's `bucket_index`) to `d_a`
+    ///    in the cohort's `union_keys` layout.
+    /// 4. For `terms[i]` (i ≥ 1): same decompress + scatter to `d_b`,
+    ///    then `inner.compute(op, d_a, d_b, d_out, words)` and
+    ///    pointer-swap `d_a ↔ d_out`.
+    /// 5. After the fold, `cudaMemcpyAsync` D→H from `d_a` and a
+    ///    single end-of-fold `cudaStreamSynchronize`.
+    ///
+    /// All decompress + memset + memcpy + kernel launches queue on
+    /// the kernel's persistent stream — single sync at end. The
+    /// codec's `decompress_one` does its own per-call sync (it reads
+    /// `d_uncomp_sizes` back to host to verify the output matches
+    /// `expected_uncomp_size`); for v3's hot path this is a stream-
+    /// boundary cost worth amortising in a future wave (multi-term
+    /// batch decompress).
+    ///
+    /// Wallclock per-cohort cost (12-term cohort):
+    /// - Decompress: 12 × ~20 µs (per term, with sync) ≈ 240 µs
+    /// - Scatter (D→D): 12 × ~10 µs ≈ 120 µs
+    /// - Kernel + sync: same as v2 (~50 µs)
+    /// - Total: ~400-500 µs per cohort warm
+    ///
+    /// vs v2 same cohort: ~350 µs warm. v3 costs ~50-150 µs more per
+    /// cohort but caches ~3-4× more terms in the same VRAM budget
+    /// (Bitcomp ratio on uint32 postings).
+    pub fn compute_fold_v3(
+        &self,
+        op: BoolOp,
+        terms: &[Arc<VramCompressedTermEntry>],
+        union_keys: &[u16],
+    ) -> Result<Vec<u32>, CudaBitmapError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        if union_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Single-term: decompress to a host vec via the workbench +
+        // gather scatter pattern. Caller usually short-circuits before
+        // us, but be defensive.
+        if terms.len() == 1 {
+            return self.gather_v3_term_to_host(&terms[0], union_keys);
+        }
+        let words_per_term = union_keys
+            .len()
+            .checked_mul(BITMAP_CONTAINER_WORDS)
+            .ok_or(CudaBitmapError::Cuda {
+                what: "words_per_term overflow",
+                code: 0,
+            })?;
+        let bytes_per_term = words_per_term
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or(CudaBitmapError::Cuda {
+                what: "bytes_per_term overflow",
+                code: 0,
+            })?;
+        // Workbench must fit the largest term's uncompressed payload.
+        let max_uncompressed = terms
+            .iter()
+            .map(|t| t.uncompressed_bytes())
+            .max()
+            .unwrap_or(0);
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("CudaBitmapOpKernel state mutex poisoned");
+        if words_per_term > state.capacity_words {
+            // SAFETY: we hold the state mutex; no other caller can
+            // observe the intermediate (freed) pointers.
+            unsafe { reallocate_buffers(&mut state, words_per_term.next_power_of_two())? };
+        }
+
+        // Resize the workbench under its own mutex (separate from
+        // state's so concurrent kernels could parallelise grows; in
+        // practice they serialise).
+        {
+            let mut workbench = self
+                .workbench
+                .lock()
+                .expect("CudaBitmapOpKernel workbench mutex poisoned");
+            if workbench.capacity_bytes < max_uncompressed {
+                // SAFETY: we hold the workbench mutex; no other caller
+                // can observe the intermediate freed state.
+                unsafe { reallocate_workbench(&mut workbench, max_uncompressed)? };
+            }
+        }
+
+        let cuda_op = to_inner_op(op);
+        let n_u32 =
+            u32::try_from(words_per_term).map_err(|_| CudaBitmapError::Cuda {
+                what: "words_per_term exceeds u32::MAX",
+                code: 0,
+            })?;
+
+        // SAFETY: device pointers + workbench valid for the whole
+        // call; we hold both mutexes.
+        unsafe {
+            // Step 1: build d_a from terms[0].
+            self.decompress_then_scatter(
+                state.d_a,
+                bytes_per_term,
+                &terms[0],
+                union_keys,
+            )?;
+            // Step 2: per-term decompress → scatter to d_b → kernel
+            // → pointer-swap.
+            for term in terms.iter().skip(1) {
+                self.decompress_then_scatter(
+                    state.d_b,
+                    bytes_per_term,
+                    term,
+                    union_keys,
+                )?;
+                self.inner.compute(
+                    cuda_op,
+                    state.d_a as *const u32,
+                    state.d_b as *const u32,
+                    state.d_out as *mut u32,
+                    n_u32,
+                )?;
+                let tmp = state.d_a;
+                state.d_a = state.d_out;
+                state.d_out = tmp;
+            }
+            // Step 3: D→H from d_a.
+            let mut out = vec![0u32; words_per_term];
+            let rc = cudaMemcpyAsync(
+                out.as_mut_ptr() as *mut c_void,
+                state.d_a as *const c_void,
+                bytes_per_term,
+                cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                self.stream,
+            );
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaMemcpyAsync(v3 fold result D2H)",
+                    code: rc,
+                });
+            }
+            let rc = cudaStreamSynchronize(self.stream);
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaStreamSynchronize(v3 fold)",
+                    code: rc,
+                });
+            }
+            Ok(out)
+        }
+    }
+
+    /// Internal: decompress `term` into the workbench, then scatter
+    /// from workbench to `dst` in the cohort `union_keys` layout.
+    /// Uses the same per-bucket DtD memcpy as v2's
+    /// [`scatter_term_to_device`].
+    ///
+    /// # Safety
+    /// - `dst` must point to ≥ `dst_bytes` writable device memory on
+    ///   the kernel's stream.
+    /// - Caller holds `self.state` and `self.workbench` mutexes (or
+    ///   appropriate barriers) so the workbench buffer isn't grown
+    ///   under us.
+    /// - Caller must hold the `Arc<VramCompressedTermEntry>` alive
+    ///   for the duration of the call.
+    unsafe fn decompress_then_scatter(
+        &self,
+        dst: *mut c_void,
+        dst_bytes: usize,
+        term: &Arc<VramCompressedTermEntry>,
+        union_keys: &[u16],
+    ) -> Result<(), CudaBitmapError> {
+        // 1. Decompress into the workbench (synchronous via codec's
+        //    internal stream sync).
+        let workbench_ptr = {
+            let workbench = self
+                .workbench
+                .lock()
+                .expect("CudaBitmapOpKernel workbench mutex poisoned");
+            workbench.d_buf
+        };
+        if workbench_ptr.is_null() {
+            return Err(CudaBitmapError::Cuda {
+                what: "v3 workbench not allocated",
+                code: 0,
+            });
+        }
+        let mut codec_guard = self
+            .decompress_codec
+            .lock()
+            .expect("CudaBitmapOpKernel decompress_codec mutex poisoned");
+        let codec = codec_guard.as_mut().ok_or(CudaBitmapError::Cuda {
+            what: "v3 decompress codec unavailable",
+            code: 0,
+        })?;
+        // SAFETY: device buffers are valid; codec uses our stream.
+        codec
+            .decompress_one(
+                term.device_ptr(),
+                term.compressed_bytes(),
+                workbench_ptr,
+                term.uncompressed_bytes(),
+            )
+            .map_err(CudaBitmapError::Inner)?;
+        drop(codec_guard);
+
+        // 2. Scatter from workbench to dst (per-bucket DtD memcpy +
+        //    zero-fill missing). Same shape as v2 scatter but source
+        //    is the workbench, not a cached d_buckets pointer.
+        // SAFETY: dst sized for dst_bytes; workbench sized for term
+        // uncompressed bytes; both on this kernel's stream.
+        unsafe {
+            let rc = cudaMemsetAsync(dst, 0i32 as std::ffi::c_int, dst_bytes, self.stream);
+            if rc != CUDA_SUCCESS {
+                return Err(CudaBitmapError::Cuda {
+                    what: "cudaMemsetAsync(v3 dst zero-fill)",
+                    code: rc,
+                });
+            }
+            let bucket_bytes = BITMAP_CONTAINER_WORDS * std::mem::size_of::<u32>();
+            for (high16, src_word_off) in term.bucket_index() {
+                let Ok(dst_idx) = union_keys.binary_search(high16) else {
+                    continue;
+                };
+                let dst_word_off = dst_idx * BITMAP_CONTAINER_WORDS;
+                let dst_ptr =
+                    (dst as *mut u8).add(dst_word_off * std::mem::size_of::<u32>());
+                let src_ptr = (workbench_ptr as *const u8)
+                    .add((*src_word_off as usize) * std::mem::size_of::<u32>());
+                let rc = cudaMemcpyAsync(
+                    dst_ptr as *mut c_void,
+                    src_ptr as *const c_void,
+                    bucket_bytes,
+                    cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                    self.stream,
+                );
+                if rc != CUDA_SUCCESS {
+                    return Err(CudaBitmapError::Cuda {
+                        what: "cudaMemcpyAsync(v3 scatter D2D bucket)",
+                        code: rc,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Single-term degenerate path: decompress, then return the
+    /// cohort-layout host buffer. Mirrors [`Self::gather_term_to_host`]
+    /// but with the v3 decompress step in front.
+    fn gather_v3_term_to_host(
+        &self,
+        term: &Arc<VramCompressedTermEntry>,
+        union_keys: &[u16],
+    ) -> Result<Vec<u32>, CudaBitmapError> {
+        let max_uncompressed = term.uncompressed_bytes();
+        {
+            let mut workbench = self
+                .workbench
+                .lock()
+                .expect("CudaBitmapOpKernel workbench mutex poisoned");
+            if workbench.capacity_bytes < max_uncompressed {
+                // SAFETY: workbench mutex held.
+                unsafe { reallocate_workbench(&mut workbench, max_uncompressed)? };
+            }
+        }
+        let workbench_ptr = {
+            let workbench = self
+                .workbench
+                .lock()
+                .expect("CudaBitmapOpKernel workbench mutex poisoned");
+            workbench.d_buf
+        };
+        if workbench_ptr.is_null() {
+            return Err(CudaBitmapError::Cuda {
+                what: "v3 workbench not allocated",
+                code: 0,
+            });
+        }
+        {
+            let mut codec_guard = self
+                .decompress_codec
+                .lock()
+                .expect("CudaBitmapOpKernel decompress_codec mutex poisoned");
+            let codec = codec_guard.as_mut().ok_or(CudaBitmapError::Cuda {
+                what: "v3 decompress codec unavailable",
+                code: 0,
+            })?;
+            // SAFETY: see decompress_then_scatter.
+            unsafe {
+                codec
+                    .decompress_one(
+                        term.device_ptr(),
+                        term.compressed_bytes(),
+                        workbench_ptr,
+                        term.uncompressed_bytes(),
+                    )
+                    .map_err(CudaBitmapError::Inner)?;
+            }
+        }
+        // Now gather into host buffer (same shape as
+        // gather_term_to_host but workbench is the source).
+        let words = union_keys.len() * BITMAP_CONTAINER_WORDS;
+        let mut out = vec![0u32; words];
+        for (high16, src_off) in term.bucket_index() {
+            let Ok(dst_idx) = union_keys.binary_search(high16) else {
+                continue;
+            };
+            let dst_start = dst_idx * BITMAP_CONTAINER_WORDS;
+            let dst_end = dst_start + BITMAP_CONTAINER_WORDS;
+            // SAFETY: per-bucket sync D→H from workbench.
+            unsafe {
+                let src_ptr = (workbench_ptr as *const u8)
+                    .add((*src_off as usize) * std::mem::size_of::<u32>());
+                let dst_ptr = out[dst_start..dst_end].as_mut_ptr() as *mut c_void;
+                let rc = ferro_compress::nvcomp_sys::cuda::cudaMemcpy(
+                    dst_ptr,
+                    src_ptr as *const c_void,
+                    BITMAP_CONTAINER_WORDS * std::mem::size_of::<u32>(),
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                );
+                if rc != CUDA_SUCCESS {
+                    return Err(CudaBitmapError::Cuda {
+                        what: "cudaMemcpy(gather v3 single-term D2H)",
+                        code: rc,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Single-term degenerate path: gather the term's cached buckets
     /// into a host `Vec<u32>` matching the cohort `union_keys` layout.
     /// Used by [`Self::compute_fold_vram`] when `terms.len() == 1` so
@@ -694,6 +1073,27 @@ impl CudaBitmapOpKernel {
 
 impl Drop for CudaBitmapOpKernel {
     fn drop(&mut self) {
+        // Phase 2 D-4 v3 — free the decompress codec FIRST so its
+        // own `cudaFree` calls happen while the stream is still
+        // alive. The codec was constructed with `with_stream` =
+        // borrowed-stream semantics, so dropping it does NOT destroy
+        // the stream (we do that below).
+        if let Ok(mut codec_slot) = self.decompress_codec.lock() {
+            let _ = codec_slot.take();
+        }
+        // Free the v3 workbench buffer.
+        if let Ok(mut workbench) = self.workbench.lock() {
+            // SAFETY: workbench buffer was allocated by `cudaMalloc`
+            // in `reallocate_workbench`; replace with null for
+            // idempotency.
+            unsafe {
+                let p = std::mem::replace(&mut workbench.d_buf, null_mut());
+                if !p.is_null() {
+                    let _ = cudaFree(p);
+                }
+            }
+            workbench.capacity_bytes = 0;
+        }
         // Free device memory before destroying the stream so any
         // pending memcpy on the stream sees the buffers still alive
         // (the Drop chain runs after `cudaStreamSynchronize` returned
@@ -793,6 +1193,40 @@ unsafe fn allocate_buffers(
 /// Frees the old buffers before installing the new ones. No external
 /// thread may hold the old pointers — guaranteed by the caller's
 /// mutex hold.
+/// Phase 2 D-4 v3 — grow the persistent decompress workbench to fit
+/// `new_capacity_bytes` of uncompressed term data. Caller must hold
+/// the workbench mutex so no other thread observes the intermediate
+/// freed state.
+///
+/// # Safety
+/// Frees the old buffer before installing the new one. No external
+/// thread may hold the old pointer.
+unsafe fn reallocate_workbench(
+    workbench: &mut DecompressWorkbench,
+    new_capacity_bytes: usize,
+) -> Result<(), CudaBitmapError> {
+    debug_assert!(new_capacity_bytes >= workbench.capacity_bytes);
+    let mut new_buf: *mut c_void = null_mut();
+    // SAFETY: cudaMalloc writes a valid device pointer on success.
+    let rc = unsafe { cudaMalloc(&mut new_buf, new_capacity_bytes) };
+    if rc != CUDA_SUCCESS {
+        return Err(CudaBitmapError::Cuda {
+            what: "cudaMalloc(v3 workbench)",
+            code: rc,
+        });
+    }
+    // SAFETY: caller holds the workbench mutex; old buffer not
+    // accessible to other threads.
+    unsafe {
+        if !workbench.d_buf.is_null() {
+            let _ = cudaFree(workbench.d_buf);
+        }
+    }
+    workbench.d_buf = new_buf;
+    workbench.capacity_bytes = new_capacity_bytes;
+    Ok(())
+}
+
 unsafe fn reallocate_buffers(
     state: &mut DeviceBuffers,
     new_capacity_words: usize,
@@ -1277,6 +1711,110 @@ mod tests {
                 .unwrap();
             assert_eq!(got, oracle, "{op:?} VRAM fold must match host oracle");
         }
+    }
+
+    /// Helper: insert a `RoaringPostings` into a fresh `VramCompressedCht`
+    /// and return the `Arc<VramCompressedTermEntry>`. Returns None if
+    /// CUDA insert fails (driver-missing host).
+    fn vram_v3_term_entry(
+        rp: &crate::postings::roaring::encoder::RoaringPostings,
+        cache: &crate::postings::roaring::vram_cht_v3::VramCompressedCht,
+        addr: usize,
+    ) -> Option<Arc<crate::postings::roaring::vram_cht_v3::VramCompressedTermEntry>> {
+        let key = crate::postings::roaring::cht::ChtKey {
+            segment_id: crate::index::SegmentId::generate_random(),
+            posting_data_addr: addr,
+            posting_data_len: 100,
+        };
+        let inserted = cache.insert(key.clone(), rp).ok()?;
+        if !inserted {
+            return None;
+        }
+        cache.get(&key)
+    }
+
+    #[test]
+    fn v3_fold_empty_returns_empty() {
+        let Some(kernel) = try_kernel() else { return };
+        let union_keys: [u16; 1] = [0];
+        let res = kernel
+            .compute_fold_v3(BoolOp::And, &[], &union_keys)
+            .unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn v3_fold_matches_v2_fold_oracle() {
+        let Some(kernel) = try_kernel() else { return };
+        let cache_v2 =
+            crate::postings::roaring::vram_cht::VramCht::with_budget(64 * 1024 * 1024);
+        let cache_v3 =
+            crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+                64 * 1024 * 1024,
+            )
+            .ok();
+        let Some(cache_v3) = cache_v3 else { return };
+        let t0 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            1, 2, 3, 65540, 65541,
+        ]);
+        let t1 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            2, 3, 4, 65541, 65542,
+        ]);
+        let t2 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            3, 4, 5, 65540, 65541,
+        ]);
+        let Some(v2_t0) = vram_term_entry(&t0, &cache_v2, 0xa1) else { return };
+        let Some(v2_t1) = vram_term_entry(&t1, &cache_v2, 0xa2) else { return };
+        let Some(v2_t2) = vram_term_entry(&t2, &cache_v2, 0xa3) else { return };
+        let Some(v3_t0) = vram_v3_term_entry(&t0, &cache_v3, 0xb1) else { return };
+        let Some(v3_t1) = vram_v3_term_entry(&t1, &cache_v3, 0xb2) else { return };
+        let Some(v3_t2) = vram_v3_term_entry(&t2, &cache_v3, 0xb3) else { return };
+
+        let term_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&t0, &t1, &t2];
+        let union_keys =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &term_refs,
+            );
+
+        let v2_terms = vec![v2_t0, v2_t1, v2_t2];
+        let v3_terms = vec![v3_t0, v3_t1, v3_t2];
+
+        for op in [BoolOp::And, BoolOp::Or, BoolOp::Xor] {
+            let v2_result = kernel
+                .compute_fold_vram(op, &v2_terms, &union_keys)
+                .expect("v2 fold");
+            let v3_result = kernel
+                .compute_fold_v3(op, &v3_terms, &union_keys)
+                .expect("v3 fold");
+            assert_eq!(
+                v2_result, v3_result,
+                "{op:?} v3 fold (decompressed) must equal v2 fold byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_fold_single_term_round_trips_layout() {
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+            64 * 1024 * 1024,
+        )
+        .ok();
+        let Some(cache) = cache else { return };
+        let docs: Vec<u32> = (0..3).chain(std::iter::once(65540)).collect();
+        let rp = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&docs);
+        let Some(term) = vram_v3_term_entry(&rp, &cache, 0xfeed) else { return };
+        let union_keys: [u16; 2] = [0, 1];
+        let got = kernel
+            .compute_fold_v3(BoolOp::And, &[term], &union_keys)
+            .unwrap();
+        // Compare to host-oracle: build expected flat layout using
+        // the same flat_buffer_for_term as v2's oracle test.
+        let expected = crate::postings::roaring::gpu_dispatch::flat_buffer_for_term_for_test(
+            &rp,
+            &union_keys,
+        );
+        assert_eq!(got, expected);
     }
 
     #[test]

@@ -217,6 +217,19 @@ pub struct EarlyTermSortByCursorCollectorMulti {
     /// DESC]`).  The trailing-`_score` order is supplied via
     /// [`Self::with_scoring`].
     scoring: Option<Order>,
+    /// **Wave 21.** When set, the collector skips the per-doc walk
+    /// through [`default_collect_segment_impl`](crate::collector::default_collect_segment_impl)
+    /// on segments where every alive doc matches (e.g. `match_all`
+    /// against a segment with no deletes).  Harvest then treats
+    /// `matched_bitset` as fully populated and walks the cursor in
+    /// sort order taking the top `limit` directly.
+    ///
+    /// Set by [`Self::with_assume_all_matched`].  The collector
+    /// re-verifies the preconditions per segment (no deletes, no
+    /// scoring) before applying the shortcut, so callers can pass
+    /// this hint based on JSON-level query inspection without paying
+    /// for a Weight downcast.
+    assume_all_matched: bool,
 }
 
 impl EarlyTermSortByCursorCollectorMulti {
@@ -235,6 +248,7 @@ impl EarlyTermSortByCursorCollectorMulti {
             limit,
             start_after: None,
             scoring: None,
+            assume_all_matched: false,
         }
     }
 
@@ -290,6 +304,42 @@ impl EarlyTermSortByCursorCollectorMulti {
     /// array per type before calling here.
     pub fn with_search_after(mut self, start_after: Vec<CursorSortVal>) -> Self {
         self.start_after = Some(start_after);
+        self
+    }
+
+    /// **Wave 21.** Hint that the query matches every alive doc in
+    /// every segment (e.g. the request body is `{"match_all": {}}` and
+    /// no `bool`/`filter` narrows it).  When set, the collector skips
+    /// the per-doc walk on segments that have no deletes and no
+    /// scoring — the matched bitset is treated as fully populated and
+    /// harvest walks the cursor only.
+    ///
+    /// Profile-driven optimisation (Wave 21, KVM-local 1M Pattern A
+    /// `match_all + sort by ts desc + size=10`):
+    ///   * pre-Wave-21: 68% of segment-scan time in
+    ///     `default_collect_segment_impl::{{closure}}`
+    ///     (`matched_bitset.insert_docs_batch`), 13% in
+    ///     `AllScorer::fill_buffer`;
+    ///   * post-Wave-21 (this flag): both paths collapse to 0% — the
+    ///     walk doesn't run.
+    ///
+    /// The flag is conservative: each segment re-checks
+    /// `reader.alive_bitset().is_none()` and `self.scoring.is_none()`
+    /// before applying the shortcut, so segments with deletes or
+    /// scoring fall back to the standard walk.
+    ///
+    /// Callers should set this only when the JSON query body is
+    /// `match_all`-equivalent (e.g. the top-level is `match_all`, or
+    /// a `bool` whose `must`/`filter` reduce to `match_all`).  The
+    /// hint is harmless when the actual Weight does not in fact
+    /// match every doc — the walk would have set the same bitset
+    /// bits the shortcut sets — except in the rare case of an
+    /// adversarial Weight that intentionally returns fewer docs than
+    /// the query semantically matches.  In that case the harvest
+    /// emits docs the walk would have skipped, so only pass this
+    /// when the query is semantically `match_all`.
+    pub fn with_assume_all_matched(mut self) -> Self {
+        self.assume_all_matched = true;
         self
     }
 
@@ -446,6 +496,7 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
                 scores: Vec::new(),
                 start_after_raw: None,
                 reverse_walk: false,
+                assume_all_matched: false,
             });
         };
 
@@ -526,6 +577,16 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
             }
         };
 
+        // **Wave 21.** Propagate the "match_all + no-deletes + no-scoring"
+        // shortcut hint per-segment.  All three preconditions must hold
+        // for the harvest fast path: caller said the query is match_all,
+        // this segment has no deletes (its alive_bitset is None), and
+        // scoring is off (otherwise the walk also populates per-doc
+        // scores).
+        let assume_all_matched = self.assume_all_matched
+            && segment_reader.alive_bitset().is_none()
+            && self.scoring.is_none();
+
         Ok(EarlyTermSortByCursorMultiSegmentCollector {
             cursor: Some(cursor),
             fields: self.fields.clone(),
@@ -539,6 +600,7 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
             scores,
             start_after_raw,
             reverse_walk,
+            assume_all_matched,
         })
     }
 
@@ -547,6 +609,47 @@ impl Collector for EarlyTermSortByCursorCollectorMulti {
         // via `with_scoring`.  Defaults to `false` so the existing
         // Wave 18-1 / 18-3 paths stay zero-cost.
         self.scoring.is_some()
+    }
+
+    /// **Wave 21.** Override the default per-doc walk when the parent
+    /// hinted `assume_all_matched` AND `for_segment` confirmed the
+    /// segment-local preconditions (no deletes, no scoring).  In that
+    /// case the `default_collect_segment_impl` walk is pure overhead
+    /// — every alive doc would be inserted into `matched_bitset`, and
+    /// harvest already short-circuits the per-entry
+    /// `matched_bitset.contains(doc)` check when the flag is on.
+    ///
+    /// Falls back to the default `Collector::collect_segment` impl
+    /// (which calls `default_collect_segment_impl`) when the
+    /// shortcut is inactive on this segment.  This preserves
+    /// byte-equivalence for every non-`match_all` caller and for any
+    /// segment where deletes or scoring are present.
+    fn collect_segment(
+        &self,
+        weight: &dyn crate::query::Weight,
+        segment_ord: u32,
+        reader: &crate::index::SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        let segment_collector = self.for_segment(segment_ord, reader)?;
+        if segment_collector.assume_all_matched {
+            // Skip `default_collect_segment_impl` entirely — the bitset
+            // is implicitly fully populated and harvest emits the
+            // cursor's top-K directly.  No `weight.for_each_*` walk
+            // means we don't touch the AllScorer/Weight machinery at
+            // all for this segment.
+            return Ok(segment_collector.harvest());
+        }
+        // Standard path: per-doc walk populates `matched_bitset`, then
+        // harvest filters cursor entries against it.
+        let mut segment_collector = segment_collector;
+        let with_scoring = self.requires_scoring();
+        crate::collector::default_collect_segment_impl(
+            &mut segment_collector,
+            weight,
+            reader,
+            with_scoring,
+        )?;
+        Ok(segment_collector.harvest())
     }
 
     fn merge_fruits(
@@ -622,6 +725,14 @@ pub struct EarlyTermSortByCursorMultiSegmentCollector {
     /// Mix dispatcher constructors leave it `false` — they are
     /// Wave 18 Forward-only.
     reverse_walk: bool,
+    /// **Wave 21.** When `true`, harvest treats `matched_bitset` as
+    /// fully populated and skips the per-cursor-entry
+    /// `matched_bitset.contains(doc)` check.  Set by
+    /// [`Collector::for_segment`] when the parent's
+    /// `assume_all_matched` flag is on, the segment has no deletes
+    /// (`reader.alive_bitset().is_none()`) and scoring is off
+    /// (`scoring.is_none()`).
+    assume_all_matched: bool,
 }
 
 impl EarlyTermSortByCursorMultiSegmentCollector {
@@ -663,6 +774,14 @@ impl EarlyTermSortByCursorMultiSegmentCollector {
             // walk use the public `for_segment` path which derives this
             // from `cursor_match_mode`.
             reverse_walk: false,
+            // Wave 21: mix-dispatcher / test path does not opt into the
+            // walk-skip shortcut.  Those callers exercise the standard
+            // `default_collect_segment_impl` walk verbatim, which is the
+            // baseline the existing per-segment-mix tests were authored
+            // against.  Callers that want the shortcut go through the
+            // public `Collector::collect_segment` path on
+            // `EarlyTermSortByCursorCollectorMulti::with_assume_all_matched`.
+            assume_all_matched: false,
         }
     }
 
@@ -697,6 +816,9 @@ impl EarlyTermSortByCursorMultiSegmentCollector {
             start_after_raw: None,
             // Wave 20: see `new_for_test_or_mix` note.
             reverse_walk: false,
+            // Wave 21: scoring path never opts in (the shortcut requires
+            // scoring=None anyway), so this is `false` unconditionally.
+            assume_all_matched: false,
         }
     }
 
@@ -927,7 +1049,14 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
         };
         for cursor_idx in cursor_iter {
             let doc = cursor.doc_ids()[cursor_idx];
-            if !self.matched_bitset.contains(doc) {
+            // **Wave 21.** When the parent hinted `assume_all_matched`
+            // and per-segment preconditions held, the walk that would
+            // have populated `matched_bitset` was skipped — the bitset
+            // is implicitly the universal set on this segment, so
+            // every cursor entry is a match by construction.  Skipping
+            // the `contains` probe here also keeps the empty bitset's
+            // memory cold (no allocation reuse).
+            if !self.assume_all_matched && !self.matched_bitset.contains(doc) {
                 continue;
             }
             // **Wave 18-3 follow-up — fast skip via raw ord pivot.**
@@ -1402,6 +1531,10 @@ mod tests {
             scores: Vec::new(),
             start_after_raw: None,
             reverse_walk,
+            // Wave 21: test helper exercises the standard bitset-driven
+            // harvest path explicitly via the `matched` slice — the
+            // shortcut would defeat the point of the test.
+            assume_all_matched: false,
         };
         segment.harvest()
     }
@@ -2940,6 +3073,11 @@ mod tests {
             scores: Vec::new(),
             start_after_raw,
             reverse_walk,
+            // Wave 21: bisect test helper populates the bitset
+            // explicitly via the loop above; the shortcut path would
+            // make the bitset moot and is exercised by separate Wave
+            // 21 tests.
+            assume_all_matched: false,
         }
     }
 

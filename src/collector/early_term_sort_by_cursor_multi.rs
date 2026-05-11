@@ -699,6 +699,80 @@ impl EarlyTermSortByCursorMultiSegmentCollector {
             reverse_walk: false,
         }
     }
+
+    /// **Wave 20 v3.** Returns the number of emission positions to
+    /// skip at the start of `harvest`'s iteration, computed by binary
+    /// searching the cursor's primary column for the first position
+    /// whose primary value is **strictly-after** the search_after
+    /// pivot in the request's order. Returns `0` (no skip) when:
+    ///
+    /// * `start_after_raw` is unresolved (`None`) — slow-path
+    ///   bytes-compare fallback handles the check per-entry in the
+    ///   harvest loop.
+    /// * `prefix_len != 1` — multi-field bisect would need tie-group
+    ///   semantics at the boundary; not implemented.
+    /// * `start_after_raw[0]` is not a `Numeric(Some(_))` pivot
+    ///   (missing-encoded slot or unresolved String).
+    /// * The cursor's last stored primary is `None` — indicating the
+    ///   cursor stores `missing="_last"` entries that the bisect
+    ///   doesn't bound-check.
+    ///
+    /// The bisect itself is `O(log N)` cursor probes. Saves the
+    /// per-entry `matched_bitset.contains()` + `is_strictly_after_lex`
+    /// cost for the skipped prefix, which dominates deep-pagination
+    /// `search_after` latency on large segments.
+    fn bisect_search_after_skip(&self, cursor: &SortCursorIndexV2) -> usize {
+        let n = cursor.len();
+        if n == 0 || self.fields.len() != 1 {
+            return 0;
+        }
+        let Some(start_raw) = &self.start_after_raw else {
+            return 0;
+        };
+        let Some(CursorSortVal::Numeric(Some(pivot))) = start_raw.first() else {
+            return 0;
+        };
+        // Cursor's `missing="_last"` storage places `None` primary
+        // entries at the tail of stored order. If the last stored
+        // position is `Some(_)`, no primary is missing — safe to
+        // bisect.
+        if cursor.value(n - 1, 0).is_none() {
+            return 0;
+        }
+        let request_order = self.fields[0].1;
+        // Standard binary search for the first emission position `p`
+        // whose primary is strictly-after `pivot` in `request_order`.
+        // `emission_to_stored(p) = (n - 1 - p)` under reverse_walk,
+        // else `p` — both shapes are monotone in the request's order
+        // because reverse_walk only fires when the stored order is
+        // the OPPOSITE of the request's.
+        let pivot = *pivot;
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let stored_idx = if self.reverse_walk { n - 1 - mid } else { mid };
+            // Safe: we've verified the last stored primary is
+            // `Some(_)`; cursor sorted with missing-last means every
+            // earlier stored position is also `Some(_)`. We avoid an
+            // `unwrap` on the hot path by handling `None` as "skip
+            // further" so a future cursor shape change degrades to a
+            // smaller-than-optimal skip rather than panicking.
+            let strictly_after = match cursor.value(stored_idx, 0) {
+                Some(v) => match request_order {
+                    Order::Asc => v > pivot,
+                    Order::Desc => v < pivot,
+                },
+                None => false,
+            };
+            if strictly_after {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    }
 }
 
 impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
@@ -738,7 +812,11 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
     }
 
     fn harvest(self) -> Self::Fruit {
-        let Some(cursor) = self.cursor else {
+        // Clone the `Arc` so `self` stays whole — `bisect_search_after_skip`
+        // below borrows `&self` for the per-segment `fields` / `reverse_walk`
+        // / `start_after_raw` fields it needs. The clone is a single ref-count
+        // bump on the shared cursor.
+        let Some(cursor) = self.cursor.as_ref().cloned() else {
             return Vec::new();
         };
         if self.limit == 0 {
@@ -819,10 +897,33 @@ impl SegmentCollector for EarlyTermSortByCursorMultiSegmentCollector {
         // which means *worse in request order* (the request is the
         // opposite of stored). The flush + early-break logic below is
         // therefore unchanged.
+        //
+        // **Wave 20 v3 — search_after binary-search pivot.**
+        // When the caller supplied a `search_after` whose primary slot
+        // is a resolved numeric pivot (i.e. `start_after_raw[0] ==
+        // Numeric(Some(p))`), and the primary column carries no
+        // `None` (missing) entries, binary-search the cursor in
+        // **emission order** for the first position whose primary is
+        // strictly-after the pivot in the request's order. Skip the
+        // prefix of emission positions before that — they would all
+        // fail the per-entry `is_strictly_after_lex` check anyway, so
+        // skipping the scan is a pure win.
+        //
+        // The optimisation is gated on `prefix_len == 1` for now —
+        // multi-field primary bisect would need to consider tie-group
+        // semantics on the secondary axis at the bisect boundary, which
+        // adds complexity for limited additional reward (deep-page
+        // search_after with multi-field primaries is rare). Missing
+        // values are gated out via the cheap `cursor.value(n-1, 0)`
+        // probe (cursor's `missing="_last"` storage places `None`
+        // entries at the tail of stored order, so the last stored
+        // position is `None` iff *any* primary is missing).
+        let initial_skip = self.bisect_search_after_skip(&cursor);
+        let n = cursor.len();
         let cursor_iter: Box<dyn Iterator<Item = usize>> = if self.reverse_walk {
-            Box::new((0..cursor.len()).rev())
+            Box::new((0..n.saturating_sub(initial_skip)).rev())
         } else {
-            Box::new(0..cursor.len())
+            Box::new(initial_skip..n)
         };
         for cursor_idx in cursor_iter {
             let doc = cursor.doc_ids()[cursor_idx];
@@ -2807,5 +2908,173 @@ mod tests {
             cursor_match_mode(&cursor, &prefix_forward),
             CursorMatchMode::Forward
         );
+    }
+
+    // ─── Wave 20 v3: search_after binary-search pivot ───────────────────
+
+    /// Helper: builds a [`EarlyTermSortByCursorMultiSegmentCollector`]
+    /// directly so the bisect helper can be probed without a
+    /// `SegmentReader`. Single-field numeric primary, all docs matched.
+    fn build_seg_collector_for_bisect(
+        cursor: Arc<SortCursorIndexV2>,
+        request_order: Order,
+        reverse_walk: bool,
+        start_after_raw: Option<Vec<CursorSortVal>>,
+        limit: usize,
+    ) -> EarlyTermSortByCursorMultiSegmentCollector {
+        let max_doc = cursor.max_doc();
+        let mut bitset = BitSet::with_max_value(max_doc);
+        for d in 0..max_doc {
+            bitset.insert(d);
+        }
+        EarlyTermSortByCursorMultiSegmentCollector {
+            cursor: Some(cursor.clone()),
+            fields: vec![(cursor.fields()[0].0.clone(), request_order)],
+            value_kinds: vec![cursor.fields()[0].2],
+            str_columns: vec![None],
+            limit,
+            segment_ord: 0,
+            matched_bitset: bitset,
+            start_after: None,
+            scoring: None,
+            scores: Vec::new(),
+            start_after_raw,
+            reverse_walk,
+        }
+    }
+
+    /// **Wave 20 v3.** Bisect on a reverse-walk: cursor stored DESC,
+    /// request ASC, search_after numeric pivot. Skip count should
+    /// equal the number of cursor entries whose primary is `<=`
+    /// pivot (= the prefix the harvest would otherwise scan + reject).
+    #[test]
+    fn wave_20_v3_bisect_reverse_walk_asc_with_pivot() {
+        // 1000 docs DESC stored on i64 ts. Doc i has ts=999-i (so
+        // doc 0 → 999, ..., doc 999 → 0). Cursor sorted DESC keeps
+        // them in declaration order (already DESC by construction).
+        let vs: Vec<Option<u64>> =
+            (0..1000i64).rev().map(|v| Some(v.to_u64())).collect();
+        let cursor = build_cursor(
+            vec![("ts", Order::Desc, ValueKind::I64)],
+            vec![vs],
+            1000,
+        );
+        // ASC request + search_after = 500 (i64). Pre-resolved start_after_raw
+        // is [Numeric(Some(500.to_u64()))].
+        let pivot = (500i64).to_u64();
+        let raw = vec![CursorSortVal::Numeric(Some(pivot))];
+        let seg = build_seg_collector_for_bisect(
+            cursor.clone(),
+            Order::Asc,
+            /* reverse_walk */ true,
+            Some(raw),
+            10,
+        );
+        let skip = seg.bisect_search_after_skip(&cursor);
+        // Emission under reverse-walk on DESC stored = ASC values
+        // 0, 1, 2, ..., 999. ASC + search_after=500 keeps emission
+        // positions p where emission_value(p) > 500. Smallest such p
+        // is 501 (value 501). Skip 501 positions.
+        assert_eq!(skip, 501);
+    }
+
+    /// **Wave 20 v3.** Forward walk on DESC stored cursor (request
+    /// matches stored = DESC) with DESC search_after pivot. Skip
+    /// count should equal the number of values `>=` pivot in stored
+    /// order = (1000 - 500) = 500 positions (cursor[0]=999 down to
+    /// cursor[499]=500). First kept emission is cursor[500]=499 since
+    /// 499 < 500.
+    #[test]
+    fn wave_20_v3_bisect_forward_walk_desc_with_pivot() {
+        let vs: Vec<Option<u64>> =
+            (0..1000i64).rev().map(|v| Some(v.to_u64())).collect();
+        let cursor = build_cursor(
+            vec![("ts", Order::Desc, ValueKind::I64)],
+            vec![vs],
+            1000,
+        );
+        let pivot = (500i64).to_u64();
+        let raw = vec![CursorSortVal::Numeric(Some(pivot))];
+        let seg = build_seg_collector_for_bisect(
+            cursor.clone(),
+            Order::Desc,
+            /* reverse_walk */ false,
+            Some(raw),
+            10,
+        );
+        let skip = seg.bisect_search_after_skip(&cursor);
+        // Forward walk on DESC stored: emission = stored = 999, 998,
+        // ..., 0. DESC + search_after=500: keep p where emission(p) <
+        // 500. Smallest p = 500 (value 499). Skip 500 positions.
+        assert_eq!(skip, 500);
+    }
+
+    /// **Wave 20 v3.** Bisect bails (returns 0) when the cursor's
+    /// primary column carries `None` entries — detected via the
+    /// last-stored probe. The harvest's per-entry `is_strictly_after_lex`
+    /// is then the sole gate.
+    #[test]
+    fn wave_20_v3_bisect_fall_through_when_primary_has_missing() {
+        // 4 docs: 3 present + 1 missing. DESC stored with missing
+        // last: [30, 20, 10, None]. `cursor.value(3, 0)` = None →
+        // bisect returns 0.
+        let vs: Vec<Option<u64>> = vec![
+            Some((30i64).to_u64()),
+            Some((20i64).to_u64()),
+            Some((10i64).to_u64()),
+            None,
+        ];
+        let cursor = build_cursor(
+            vec![("ts", Order::Desc, ValueKind::I64)],
+            vec![vs],
+            4,
+        );
+        let pivot = (15i64).to_u64();
+        let raw = vec![CursorSortVal::Numeric(Some(pivot))];
+        // Reverse walk + ASC request → would bisect if no missing.
+        let seg = build_seg_collector_for_bisect(
+            cursor.clone(),
+            Order::Asc,
+            /* reverse_walk */ true,
+            Some(raw),
+            10,
+        );
+        let skip = seg.bisect_search_after_skip(&cursor);
+        assert_eq!(skip, 0, "bisect must bail when primary column has missing");
+    }
+
+    /// **Wave 20 v3.** End-to-end through `harvest`: bisect-skipped
+    /// path produces the same fruit as the scan path on a small
+    /// cursor, with `search_after` set. Pins that the bisect
+    /// optimisation is byte-equivalent (no docs lost or duplicated).
+    #[test]
+    fn wave_20_v3_harvest_with_bisect_matches_scan() {
+        // 20 docs DESC stored: 19, 18, ..., 0. Reverse-walk ASC
+        // request + search_after = 5 → expect [6, 7, 8, 9, 10].
+        let vs: Vec<Option<u64>> =
+            (0..20i64).rev().map(|v| Some(v.to_u64())).collect();
+        let cursor = build_cursor(
+            vec![("ts", Order::Desc, ValueKind::I64)],
+            vec![vs],
+            20,
+        );
+        let pivot = (5i64).to_u64();
+        let raw = vec![CursorSortVal::Numeric(Some(pivot))];
+        let seg = build_seg_collector_for_bisect(
+            cursor.clone(),
+            Order::Asc,
+            /* reverse_walk */ true,
+            Some(raw),
+            5,
+        );
+        let hits = seg.harvest();
+        let vals: Vec<u64> = hits
+            .iter()
+            .map(|(t, _)| match &t[0] {
+                CursorSortVal::Numeric(Some(u)) => i64::from_u64(*u) as u64,
+                _ => panic!("unexpected slot kind"),
+            })
+            .collect();
+        assert_eq!(vals, vec![6u64, 7, 8, 9, 10]);
     }
 }

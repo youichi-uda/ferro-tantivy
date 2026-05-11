@@ -74,8 +74,8 @@ use ferro_compress::nvcomp_sys::cuda::{
 use ferro_compress::{BitcompDataType, BitcompDeviceCodec, Error as FcError};
 
 use crate::postings::roaring::cht::ChtKey;
-use crate::postings::roaring::container::{BitmapContainer, Container};
 use crate::postings::roaring::encoder::RoaringPostings;
+use crate::postings::roaring::shared_bitmap_payload::SharedBitmapPayload;
 use crate::postings::roaring::BITMAP_CONTAINER_WORDS;
 
 /// Errors specific to the v3 cache layer. Insert / promote failures
@@ -547,42 +547,27 @@ impl VramCompressedCht {
     /// Internal: stage uncompressed flat layout to host, upload to
     /// device temp, compress with `BitcompDeviceCodec` to a freshly-
     /// allocated `d_compressed`, free the device temp.
+    ///
+    /// Wave Z-2 #1: container→bitmap expansion lives in
+    /// [`SharedBitmapPayload::from_postings`] so the staging /
+    /// bucket_index layout stays byte-identical to v2 (= the
+    /// invariant cross-tier promote relies on).
     fn build_entry(
         &self,
         roaring: &RoaringPostings,
         bucket_count: usize,
         uncompressed_bytes: usize,
     ) -> Result<VramCompressedTermEntry, VramCompressedChtError> {
-        // 1. Build host staging buffer + bucket_index (same as v2).
-        let total_words = bucket_count * BITMAP_CONTAINER_WORDS;
-        let mut staging: Vec<u32> = vec![0u32; total_words];
-        let mut bucket_index: Vec<(u16, u32)> = Vec::with_capacity(bucket_count);
-        let mut word_offset: u32 = 0;
-        for (high16, container) in &roaring.containers {
-            if container.cardinality() == 0 {
-                continue;
-            }
-            let start = word_offset as usize;
-            let end = start + BITMAP_CONTAINER_WORDS;
-            let chunk = &mut staging[start..end];
-            match container {
-                Container::Bitmap(bm) => {
-                    chunk.copy_from_slice(bm.words.as_ref());
-                }
-                Container::Array(arr) => {
-                    let bm = BitmapContainer::from_array(arr);
-                    chunk.copy_from_slice(bm.words.as_ref());
-                }
-                Container::Run(rc) => {
-                    let bm = BitmapContainer::from_run(rc);
-                    chunk.copy_from_slice(bm.words.as_ref());
-                }
-            }
-            bucket_index.push((*high16, word_offset));
-            word_offset = word_offset
-                .checked_add(BITMAP_CONTAINER_WORDS as u32)
-                .expect("word_offset must not overflow u32 within total_words bound");
-        }
+        // 1. Build host staging buffer + bucket_index via shared helper.
+        let payload = SharedBitmapPayload::from_postings(roaring)
+            .expect("caller pre-filtered empty postings; payload must be Some");
+        debug_assert_eq!(payload.bucket_count, bucket_count);
+        debug_assert_eq!(payload.total_bytes(), uncompressed_bytes);
+        let SharedBitmapPayload {
+            bucket_index,
+            staging,
+            ..
+        } = payload;
 
         // 2. Upload uncompressed staging to device temp.
         let mut d_uncompressed_temp: *mut c_void = null_mut();

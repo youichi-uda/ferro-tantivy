@@ -95,8 +95,8 @@ use ferro_compress::nvcomp_sys::cuda::{
 };
 
 use crate::postings::roaring::cht::ChtKey;
-use crate::postings::roaring::container::{BitmapContainer, Container};
 use crate::postings::roaring::encoder::RoaringPostings;
+use crate::postings::roaring::shared_bitmap_payload::SharedBitmapPayload;
 use crate::postings::roaring::BITMAP_CONTAINER_WORDS;
 
 /// Errors specific to the VRAM cache layer. Insert / promote failures
@@ -508,6 +508,11 @@ impl VramCht {
     /// layout, copy H→D synchronously. Failures `cudaFree` the
     /// allocation before returning the error so the caller's state
     /// remains consistent.
+    ///
+    /// Wave Z-2 #1: the container→bitmap expansion + staging buffer
+    /// build lives in [`SharedBitmapPayload::from_postings`] so v3
+    /// can reuse the exact same layout (byte-identical
+    /// `bucket_index` + staging) without redundant duplication.
     fn build_entry(
         &self,
         roaring: &RoaringPostings,
@@ -515,40 +520,19 @@ impl VramCht {
     ) -> Result<VramTermEntry, VramChtError> {
         let bytes = total_words * std::mem::size_of::<u32>();
 
-        // Host staging buffer: build the full flat layout, then a single
-        // cudaMemcpy. Smaller cudaMemcpys per bucket would multiply
-        // launch overhead — at typical bucket counts (~10-100 per term)
-        // a single H→D wins handily.
-        let mut staging: Vec<u32> = vec![0u32; total_words];
-        let mut bucket_index: Vec<(u16, u32)> = Vec::with_capacity(
-            roaring.containers.len(),
-        );
-        let mut word_offset: u32 = 0;
-        for (high16, container) in &roaring.containers {
-            if container.cardinality() == 0 {
-                continue;
-            }
-            let start = word_offset as usize;
-            let end = start + BITMAP_CONTAINER_WORDS;
-            let chunk = &mut staging[start..end];
-            match container {
-                Container::Bitmap(bm) => {
-                    chunk.copy_from_slice(bm.words.as_ref());
-                }
-                Container::Array(arr) => {
-                    let bm = BitmapContainer::from_array(arr);
-                    chunk.copy_from_slice(bm.words.as_ref());
-                }
-                Container::Run(rc) => {
-                    let bm = BitmapContainer::from_run(rc);
-                    chunk.copy_from_slice(bm.words.as_ref());
-                }
-            }
-            bucket_index.push((*high16, word_offset));
-            word_offset = word_offset
-                .checked_add(BITMAP_CONTAINER_WORDS as u32)
-                .expect("word_offset must not overflow u32 within total_words bound");
-        }
+        // Host staging buffer: build the full flat layout via the
+        // shared helper, then a single cudaMemcpy. Smaller
+        // cudaMemcpys per bucket would multiply launch overhead — at
+        // typical bucket counts (~10-100 per term) a single H→D wins
+        // handily.
+        let payload = SharedBitmapPayload::from_postings(roaring)
+            .expect("caller pre-filtered empty postings; payload must be Some");
+        debug_assert_eq!(payload.total_words, total_words);
+        let SharedBitmapPayload {
+            bucket_index,
+            staging,
+            ..
+        } = payload;
 
         // Allocate device buffer.
         let mut d_buckets: *mut c_void = null_mut();

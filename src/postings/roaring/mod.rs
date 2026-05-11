@@ -69,6 +69,8 @@ pub mod gpu_dispatch;
 pub mod persist;
 pub mod planner;
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub(crate) mod shared_bitmap_payload;
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 pub mod vram_cht;
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 pub mod vram_cht_v3;

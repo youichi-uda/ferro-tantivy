@@ -332,6 +332,95 @@ impl Cht {
         self.inserts.store(0, Ordering::Relaxed);
         self.evictions.store(0, Ordering::Relaxed);
     }
+
+    // ========================================================
+    // Phase 2 D-5 — warm-restart persistence (host-memory tier)
+    // ========================================================
+
+    /// Dump every cached entry to `<path>` in the v1 (FCV1) wire
+    /// format. The file body for each entry is the existing
+    /// [`RoaringPostings::to_bytes`] encoding, length-prefixed with a
+    /// `u32` so the loader can slice without re-parsing the inner
+    /// magic header.
+    ///
+    /// Returns the number of entries written. Errors after partial
+    /// write leave the staging `<path>.tmp` behind for operator
+    /// inspection; the destination `<path>` is untouched (the rename
+    /// only runs after the trailer flushes successfully).
+    ///
+    /// LRU tokens are not persisted — the cache restarts with all
+    /// loaded entries marked fresh in arrival order (which matches
+    /// the on-disk order; deterministic).
+    pub fn dump_to_path(&self, path: &std::path::Path) -> Result<u64, super::persist::DumpError> {
+        use super::persist::{
+            finalise_atomic_write, open_tmp_writer, write_chtkey, write_file_header,
+            write_file_trailer, MAGIC_V1,
+        };
+        use std::io::Write;
+        // Snapshot under lock — we want a consistent set of entries
+        // even if other threads are mid-insert. Clone the Arcs so we
+        // can release the lock before the I/O loop (RoaringPostings
+        // are already immutable-shared).
+        let snapshot: Vec<(ChtKey, Arc<RoaringPostings>)> = {
+            let inner = self.inner.lock().expect("CHT mutex poisoned");
+            inner
+                .map
+                .iter()
+                .map(|(k, (v, _))| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
+        let entry_count = snapshot.len() as u64;
+        let mut writer = open_tmp_writer(path)?;
+        write_file_header(&mut writer, MAGIC_V1, entry_count)?;
+        for (key, rp) in &snapshot {
+            write_chtkey(&mut writer, key)?;
+            let body = rp.to_bytes();
+            let body_len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+            writer.write_all(&body_len.to_le_bytes())?;
+            writer.write_all(&body)?;
+        }
+        write_file_trailer(&mut writer)?;
+        finalise_atomic_write(writer, path)?;
+        Ok(entry_count)
+    }
+
+    /// Load entries from `<path>` and populate this cache. The
+    /// caller is responsible for ensuring the cache is empty (or
+    /// that re-inserts are acceptable) — duplicate keys re-use
+    /// existing entries via the same idempotency path as
+    /// [`Cht::insert`]. Returns the number of entries successfully
+    /// loaded; per-entry body-parse failures are silently skipped
+    /// (the cache stays internally consistent — a single corrupt
+    /// entry doesn't poison the whole warm-restart load). Operators
+    /// observe per-entry loss via the count diff
+    /// (`loaded < entry_count_on_disk`); whole-file structural
+    /// issues (magic / version / trailer) fail loud via
+    /// [`super::persist::LoadError`].
+    pub fn load_from_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<u64, super::persist::LoadError> {
+        use super::persist::{
+            open_reader, read_and_validate_file_header, read_and_validate_file_trailer,
+            read_chtkey, read_exact_or_truncated, read_u32_le, MAGIC_V1,
+        };
+        let mut reader = open_reader(path)?;
+        let entry_count = read_and_validate_file_header(&mut reader, MAGIC_V1)?;
+        let mut loaded: u64 = 0;
+        for i in 0..entry_count {
+            let key = read_chtkey(&mut reader, i)?;
+            let body_len = read_u32_le(&mut reader)? as usize;
+            let body = read_exact_or_truncated(&mut reader, body_len)?;
+            if let Ok(rp) = RoaringPostings::from_bytes(&body) {
+                self.insert(key, Arc::new(rp));
+                loaded += 1;
+            }
+            // Body-parse failure: silently skip; the rest of the
+            // dump is still consumable.
+        }
+        read_and_validate_file_trailer(&mut reader)?;
+        Ok(loaded)
+    }
 }
 
 // ============================================================
@@ -536,6 +625,188 @@ mod tests {
         assert_eq!(
             h_empty_1, h_empty_2,
             "empty-input hash must be deterministic across calls"
+        );
+    }
+
+    // ========================================================
+    // Phase 2 D-5 — v1 dump/load roundtrip tests
+    // ========================================================
+
+    #[test]
+    fn chtv1_dump_then_load_roundtrip_byte_equal() {
+        // Populate one source cache, dump, build a fresh cache,
+        // load, and assert the loaded entries are byte-equal to
+        // the source values (via the RoaringPostings to_bytes
+        // representation — Arc identity diverges, content does
+        // not).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v1.bin");
+
+        let src = Cht::with_budget(64 * 1024 * 1024);
+        let entries = vec![
+            (
+                dummy_key(0x1000, 0xAAAA_BBBB_CCCC_DDDD),
+                Arc::new(small_postings()),
+            ),
+            (
+                dummy_key(0x2000, 0x1111_2222_3333_4444),
+                Arc::new(big_postings(7)),
+            ),
+            (
+                dummy_key(0x3000, 0xDEAD_BEEF_CAFE_BABE),
+                Arc::new(RoaringEncoder::from_doc_ids(&[42])),
+            ),
+        ];
+        for (k, v) in &entries {
+            src.insert(k.clone(), Arc::clone(v));
+        }
+        let n_dumped = src.dump_to_path(&path).unwrap();
+        assert_eq!(n_dumped, entries.len() as u64);
+        // File exists at final path, .tmp does not.
+        assert!(path.exists());
+        assert!(!super::super::persist::tmp_path_for(&path).exists());
+
+        // Fresh cache; load; per-key byte-equal check.
+        let dst = Cht::with_budget(64 * 1024 * 1024);
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, entries.len() as u64);
+        for (k, expected) in &entries {
+            let got = dst.get(k).expect("loaded entry must hit");
+            assert_eq!(
+                got.to_bytes(),
+                expected.to_bytes(),
+                "loaded RoaringPostings must be byte-equal to dumped"
+            );
+        }
+    }
+
+    #[test]
+    fn chtv1_load_wrong_magic_returns_error() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v1.bin");
+        // Write a v2-magic file.
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&super::super::persist::MAGIC_V2.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::WIRE_VERSION.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::HASH_FN_FXHASHER_V1.to_le_bytes())
+            .unwrap();
+        f.write_all(&0u64.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&super::super::persist::MAGIC_END.to_le_bytes())
+            .unwrap();
+        drop(f);
+
+        let dst = Cht::with_budget(1024 * 1024);
+        let err = dst.load_from_path(&path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::super::persist::LoadError::WrongMagic { .. }
+            ),
+            "v2 file at v1 path must reject as WrongMagic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn chtv1_dump_empty_cache_then_load_succeeds() {
+        // Zero-entry dump is a valid file (header + trailer only).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v1.bin");
+        let src = Cht::with_budget(64 * 1024 * 1024);
+        let n = src.dump_to_path(&path).unwrap();
+        assert_eq!(n, 0);
+        let dst = Cht::with_budget(64 * 1024 * 1024);
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, 0);
+        assert_eq!(dst.stats().entries, 0);
+    }
+
+    #[test]
+    fn chtv1_restart_simulation_first_query_hits() {
+        // Phase 2 D-5 acceptance gate: after dump + restart
+        // simulation (= fresh Cht instance) + load, the FIRST query
+        // for a previously-cached key must observe a hit, not a
+        // miss. This is the load-bearing witness for the
+        // "warm-restart, drain skipped" claim.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v1_restart.bin");
+
+        // Original process: populate + dump.
+        let original = Cht::with_budget(64 * 1024 * 1024);
+        let k1 = dummy_key(0xCAFE, 0xBABE_0001);
+        let k2 = dummy_key(0xCAFE, 0xBABE_0002);
+        original.insert(k1.clone(), Arc::new(small_postings()));
+        original.insert(k2.clone(), Arc::new(big_postings(0)));
+        original.dump_to_path(&path).unwrap();
+
+        // Restart simulation: fresh Cht (= post-restart cold state).
+        let restarted = Cht::with_budget(64 * 1024 * 1024);
+        // Pre-load stats: nothing.
+        let pre = restarted.stats();
+        assert_eq!(pre.hits, 0, "fresh cache has no hits");
+        assert_eq!(pre.misses, 0, "fresh cache has no misses");
+        assert_eq!(pre.entries, 0, "fresh cache has no entries");
+
+        // Load from disk.
+        let loaded = restarted.load_from_path(&path).unwrap();
+        assert_eq!(loaded, 2, "load must reinstall both entries");
+        let post_load = restarted.stats();
+        assert_eq!(
+            post_load.entries, 2,
+            "post-load entry count must equal dumped entry count"
+        );
+
+        // The acceptance gate: first query post-restart hits.
+        let got = restarted.get(&k1);
+        assert!(got.is_some(), "first-query-post-restart must hit, not miss");
+        let post_query = restarted.stats();
+        assert_eq!(
+            post_query.hits, 1,
+            "stats.hits must be 1 after one post-restart query (drain skipped)"
+        );
+        assert_eq!(
+            post_query.misses, 0,
+            "no misses observed post-restart for cached keys"
+        );
+
+        // Verify the loaded value is byte-equal to the original.
+        let original_bytes = small_postings().to_bytes();
+        assert_eq!(
+            got.unwrap().to_bytes(),
+            original_bytes,
+            "post-restart get returns byte-equal posting list"
+        );
+    }
+
+    #[test]
+    fn chtv1_load_truncated_dump_returns_error() {
+        // Write a header claiming 5 entries but no bodies.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v1.bin");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&super::super::persist::MAGIC_V1.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::WIRE_VERSION.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::HASH_FN_FXHASHER_V1.to_le_bytes())
+            .unwrap();
+        f.write_all(&5u64.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        // No bodies, no trailer.
+        drop(f);
+
+        let dst = Cht::with_budget(1024 * 1024);
+        let err = dst.load_from_path(&path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::super::persist::LoadError::TruncatedDump { .. }
+            ),
+            "truncated body must reject as TruncatedDump, got {err:?}"
         );
     }
 

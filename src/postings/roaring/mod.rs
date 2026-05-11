@@ -65,6 +65,8 @@ pub mod encoder;
 pub mod ferro_compress_bridge;
 pub mod from_block_segment;
 pub mod gpu_dispatch;
+#[cfg(all(feature = "gpu", feature = "ferro-compress"))]
+pub mod persist;
 pub mod planner;
 #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 pub mod vram_cht;

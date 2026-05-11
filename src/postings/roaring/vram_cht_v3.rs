@@ -689,6 +689,201 @@ impl VramCompressedCht {
             bucket_index,
         })
     }
+
+    // ========================================================
+    // Phase 2 D-5 — warm-restart persistence (Bitcomp-compressed VRAM tier)
+    // ========================================================
+
+    /// Dump every cached entry to `<path>` in the v3 (FCV3) wire
+    /// format. Each entry stages its device-resident
+    /// compressed-bytes payload back to host via
+    /// `cudaMemcpyDeviceToHost` and writes the bytes next to the
+    /// bucket-index + uncompressed/compressed size headers.
+    ///
+    /// On disk the compressed bytes are stored as-is — load time
+    /// allocates a fresh device buffer and copies them back via
+    /// `cudaMemcpyHostToDevice`, ready for the same Bitcomp
+    /// decompress-on-read flow as a freshly-inserted entry. The
+    /// codec data type is implicit in the magic (one cache per
+    /// process, one data type per cache); future multi-data-type
+    /// dumps would version-bump the wire format.
+    ///
+    /// Returns the number of entries written.
+    pub fn dump_to_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<u64, super::persist::DumpError> {
+        use super::persist::{
+            finalise_atomic_write, open_tmp_writer, write_chtkey, write_file_header,
+            write_file_trailer, DumpError, MAGIC_V3,
+        };
+        use std::io::Write;
+        let snapshot: Vec<(ChtKey, Arc<VramCompressedTermEntry>)> = {
+            let inner = self.inner.lock().expect("VramCompressedCht mutex poisoned");
+            inner
+                .map
+                .iter()
+                .map(|(k, (v, _))| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
+        let entry_count = snapshot.len() as u64;
+        let mut writer = open_tmp_writer(path)?;
+        write_file_header(&mut writer, MAGIC_V3, entry_count)?;
+        for (i, (key, entry)) in snapshot.iter().enumerate() {
+            write_chtkey(&mut writer, key)?;
+            // bucket_count + per-bucket (high16, word_offset) pairs.
+            let bucket_count = u32::try_from(entry.bucket_index.len()).unwrap_or(u32::MAX);
+            writer.write_all(&bucket_count.to_le_bytes())?;
+            for (high16, word_offset) in &entry.bucket_index {
+                writer.write_all(&high16.to_le_bytes())?;
+                writer.write_all(&word_offset.to_le_bytes())?;
+            }
+            // uncompressed_bytes + compressed_bytes (both u64).
+            writer.write_all(&(entry.uncompressed_bytes as u64).to_le_bytes())?;
+            writer.write_all(&(entry.compressed_bytes as u64).to_le_bytes())?;
+            // Stage the device-resident compressed payload back to
+            // host for write.
+            let bytes = entry.compressed_bytes;
+            let mut host_staging: Vec<u8> = vec![0u8; bytes];
+            // SAFETY: entry.d_compressed points to `bytes` of device
+            // memory owned by this Arc; host_staging holds `bytes`
+            // of valid host memory.
+            let rc = unsafe {
+                cudaMemcpy(
+                    host_staging.as_mut_ptr() as *mut c_void,
+                    entry.d_compressed as *const c_void,
+                    bytes,
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                )
+            };
+            if rc != CUDA_SUCCESS {
+                return Err(DumpError::Cuda {
+                    entry_index: i as u64,
+                    bytes,
+                    code: rc,
+                });
+            }
+            writer.write_all(&host_staging)?;
+        }
+        write_file_trailer(&mut writer)?;
+        finalise_atomic_write(writer, path)?;
+        Ok(entry_count)
+    }
+
+    /// Load entries from `<path>` into this cache. For each entry
+    /// read from disk, allocates a fresh `d_compressed` device
+    /// buffer, stages the compressed bytes back to device, and
+    /// installs the entry under the parsed [`ChtKey`].
+    ///
+    /// Per-entry CUDA failures are skipped; structural failures
+    /// fail loud. Returns the number of entries installed.
+    pub fn load_from_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<u64, super::persist::LoadError> {
+        use super::persist::{
+            open_reader, read_and_validate_file_header,
+            read_and_validate_file_trailer, read_chtkey, read_exact_or_truncated,
+            read_u16_le, read_u32_le, read_u64_le, MAGIC_V3,
+        };
+        let mut reader = open_reader(path)?;
+        let entry_count = read_and_validate_file_header(&mut reader, MAGIC_V3)?;
+        let mut loaded: u64 = 0;
+        for i in 0..entry_count {
+            let key = read_chtkey(&mut reader, i)?;
+            let bucket_count = read_u32_le(&mut reader)? as usize;
+            let mut bucket_index: Vec<(u16, u32)> = Vec::with_capacity(bucket_count);
+            for _ in 0..bucket_count {
+                let high16 = read_u16_le(&mut reader)?;
+                let word_offset = read_u32_le(&mut reader)?;
+                bucket_index.push((high16, word_offset));
+            }
+            let uncompressed_bytes = read_u64_le(&mut reader)? as usize;
+            let compressed_bytes = read_u64_le(&mut reader)? as usize;
+            let body = read_exact_or_truncated(&mut reader, compressed_bytes)?;
+            // Cross-check: uncompressed_bytes must match the
+            // bucket_count expansion (same invariant as v2).
+            let expected_uncomp = bucket_count * BITMAP_CONTAINER_WORDS * 4;
+            if expected_uncomp != uncompressed_bytes {
+                continue;
+            }
+            // Budget gate: if the entire compressed entry exceeds
+            // the budget, skip (matches the runtime insert path).
+            if (compressed_bytes as u64) > self.budget_bytes {
+                continue;
+            }
+            // Allocate device buffer + H2D for the compressed payload.
+            let mut d_compressed: *mut c_void = null_mut();
+            // SAFETY: cudaMalloc writes the device pointer on success.
+            let rc = unsafe { cudaMalloc(&mut d_compressed, compressed_bytes) };
+            if rc != CUDA_SUCCESS {
+                continue;
+            }
+            // SAFETY: d_compressed just allocated of `compressed_bytes`;
+            // body.as_ptr() holds the right bytes.
+            let rc = unsafe {
+                cudaMemcpy(
+                    d_compressed,
+                    body.as_ptr() as *const c_void,
+                    compressed_bytes,
+                    cudaMemcpyKind::cudaMemcpyHostToDevice,
+                )
+            };
+            if rc != CUDA_SUCCESS {
+                // SAFETY: just allocated above.
+                unsafe {
+                    let _ = cudaFree(d_compressed);
+                }
+                continue;
+            }
+            let entry = VramCompressedTermEntry {
+                d_compressed,
+                compressed_bytes,
+                uncompressed_bytes,
+                bucket_index,
+            };
+            // Install via LRU eviction path.
+            let entry_compressed_bytes = entry.compressed_bytes as u64;
+            let entry_uncompressed_bytes = entry.uncompressed_bytes as u64;
+            let mut inner = self.inner.lock().expect("VramCompressedCht mutex poisoned");
+            let next_token = inner.next_token + 1;
+            if inner.map.contains_key(&key) {
+                drop(inner);
+                drop(entry);
+                continue;
+            }
+            while inner.current_bytes + entry_compressed_bytes > self.budget_bytes
+                && !inner.map.is_empty()
+            {
+                let oldest_key = inner
+                    .map
+                    .iter()
+                    .min_by_key(|(_, (_, t))| *t)
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest_key {
+                    if let Some((evicted_value, _)) = inner.map.remove(&k) {
+                        inner.current_bytes = inner
+                            .current_bytes
+                            .saturating_sub(evicted_value.compressed_bytes as u64);
+                        inner.uncompressed_bytes_total = inner
+                            .uncompressed_bytes_total
+                            .saturating_sub(evicted_value.uncompressed_bytes as u64);
+                        self.evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    break;
+                }
+            }
+            inner.next_token = next_token;
+            inner.current_bytes += entry_compressed_bytes;
+            inner.uncompressed_bytes_total += entry_uncompressed_bytes;
+            inner.map.insert(key, (Arc::new(entry), next_token));
+            self.inserts.fetch_add(1, Ordering::Relaxed);
+            loaded += 1;
+        }
+        read_and_validate_file_trailer(&mut reader)?;
+        Ok(loaded)
+    }
 }
 
 // ============================================================
@@ -1020,6 +1215,245 @@ mod tests {
             "v3 capacity advantage: v3={v3_entries} entries / v2={v2_entries} entries / \
              v3 live ratio={live_ratio:.2} / v3 one-entry compressed={v3_one_entry} \
              uncompressed={v3_one_uncompressed}"
+        );
+    }
+
+    // ========================================================
+    // Phase 2 D-5 — v3 dump/load roundtrip tests
+    // ========================================================
+
+    #[test]
+    fn cht_v3_dump_then_load_roundtrip_byte_equal() {
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v3.bin");
+
+        let src = VramCompressedCht::with_budget(256 * 1024 * 1024).unwrap();
+        let entries = vec![
+            (
+                dummy_key(0x1111, 0x1111_2222_3333_4444),
+                small_roaring(),
+            ),
+            (
+                dummy_key(0x2222, 0x5555_6666_7777_8888),
+                dense_roaring(0),
+            ),
+            (
+                dummy_key(0x3333, 0x9999_AAAA_BBBB_CCCC),
+                dense_roaring(1),
+            ),
+        ];
+        for (k, rp) in &entries {
+            src.insert(k.clone(), rp).unwrap();
+        }
+        let n_dumped = src.dump_to_path(&path).unwrap();
+        assert_eq!(n_dumped, entries.len() as u64);
+        assert!(path.exists());
+
+        // Capture per-entry (compressed_bytes, uncompressed_bytes,
+        // bucket_index, host bytes) from the source.
+        struct Expected {
+            compressed_bytes: usize,
+            uncompressed_bytes: usize,
+            bucket_index: Vec<(u16, u32)>,
+            host_compressed: Vec<u8>,
+        }
+        let mut expected_per_entry: Vec<Expected> = Vec::with_capacity(entries.len());
+        for (k, _) in &entries {
+            let e = src.get(k).expect("src entry must hit");
+            let bytes = e.compressed_bytes();
+            let mut staging = vec![0u8; bytes];
+            let rc = unsafe {
+                cudaMemcpy(
+                    staging.as_mut_ptr() as *mut c_void,
+                    e.device_ptr(),
+                    bytes,
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                )
+            };
+            assert_eq!(rc, CUDA_SUCCESS);
+            expected_per_entry.push(Expected {
+                compressed_bytes: e.compressed_bytes(),
+                uncompressed_bytes: e.uncompressed_bytes(),
+                bucket_index: e.bucket_index().to_vec(),
+                host_compressed: staging,
+            });
+        }
+
+        // Fresh cache; load; per-entry byte-equal.
+        let dst = VramCompressedCht::with_budget(256 * 1024 * 1024).unwrap();
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, entries.len() as u64);
+        for ((k, _), expected) in entries.iter().zip(expected_per_entry.iter()) {
+            let got = dst.get(k).expect("loaded entry must hit");
+            assert_eq!(got.compressed_bytes(), expected.compressed_bytes);
+            assert_eq!(got.uncompressed_bytes(), expected.uncompressed_bytes);
+            assert_eq!(got.bucket_index(), expected.bucket_index.as_slice());
+            // Compressed payload byte-equal: stage device → host
+            // and compare to the dumped bytes.
+            let mut staging = vec![0u8; got.compressed_bytes()];
+            let rc = unsafe {
+                cudaMemcpy(
+                    staging.as_mut_ptr() as *mut c_void,
+                    got.device_ptr(),
+                    got.compressed_bytes(),
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                )
+            };
+            assert_eq!(rc, CUDA_SUCCESS);
+            assert_eq!(
+                staging, expected.host_compressed,
+                "loaded compressed payload must be byte-equal to dumped"
+            );
+        }
+        // Stats: the loaded cache must report the same uncompressed
+        // total (the live capacity-multiplier signal that buyer DD
+        // talks about).
+        let src_stats = src.stats();
+        let dst_stats = dst.stats();
+        assert_eq!(
+            src_stats.compressed_bytes_total,
+            dst_stats.compressed_bytes_total,
+            "compressed total must match"
+        );
+        assert_eq!(
+            src_stats.uncompressed_bytes_total,
+            dst_stats.uncompressed_bytes_total,
+            "uncompressed total must match"
+        );
+    }
+
+    #[test]
+    fn cht_v3_restart_simulation_first_query_hits() {
+        // Phase 2 D-5 acceptance gate: after dump + restart
+        // simulation (= fresh VramCompressedCht) + load, the FIRST
+        // query for a previously-cached key must observe a hit.
+        // v3 specific: the loaded entry must preserve compressed
+        // bytes byte-for-byte (so decompress-on-read at query time
+        // produces the same uncompressed buffer the kernel
+        // expects).
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v3_restart.bin");
+
+        let original = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let k1 = dummy_key(0xCAFE, 0xBABE_0001);
+        let k2 = dummy_key(0xCAFE, 0xBABE_0002);
+        original.insert(k1.clone(), &small_roaring()).unwrap();
+        original.insert(k2.clone(), &dense_roaring(0)).unwrap();
+        original.dump_to_path(&path).unwrap();
+
+        let restarted = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let pre = restarted.stats();
+        assert_eq!(pre.hits, 0);
+        assert_eq!(pre.entries, 0);
+
+        let loaded = restarted.load_from_path(&path).unwrap();
+        assert_eq!(loaded, 2, "load installs both entries");
+        let post_load = restarted.stats();
+        assert_eq!(post_load.entries, 2);
+
+        // Acceptance gate.
+        let got = restarted.get(&k1);
+        assert!(got.is_some(), "first-query-post-restart hits");
+        let post_query = restarted.stats();
+        assert_eq!(post_query.hits, 1);
+        assert_eq!(post_query.misses, 0);
+
+        // The entry exposes a valid device pointer + matched bucket
+        // index + non-zero compressed bytes (the buyer DD signal
+        // for "compressed hot tier survives restart").
+        let entry = got.unwrap();
+        assert!(!entry.device_ptr().is_null());
+        assert!(entry.compressed_bytes() > 0);
+        assert!(entry.uncompressed_bytes() > 0);
+        assert!(entry.bucket_count() >= 1);
+    }
+
+    #[test]
+    fn cht_v3_load_wrong_magic_rejected() {
+        if !cuda_available() {
+            return;
+        }
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v3.bin");
+        // Write a v1-magic file.
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&super::super::persist::MAGIC_V1.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::WIRE_VERSION.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::HASH_FN_FXHASHER_V1.to_le_bytes())
+            .unwrap();
+        f.write_all(&0u64.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&super::super::persist::MAGIC_END.to_le_bytes())
+            .unwrap();
+        drop(f);
+
+        let dst = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let err = dst.load_from_path(&path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::super::persist::LoadError::WrongMagic { .. }
+            ),
+            "v1 file at v3 path must reject as WrongMagic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cht_v3_dump_empty_cache_roundtrips() {
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v3_empty.bin");
+        let src = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let n = src.dump_to_path(&path).unwrap();
+        assert_eq!(n, 0);
+        let dst = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, 0);
+        assert_eq!(dst.stats().entries, 0);
+    }
+
+    #[test]
+    fn cht_v3_dump_with_hash_fn_drift_rejected_on_load() {
+        // Write a v3-magic file with hash_function = 999 (= future
+        // hash swap). Loader must reject as HashFunctionMismatch
+        // so cold-start kicks in cleanly.
+        if !cuda_available() {
+            return;
+        }
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v3_hashdrift.bin");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&super::super::persist::MAGIC_V3.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::WIRE_VERSION.to_le_bytes())
+            .unwrap();
+        f.write_all(&999u32.to_le_bytes()).unwrap(); // wrong hash_fn
+        f.write_all(&0u64.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&super::super::persist::MAGIC_END.to_le_bytes())
+            .unwrap();
+        drop(f);
+
+        let dst = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let err = dst.load_from_path(&path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::super::persist::LoadError::HashFunctionMismatch { .. }
+            ),
+            "hash_function drift must reject as HashFunctionMismatch, got {err:?}"
         );
     }
 

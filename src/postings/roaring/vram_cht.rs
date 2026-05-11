@@ -593,6 +593,218 @@ impl VramCht {
             total_words,
         })
     }
+
+    // ========================================================
+    // Phase 2 D-5 — warm-restart persistence (uncompressed VRAM tier)
+    // ========================================================
+
+    /// Dump every cached entry to `<path>` in the v2 (FCV2) wire
+    /// format. Each entry stages its device-resident
+    /// `[u32; total_words]` flat bitmap back to host via
+    /// `cudaMemcpyDeviceToHost` and writes the uncompressed bytes
+    /// next to the bucket-index header.
+    ///
+    /// The atomic-write protocol from
+    /// [`super::persist::finalise_atomic_write`] guarantees that a
+    /// crash mid-dump leaves the destination path untouched; the
+    /// staging `<path>.tmp` is left behind for operator inspection.
+    ///
+    /// Returns the number of entries written. The default-stream
+    /// `cudaMemcpy` is synchronous; it implicitly serialises
+    /// against in-flight kernels on the same stream so a query in
+    /// progress on the same device-resident `Arc` is safe.
+    pub fn dump_to_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<u64, super::persist::DumpError> {
+        use super::persist::{
+            finalise_atomic_write, open_tmp_writer, write_chtkey, write_file_header,
+            write_file_trailer, DumpError, MAGIC_V2,
+        };
+        use std::io::Write;
+        // Snapshot Arcs under the lock, release before staging
+        // device → host copies (which can be slow on multi-MiB
+        // entries). Arc keeps each entry's device buffer alive
+        // until the snapshot is fully drained.
+        let snapshot: Vec<(ChtKey, Arc<VramTermEntry>)> = {
+            let inner = self.inner.lock().expect("VramCht mutex poisoned");
+            inner
+                .map
+                .iter()
+                .map(|(k, (v, _))| (k.clone(), Arc::clone(v)))
+                .collect()
+        };
+        let entry_count = snapshot.len() as u64;
+        let mut writer = open_tmp_writer(path)?;
+        write_file_header(&mut writer, MAGIC_V2, entry_count)?;
+        for (i, (key, entry)) in snapshot.iter().enumerate() {
+            write_chtkey(&mut writer, key)?;
+            // bucket_count (u32) + bucket_index pairs (u16 + u32 each).
+            let bucket_count = u32::try_from(entry.bucket_index.len()).unwrap_or(u32::MAX);
+            writer.write_all(&bucket_count.to_le_bytes())?;
+            for (high16, word_offset) in &entry.bucket_index {
+                writer.write_all(&high16.to_le_bytes())?;
+                writer.write_all(&word_offset.to_le_bytes())?;
+            }
+            // uncompressed_bytes (= total_words * 4).
+            let uncompressed_bytes = (entry.total_words as u64).saturating_mul(4);
+            writer.write_all(&uncompressed_bytes.to_le_bytes())?;
+            // Stage the device buffer back to host then write.
+            let mut host_staging: Vec<u32> = vec![0u32; entry.total_words];
+            let bytes = entry.total_words * 4;
+            // SAFETY: entry.d_buckets points to `bytes` of device
+            // memory owned by this Arc; host_staging holds `bytes`
+            // of valid host memory.
+            let rc = unsafe {
+                cudaMemcpy(
+                    host_staging.as_mut_ptr() as *mut c_void,
+                    entry.d_buckets as *const c_void,
+                    bytes,
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                )
+            };
+            if rc != CUDA_SUCCESS {
+                return Err(DumpError::Cuda {
+                    entry_index: i as u64,
+                    bytes,
+                    code: rc,
+                });
+            }
+            // bytemuck-free byte view: u32 staging vec → byte slice.
+            let byte_view = unsafe {
+                std::slice::from_raw_parts(
+                    host_staging.as_ptr() as *const u8,
+                    bytes,
+                )
+            };
+            writer.write_all(byte_view)?;
+        }
+        write_file_trailer(&mut writer)?;
+        finalise_atomic_write(writer, path)?;
+        Ok(entry_count)
+    }
+
+    /// Load entries from `<path>` into this cache. For each entry
+    /// read from disk, allocates a fresh device buffer via
+    /// `cudaMalloc`, stages the uncompressed bytes back to device
+    /// via `cudaMemcpyHostToDevice`, and inserts under the parsed
+    /// [`ChtKey`].
+    ///
+    /// Per-entry CUDA failures are skipped (the dump's other
+    /// entries continue loading); structural failures
+    /// (magic / version / trailer) fail loud via
+    /// [`super::persist::LoadError`]. Returns the number of
+    /// entries successfully installed.
+    pub fn load_from_path(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<u64, super::persist::LoadError> {
+        use super::persist::{
+            open_reader, read_and_validate_file_header,
+            read_and_validate_file_trailer, read_chtkey, read_exact_or_truncated,
+            read_u16_le, read_u32_le, read_u64_le, MAGIC_V2,
+        };
+        let mut reader = open_reader(path)?;
+        let entry_count = read_and_validate_file_header(&mut reader, MAGIC_V2)?;
+        let mut loaded: u64 = 0;
+        for i in 0..entry_count {
+            let key = read_chtkey(&mut reader, i)?;
+            let bucket_count = read_u32_le(&mut reader)? as usize;
+            let mut bucket_index: Vec<(u16, u32)> = Vec::with_capacity(bucket_count);
+            for _ in 0..bucket_count {
+                let high16 = read_u16_le(&mut reader)?;
+                let word_offset = read_u32_le(&mut reader)?;
+                bucket_index.push((high16, word_offset));
+            }
+            let uncompressed_bytes = read_u64_le(&mut reader)? as usize;
+            let body = read_exact_or_truncated(&mut reader, uncompressed_bytes)?;
+            // Cross-check: total_words derived from bucket_count
+            // must match the uncompressed_bytes; mismatched dumps
+            // are skipped (structural inconsistency without being
+            // truncated).
+            let expected_bytes = bucket_count * BITMAP_CONTAINER_WORDS * 4;
+            if expected_bytes != uncompressed_bytes {
+                continue;
+            }
+            // Allocate device buffer + copy H2D.
+            let mut d_buckets: *mut c_void = null_mut();
+            // SAFETY: cudaMalloc writes the device pointer on success.
+            let rc = unsafe { cudaMalloc(&mut d_buckets, uncompressed_bytes) };
+            if rc != CUDA_SUCCESS {
+                continue; // Skip; budget pressure or device full.
+            }
+            // SAFETY: d_buckets is a valid device buffer of
+            // uncompressed_bytes; body.as_ptr() holds the right
+            // bytes.
+            let rc = unsafe {
+                cudaMemcpy(
+                    d_buckets,
+                    body.as_ptr() as *const c_void,
+                    uncompressed_bytes,
+                    cudaMemcpyKind::cudaMemcpyHostToDevice,
+                )
+            };
+            if rc != CUDA_SUCCESS {
+                // Defensive cleanup.
+                // SAFETY: just allocated above.
+                unsafe {
+                    let _ = cudaFree(d_buckets);
+                }
+                continue;
+            }
+            let entry = VramTermEntry {
+                d_buckets: d_buckets as *mut u32,
+                bucket_index,
+                total_words: bucket_count * BITMAP_CONTAINER_WORDS,
+            };
+            // Install via the standard LRU eviction path so budget
+            // accounting stays consistent.
+            let entry_bytes = (entry.total_words as u64).saturating_mul(4);
+            if entry_bytes > self.budget_bytes {
+                // The dump was written under a larger budget than
+                // this process; drop the entry cleanly (Drop runs
+                // cudaFree).
+                drop(entry);
+                continue;
+            }
+            let mut inner = self.inner.lock().expect("VramCht mutex poisoned");
+            let next_token = inner.next_token + 1;
+            if inner.map.contains_key(&key) {
+                // Already cached — race against another loader, or
+                // duplicate dump entry; drop ours.
+                drop(inner);
+                drop(entry);
+                continue;
+            }
+            // Evict to fit.
+            while inner.current_bytes + entry_bytes > self.budget_bytes
+                && !inner.map.is_empty()
+            {
+                let oldest_key = inner
+                    .map
+                    .iter()
+                    .min_by_key(|(_, (_, t))| *t)
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest_key {
+                    if let Some((evicted_value, _)) = inner.map.remove(&k) {
+                        let evicted_bytes = evicted_value.total_bytes() as u64;
+                        inner.current_bytes =
+                            inner.current_bytes.saturating_sub(evicted_bytes);
+                        self.evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    break;
+                }
+            }
+            inner.next_token = next_token;
+            inner.current_bytes += entry_bytes;
+            inner.map.insert(key, (Arc::new(entry), next_token));
+            self.inserts.fetch_add(1, Ordering::Relaxed);
+            loaded += 1;
+        }
+        read_and_validate_file_trailer(&mut reader)?;
+        Ok(loaded)
+    }
 }
 
 // ============================================================
@@ -926,6 +1138,182 @@ mod tests {
             assert!(inserted);
             assert!(cht.get(&key).is_some());
         }
+    }
+
+    // ========================================================
+    // Phase 2 D-5 — v2 dump/load roundtrip tests
+    // ========================================================
+
+    #[test]
+    fn vram_cht_v2_dump_then_load_roundtrip_byte_equal() {
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v2.bin");
+
+        // Populate source cache with 3 entries.
+        let src = VramCht::with_budget(256 * 1024 * 1024);
+        let entries = vec![
+            (
+                dummy_key(0xAAAA, 0x1111_2222_3333_4444),
+                small_roaring(),
+            ),
+            (
+                dummy_key(0xBBBB, 0x5555_6666_7777_8888),
+                dense_roaring(0),
+            ),
+            (
+                dummy_key(0xCCCC, 0x9999_AAAA_BBBB_CCCC),
+                dense_roaring(1),
+            ),
+        ];
+        for (k, rp) in &entries {
+            src.insert(k.clone(), rp).unwrap();
+        }
+        let n_dumped = src.dump_to_path(&path).unwrap();
+        assert_eq!(n_dumped, entries.len() as u64);
+        assert!(path.exists());
+        // Capture per-entry (bucket_index, total_words, host bytes)
+        // for byte-equal comparison post-load. We round-trip the
+        // device buffer back to host once per source entry now so
+        // we can verify the loader produced an identical buffer.
+        let mut expected_bytes: Vec<(usize, Vec<u32>)> = Vec::with_capacity(entries.len());
+        for (k, _) in &entries {
+            let e = src.get(k).expect("src entry must hit");
+            let mut staging = vec![0u32; e.total_words];
+            let bytes = e.total_words * 4;
+            let rc = unsafe {
+                cudaMemcpy(
+                    staging.as_mut_ptr() as *mut c_void,
+                    e.device_ptr() as *const c_void,
+                    bytes,
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                )
+            };
+            assert_eq!(rc, CUDA_SUCCESS, "src D→H must succeed");
+            expected_bytes.push((e.total_words, staging));
+        }
+
+        // Fresh cache; load; per-key byte-equal.
+        let dst = VramCht::with_budget(256 * 1024 * 1024);
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, entries.len() as u64);
+        for ((k, _), (expected_words, expected_buf)) in
+            entries.iter().zip(expected_bytes.iter())
+        {
+            let got = dst.get(k).expect("loaded entry must hit");
+            assert_eq!(got.total_words(), *expected_words);
+            let mut staging = vec![0u32; got.total_words()];
+            let bytes = got.total_words() * 4;
+            let rc = unsafe {
+                cudaMemcpy(
+                    staging.as_mut_ptr() as *mut c_void,
+                    got.device_ptr() as *const c_void,
+                    bytes,
+                    cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                )
+            };
+            assert_eq!(rc, CUDA_SUCCESS, "dst D→H must succeed");
+            assert_eq!(
+                &staging, expected_buf,
+                "loaded device buffer must be byte-equal to dumped"
+            );
+        }
+    }
+
+    #[test]
+    fn vram_cht_v2_restart_simulation_first_query_hits() {
+        // Phase 2 D-5 acceptance gate: after dump + restart
+        // simulation (= fresh VramCht) + load, the FIRST query for
+        // a previously-cached key must observe a hit. v2 specific:
+        // the loaded entry must be queryable identically to a
+        // freshly-inserted entry (kernel scatter consumes the
+        // device buffer via Arc, not the Cht itself).
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v2_restart.bin");
+
+        let original = VramCht::with_budget(64 * 1024 * 1024);
+        let k1 = dummy_key(0xCAFE, 0xBABE_0001);
+        let k2 = dummy_key(0xCAFE, 0xBABE_0002);
+        original.insert(k1.clone(), &small_roaring()).unwrap();
+        original.insert(k2.clone(), &dense_roaring(0)).unwrap();
+        original.dump_to_path(&path).unwrap();
+
+        let restarted = VramCht::with_budget(64 * 1024 * 1024);
+        let pre = restarted.stats();
+        assert_eq!(pre.hits, 0);
+        assert_eq!(pre.entries, 0);
+
+        let loaded = restarted.load_from_path(&path).unwrap();
+        assert_eq!(loaded, 2, "load installs both entries");
+        let post_load = restarted.stats();
+        assert_eq!(post_load.entries, 2);
+
+        // Acceptance gate.
+        let got = restarted.get(&k1);
+        assert!(got.is_some(), "first-query-post-restart hits");
+        let post_query = restarted.stats();
+        assert_eq!(post_query.hits, 1);
+        assert_eq!(post_query.misses, 0);
+
+        // The device pointer is non-null (the Arc owns a freshly-
+        // allocated buffer); bucket_index matches the source layout.
+        let entry = got.unwrap();
+        assert!(!entry.device_ptr().is_null());
+        assert!(entry.bucket_count() >= 1);
+    }
+
+    #[test]
+    fn vram_cht_v2_load_wrong_magic_rejected() {
+        if !cuda_available() {
+            return;
+        }
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v2.bin");
+        // Write v3-magic file.
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&super::super::persist::MAGIC_V3.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::WIRE_VERSION.to_le_bytes())
+            .unwrap();
+        f.write_all(&super::super::persist::HASH_FN_FXHASHER_V1.to_le_bytes())
+            .unwrap();
+        f.write_all(&0u64.to_le_bytes()).unwrap();
+        f.write_all(&0u32.to_le_bytes()).unwrap();
+        f.write_all(&super::super::persist::MAGIC_END.to_le_bytes())
+            .unwrap();
+        drop(f);
+
+        let dst = VramCht::with_budget(64 * 1024 * 1024);
+        let err = dst.load_from_path(&path).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::super::persist::LoadError::WrongMagic { .. }
+            ),
+            "v3 file at v2 path must reject as WrongMagic, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vram_cht_v2_dump_empty_cache_roundtrips() {
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v2_empty.bin");
+        let src = VramCht::with_budget(64 * 1024 * 1024);
+        let n = src.dump_to_path(&path).unwrap();
+        assert_eq!(n, 0);
+        let dst = VramCht::with_budget(64 * 1024 * 1024);
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, 0);
+        assert_eq!(dst.stats().entries, 0);
     }
 
     #[test]

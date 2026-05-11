@@ -3215,4 +3215,158 @@ mod tests {
             .collect();
         assert_eq!(vals, vec![6u64, 7, 8, 9, 10]);
     }
+
+    /// **Wave 21 byte-equivalence guard.**
+    ///
+    /// With `with_assume_all_matched()` set on an `AllQuery` against a
+    /// no-deletes index, `collect_segment` skips the per-doc walk that
+    /// populates `matched_bitset` and harvests the cursor directly.
+    /// Pins that the fruit is byte-identical to the standard walked
+    /// path — same top-K docs, same sort-value tuples, same order — so
+    /// future refactors of the shortcut path don't silently drift from
+    /// the baseline.
+    #[test]
+    fn wave_21_assume_all_matched_byte_equivalent_no_deletes() {
+        use crate::index::IndexSortByField;
+        use crate::schema::{Schema, FAST, INDEXED, STORED};
+        use crate::{Index, IndexBuilder, IndexSettings};
+
+        let mut sb = Schema::builder();
+        let ts = sb.add_i64_field("ts", FAST | INDEXED | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "ts".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().expect("writer_for_tests");
+        for v in [100i64, 30, 200, 5, 75] {
+            writer.add_document(doc!(ts => v)).unwrap();
+        }
+        writer.commit().unwrap();
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        // Premise: single segment with no deletes — the per-segment
+        // guard's `alive_bitset().is_none()` passes, so the shortcut
+        // actually fires.
+        assert_eq!(searcher.segment_readers().len(), 1);
+        assert!(
+            searcher.segment_reader(0).alive_bitset().is_none(),
+            "no-deletes premise broken"
+        );
+
+        let baseline =
+            EarlyTermSortByCursorCollectorMulti::new(vec![("ts", Order::Desc)], 10);
+        let shortcut =
+            EarlyTermSortByCursorCollectorMulti::new(vec![("ts", Order::Desc)], 10)
+                .with_assume_all_matched();
+
+        let baseline_hits = searcher
+            .search(&crate::query::AllQuery, &baseline)
+            .expect("baseline search");
+        let shortcut_hits = searcher
+            .search(&crate::query::AllQuery, &shortcut)
+            .expect("shortcut search");
+
+        assert_eq!(
+            shortcut_hits, baseline_hits,
+            "Wave 21 shortcut fruit must byte-equal the standard walked fruit"
+        );
+        // Sanity: 5 docs, DESC ts → values (200, 100, 75, 30, 5) →
+        // docs (2, 0, 4, 1, 3).
+        let docs: Vec<u32> = shortcut_hits.iter().map(|(_, a)| a.doc_id).collect();
+        assert_eq!(docs, vec![2u32, 0, 4, 1, 3]);
+    }
+
+    /// **Wave 21 safety guard.**
+    ///
+    /// `with_assume_all_matched()` is only safe on segments without
+    /// deletes — the per-segment check in `for_segment` downgrades the
+    /// flag to `false` when `reader.alive_bitset().is_some()`, which
+    /// reverts the segment to the standard walked path so the deleted
+    /// docs are correctly excluded. Pins that an `assume_all_matched`
+    /// collector against an index with deletes returns the same fruit
+    /// as the standard walked collector, NOT the deleted docs that the
+    /// shortcut would emit if the guard were absent.
+    #[test]
+    fn wave_21_assume_all_matched_safe_with_deletes() {
+        use crate::index::IndexSortByField;
+        use crate::schema::{Schema, FAST, INDEXED, STORED};
+        use crate::{Index, IndexBuilder, IndexSettings, Term};
+
+        let mut sb = Schema::builder();
+        let ts = sb.add_i64_field("ts", FAST | INDEXED | STORED);
+        let id = sb.add_i64_field("id", INDEXED | STORED);
+        let schema = sb.build();
+        let settings = IndexSettings {
+            sort_by_fields: Some(vec![IndexSortByField {
+                field: "ts".to_string(),
+                order: Order::Desc,
+            }]),
+            ..Default::default()
+        };
+        let index: Index = IndexBuilder::default()
+            .schema(schema)
+            .settings(settings)
+            .create_in_ram()
+            .unwrap();
+        let mut writer = index.writer_for_tests().expect("writer_for_tests");
+        // Disable merge so deletes stay in the same segment whose
+        // cursor we built — merging would either drop the cursor or
+        // rebuild it without the deleted docs, defeating the test.
+        writer.set_merge_policy(Box::new(crate::indexer::NoMergePolicy));
+        for (i, v) in [100i64, 30, 200, 5, 75].iter().enumerate() {
+            writer
+                .add_document(doc!(ts => *v, id => i as i64))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        // Delete docs with id=2 (ts=200, the top hit) and id=1
+        // (ts=30, a middle hit) — a missing guard would surface them
+        // back into the fruit.
+        writer.delete_term(Term::from_field_i64(id, 2));
+        writer.delete_term(Term::from_field_i64(id, 1));
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        assert!(
+            searcher.segment_reader(0).alive_bitset().is_some(),
+            "with-deletes premise broken"
+        );
+
+        let baseline =
+            EarlyTermSortByCursorCollectorMulti::new(vec![("ts", Order::Desc)], 10);
+        let shortcut =
+            EarlyTermSortByCursorCollectorMulti::new(vec![("ts", Order::Desc)], 10)
+                .with_assume_all_matched();
+
+        let baseline_hits = searcher
+            .search(&crate::query::AllQuery, &baseline)
+            .expect("baseline search w/ deletes");
+        let shortcut_hits = searcher
+            .search(&crate::query::AllQuery, &shortcut)
+            .expect("shortcut search w/ deletes");
+
+        assert_eq!(
+            shortcut_hits, baseline_hits,
+            "Wave 21 shortcut must match baseline when segment has deletes \
+             — the per-segment guard downgrades the flag to false"
+        );
+        // Surviving docs: ts values (100, 75, 5) → docs (0, 4, 3).
+        let docs: Vec<u32> = shortcut_hits.iter().map(|(_, a)| a.doc_id).collect();
+        assert_eq!(
+            docs,
+            vec![0u32, 4, 3],
+            "deleted docs (id=2 ts=200, id=1 ts=30) must NOT appear"
+        );
+    }
 }

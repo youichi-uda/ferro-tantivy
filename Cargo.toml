@@ -300,3 +300,7 @@ harness = false
 [[bench]]
 name = "bool_and_query_path"
 harness = false
+
+[[example]]
+name = "promote_v2_to_v3_dense_bench"
+required-features = ["gpu", "ferro-compress", "cuda-bitmap-kernel"]

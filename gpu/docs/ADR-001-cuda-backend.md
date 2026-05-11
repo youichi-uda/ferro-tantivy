@@ -317,6 +317,44 @@ post-correction.
   cargo bench -p tantivy-gpu --features cuda-tensor-core --bench binary_distance
   ```
 
+## Update log
+
+### 2026-05-11 — re-bench refresh
+
+`gpu/benches/data/cuda_*.json` files were refreshed by running
+`cargo bench -p tantivy-gpu --bench binary_distance --features
+cuda-tensor-core` on the same host (RTX 4070 Ti SUPER, driver
+595.58.03, rustc 1.95.0, Vulkan WGSL backend).  The historical
+2026-05-10 timing tables in the §Phase 4 / Phase 5 / BMMA sections
+above are **NOT** in-place updated — they record the ADR's
+acceptance-state numbers.
+
+The 2026-05-11 raw timings are preserved in two locations:
+
+* `gpu/benches/data/cuda_{vs_wgsl,cached_vs_wgsl,doublebuf,bmma_vs_int8}.json`
+  — the live snapshot consumed by the criterion bench harness.
+* `reports/cuda-backend-bench-2026-05-11/` — a frozen evidence bundle
+  (README with host info + 4 JSON copies + full 75-line bench.log)
+  that the live snapshot mirrors at the time of refresh.
+
+Shape-level deltas vs the 2026-05-10 snapshot the historical tables
+above were sampled from (within bench-to-bench noise on a contended
+desktop; the headline qualitative claims hold):
+
+* WGSL vs CUDA (1 M × Q=64 cold): 89.35 ms → cold path migrated to
+  `cuda_cached_vs_wgsl.json` (`cuda_cached_ns=73.45 ms,
+  cuda_pinned_ns=27.22 ms`, vs WGSL 253.26 ms → pinned 9.30×
+  speedup; was 8.50× / 6.19× on the smaller shapes).
+* BMMA vs INT8 at 1 M × Q=64: INT8 79.20 ms → **97.13 ms**,
+  BMMA 63.23 ms → **79.38 ms**, speedup 1.25× → **1.22×**
+  (within noise; BMMA continues to lead).
+* Double-buffer at B=10 Q=64 N=1 M: serial 272.37 ms / doublebuf
+  206.13 ms / 1.32×.
+
+When evaluating production claims, prefer the live JSON snapshot —
+or the dated `reports/<date>/` bundle if reproducibility against a
+specific bench day is required.
+
 ## Reference
 
 - Wave 4 verdict: `~/git/Inferentia2/ferro-knn-inf2/reports/g1-final-verdict-with-direct-l4.md`

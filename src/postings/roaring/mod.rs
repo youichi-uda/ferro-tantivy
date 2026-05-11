@@ -415,10 +415,34 @@ mod tests {
     // Wave Z-1 #1 — segment-warm hook tests
     // ============================================================
 
+    // Wave Z-3 #5 — test isolation guard. The two warm-hook tests
+    // both mutate the process-global toggle
+    // (`set_segment_warm_on_open`) and observe the process-global
+    // host CHT (`cht::global()`). Cargo's default test harness runs
+    // tests in this module in parallel, so without a serialisation
+    // primitive the toggle-on test can flip the toggle just before
+    // the toggle-off test snapshots `stats_after` — and the warm
+    // path silently fires under the wrong toggle. We avoid pulling
+    // in `serial_test` (no new crate dependency) by guarding the
+    // critical section with a local mutex.
+    //
+    // Any test that
+    // (a) writes to `SEGMENT_WARM_ON_OPEN` or
+    // (b) inspects `cht::global().stats()`
+    // must `let _g = WARM_TEST_LOCK.lock().unwrap();` at the top to
+    // hold this lock for its whole duration.
+    use std::sync::Mutex;
+    static WARM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// The toggle must default to *off*. Existing deployments retain
     /// bytewise-identical behaviour until they opt in.
     #[test]
     fn segment_warm_on_open_defaults_off() {
+        // Wave Z-3 #5 — serialise with sibling warm-hook tests; we
+        // mutate the process-global toggle.
+        let _g = WARM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // NB: a previous test in this binary could have flipped the
         // toggle to true. Restore the documented default after we read
         // it. We cannot assert *the initial value* portably for this
@@ -436,6 +460,11 @@ mod tests {
     /// `segment_warm_on_open`. Idempotent across repeated stores.
     #[test]
     fn segment_warm_on_open_setter_round_trip() {
+        // Wave Z-3 #5 — serialise with sibling warm-hook tests; we
+        // mutate the process-global toggle.
+        let _g = WARM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let saved = segment_warm_on_open();
         set_segment_warm_on_open(true);
         assert!(segment_warm_on_open());
@@ -456,6 +485,17 @@ mod tests {
     fn warm_segment_v3_noop_when_disabled() {
         use crate::index::Index;
         use crate::schema::{Schema, TEXT};
+
+        // Wave Z-3 #5 — serialise with sibling warm-hook tests; we
+        // mutate the process-global toggle and observe host CHT
+        // stats. Without this guard, the sibling
+        // `warm_segment_v3_populates_v1_cache_when_enabled` test
+        // can flip the toggle to *true* concurrently and our
+        // `warm_segment_v3` call below would suddenly start
+        // inserting under a stale `toggle=false` assertion.
+        let _g = WARM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let saved = segment_warm_on_open();
         set_segment_warm_on_open(false);
@@ -479,7 +519,15 @@ mod tests {
         // stub; the call itself must not panic or otherwise misbehave.
         #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
         {
+            // Wave Z-3 #5 — reset host CHT for ordering-safe runs.
+            // The toggle-off branch's assertion is "stats unchanged
+            // by warm call". Reset *after* writer commit + reader
+            // construction (those steps may touch the host CHT via
+            // the segment open path); resetting beforehand would be
+            // overwritten and the before-snapshot would still
+            // contain whatever those steps inserted.
             let cht = cht::global();
+            cht.reset();
             let stats_before = cht.stats();
             warm_segment_v3(&segment_reader);
             let stats_after = cht.stats();
@@ -508,11 +556,34 @@ mod tests {
     /// Gated on the feature stack — the host CHT module
     /// (`super::cht`) is itself cfg-gated, so this test only compiles
     /// when v3 is available.
+    ///
+    /// Wave Z-3 #5 — test isolation: the host CHT is a process-global
+    /// singleton (`cht::global()`), so other tests in the same binary
+    /// may have already drained the same common test tokens
+    /// (`alpha`/`beta`/`gamma`/...) and populated the cache. Without
+    /// a reset, the `warm_segment_v3` body short-circuits on each
+    /// already-cached key (see `mod.rs::warm_segment_v3` "Skip if v1
+    /// already has this entry" branch) and the insert counter does
+    /// NOT grow by 5 — the assertion below would observe
+    /// `before == after`. We call [`cht::Cht::reset`] up front to
+    /// force a clean slate; this is the documented test-only entry
+    /// point on the host CHT.
     #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
     #[test]
     fn warm_segment_v3_populates_v1_cache_when_enabled() {
         use crate::index::Index;
         use crate::schema::{Schema, TEXT};
+
+        // Wave Z-3 #5 — serialise with sibling warm-hook tests; we
+        // both mutate the process-global toggle AND inspect the
+        // host CHT's `inserts` counter. Without this guard a
+        // sibling test could flip the toggle off between our
+        // `set_segment_warm_on_open(true)` and the `warm_segment_v3`
+        // call, turning the body into a silent no-op and the
+        // inserts-grew-by-≥5 assertion would flake.
+        let _g = WARM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let saved = segment_warm_on_open();
         set_segment_warm_on_open(true);
@@ -535,7 +606,21 @@ mod tests {
         let reader = index.reader().unwrap();
         let segment_reader = reader.searcher().segment_reader(0).clone();
 
+        // Wave Z-3 #5 — reset host CHT global state for ordering-
+        // safe runs. Reset is performed *after* the writer commit
+        // and reader/segment_reader construction: those steps may
+        // touch the host CHT via the segment open path (e.g.
+        // implicit `warm_segment_v3` invocations or other cache
+        // priming routines triggered by `index.reader()`), so a
+        // reset *before* setup would be overwritten and the
+        // before-snapshot would still observe non-zero inserts for
+        // already-cached test terms (`alpha`/`beta`/...) populated
+        // by sibling tests. Resetting right before the snapshot
+        // gives the inserts-delta assertion below a stable
+        // baseline of zero.
         let cht = cht::global();
+        cht.reset();
+
         let inserts_before = cht.stats().inserts;
         warm_segment_v3(&segment_reader);
         let inserts_after = cht.stats().inserts;

@@ -240,6 +240,13 @@ pub struct VramCompressedChtStats {
     /// Cumulative v2→v3 promotions (subset of `inserts` driven by
     /// dispatch-layer promotion, rather than direct insert).
     pub promotions: u64,
+    /// Cumulative successful [`VramCompressedCht::promote_v2_to_v3`]
+    /// calls — strict subset of [`Self::promotions`] that excludes
+    /// legacy [`VramCompressedCht::promote`] (re-drain) admissions.
+    /// Bumped only when the cross-tier device→device compress path
+    /// fires; lets dispatch-path tests pin the new wiring branch
+    /// byte-for-byte vs the legacy `promote(roaring)` fallback.
+    pub cross_tier_promotions: u64,
     /// Sum of `compressed_bytes` for all currently-cached entries
     /// (= the actual VRAM footprint, what the budget bounds).
     pub current_bytes: u64,
@@ -289,6 +296,7 @@ pub struct VramCompressedCht {
     inserts: AtomicU64,
     evictions: AtomicU64,
     promotions: AtomicU64,
+    cross_tier_promotions: AtomicU64,
 }
 
 struct VramCompressedChtInner {
@@ -330,6 +338,7 @@ impl VramCompressedCht {
             inserts: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             promotions: AtomicU64::new(0),
+            cross_tier_promotions: AtomicU64::new(0),
         })
     }
 
@@ -513,10 +522,14 @@ impl VramCompressedCht {
     ///
     /// ## Returns
     /// - `Ok(true)` on successful insertion (admission policy + LRU
-    ///   eviction performed; promotions counter bumped).
+    ///   eviction performed; both [`VramCompressedChtStats::promotions`]
+    ///   and the strict-subset
+    ///   [`VramCompressedChtStats::cross_tier_promotions`] counter
+    ///   bumped).
     /// - `Ok(false)` on rejection: kill-switch active OR the
     ///   compressed entry would alone exceed `budget_bytes` OR the
-    ///   key is already cached (idempotent re-promote).
+    ///   key is already cached (idempotent re-promote). Neither
+    ///   counter is bumped.
     /// - `Err(VramCompressedChtError)` on CUDA / Bitcomp failure.
     ///
     /// ## Lifetime / safety
@@ -693,6 +706,8 @@ impl VramCompressedCht {
             .insert(key.clone(), (Arc::new(entry), next_token));
         self.inserts.fetch_add(1, Ordering::Relaxed);
         self.promotions.fetch_add(1, Ordering::Relaxed);
+        self.cross_tier_promotions
+            .fetch_add(1, Ordering::Relaxed);
         // Drop the inner lock before returning so the caller doesn't
         // hold it any longer than necessary.
         drop(inner);
@@ -720,6 +735,7 @@ impl VramCompressedCht {
             inserts: self.inserts.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             promotions: self.promotions.load(Ordering::Relaxed),
+            cross_tier_promotions: self.cross_tier_promotions.load(Ordering::Relaxed),
             current_bytes,
             budget_bytes: self.budget_bytes,
             entries,
@@ -742,6 +758,7 @@ impl VramCompressedCht {
         self.inserts.store(0, Ordering::Relaxed);
         self.evictions.store(0, Ordering::Relaxed);
         self.promotions.store(0, Ordering::Relaxed);
+        self.cross_tier_promotions.store(0, Ordering::Relaxed);
     }
 
     /// Budget configured at construction.
@@ -1900,5 +1917,106 @@ mod tests {
             "uncompressed_bytes must match"
         );
         assert_eq!(legacy_entry.bucket_count(), promote_entry.bucket_count());
+    }
+
+    // ========================================================
+    // Wave Z-4 #1 — cross_tier_promotions dedicated counter
+    // ========================================================
+
+    #[test]
+    fn legacy_promote_does_not_increment_cross_tier_promotions() {
+        // Legacy `promote(roaring)` (re-drain path) bumps the
+        // generic `promotions` counter but must NOT bump the
+        // strict-subset `cross_tier_promotions` counter — that
+        // counter is reserved for `promote_v2_to_v3`'s device→device
+        // path. This is the key invariant Wave Z-4 #1 establishes.
+        if !cuda_available() {
+            return;
+        }
+        let cht = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let key = dummy_key(0xc4_4ee5, 100);
+        let inserted = cht.promote(key, &small_roaring()).unwrap();
+        assert!(inserted);
+        let stats = cht.stats();
+        assert_eq!(stats.promotions, 1);
+        assert_eq!(
+            stats.cross_tier_promotions, 0,
+            "legacy promote(roaring) must not bump the cross-tier counter"
+        );
+    }
+
+    #[test]
+    fn promote_v2_to_v3_increments_cross_tier_promotions() {
+        // Successful cross-tier promote bumps BOTH `promotions` and
+        // the dedicated `cross_tier_promotions` counter by exactly
+        // 1. Re-promote of the same key (idempotent short-circuit)
+        // does not bump either.
+        if !cuda_available() {
+            return;
+        }
+        let v3 = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let rp = small_roaring();
+        let (_v2, key, v2_entry) = populate_v2(&rp);
+
+        let pre = v3.stats();
+        assert_eq!(pre.cross_tier_promotions, 0);
+
+        let first = v3.promote_v2_to_v3(&key, Arc::clone(&v2_entry)).unwrap();
+        assert!(first);
+        let after_first = v3.stats();
+        assert_eq!(after_first.promotions, 1);
+        assert_eq!(after_first.cross_tier_promotions, 1);
+
+        // Idempotent re-promote: short-circuits, neither counter
+        // moves.
+        let second = v3.promote_v2_to_v3(&key, Arc::clone(&v2_entry)).unwrap();
+        assert!(!second);
+        let after_second = v3.stats();
+        assert_eq!(after_second.promotions, 1);
+        assert_eq!(after_second.cross_tier_promotions, 1);
+    }
+
+    #[test]
+    fn promote_v2_to_v3_rejection_keeps_cross_tier_counter_zero() {
+        // Admission rejection (compressed entry > budget) takes the
+        // pre-install drop path and must NOT bump either counter.
+        // This mirrors the existing
+        // `promote_v2_to_v3_rejection_for_oversize_entry` test but
+        // pins the new counter explicitly.
+        if !cuda_available() {
+            return;
+        }
+        let rp = dense_roaring(0);
+        let probe = VramCompressedCht::with_budget(1 << 30).unwrap();
+        let pkey = dummy_key(0xfee, 100);
+        probe.insert(pkey, &rp).unwrap();
+        let one_entry_compressed = probe.stats().compressed_bytes_total;
+        drop(probe);
+
+        let tight =
+            VramCompressedCht::with_budget(one_entry_compressed.saturating_sub(1).max(1)).unwrap();
+        let (_v2, key, v2_entry) = populate_v2(&rp);
+        let admitted = tight.promote_v2_to_v3(&key, v2_entry).unwrap();
+        assert!(!admitted);
+        let stats = tight.stats();
+        assert_eq!(stats.promotions, 0);
+        assert_eq!(stats.cross_tier_promotions, 0);
+    }
+
+    #[test]
+    fn reset_clears_cross_tier_promotions() {
+        // `reset()` must zero the new counter alongside the existing
+        // ones — confirms the field is wired into the test-only
+        // reset helper that dispatch-layer tests rely on.
+        if !cuda_available() {
+            return;
+        }
+        let v3 = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let rp = small_roaring();
+        let (_v2, key, v2_entry) = populate_v2(&rp);
+        v3.promote_v2_to_v3(&key, v2_entry).unwrap();
+        assert_eq!(v3.stats().cross_tier_promotions, 1);
+        v3.reset();
+        assert_eq!(v3.stats().cross_tier_promotions, 0);
     }
 }

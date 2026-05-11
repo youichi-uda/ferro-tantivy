@@ -859,19 +859,14 @@ mod tests {
     ///    cohort key) and `v3_entry.is_none()` (because we cleared v3),
     ///    so the new `promote_v2_to_v3` branch must fire for every
     ///    cohort member.
-    /// 5. Assert v3's `promotions` counter grew by ≥1 over the call.
-    ///    Combined with the pre-call invariant `v3.entries == 0`, this
-    ///    proves the wiring is exercised — there's no other code path
-    ///    that bumps `v3.promotions` while the v2 tier is hot.
-    ///
-    /// Limitations: the `promotions` counter is bumped by *both*
-    /// `promote(roaring)` and `promote_v2_to_v3`, so this test verifies
-    /// the wiring-reach contract (v3 promotion fires during a v2-hit-
-    /// but-v3-miss call) but does not byte-for-byte prove the new
-    /// kernel-side path was taken. The structural code inspection +
-    /// the Wave Z-2 #1 unit tests on `promote_v2_to_v3` itself cover
-    /// the "actual savings" half; this test pins the "the wiring is
-    /// reachable from the public query path" half.
+    /// 5. Assert v3's dedicated `cross_tier_promotions` counter grew
+    ///    by ≥1 over the call, AND every v3 promote during the call
+    ///    was a cross-tier promote (= `promotions` delta equals
+    ///    `cross_tier_promotions` delta). The dedicated counter is
+    ///    bumped **only** by [`crate::postings::roaring::vram_cht_v3::
+    ///    VramCompressedCht::promote_v2_to_v3`] (Wave Z-4 #1), so this
+    ///    is a byte-for-byte witness that the new wiring branch fired
+    ///    rather than the legacy `promote(roaring)` fallback.
     ///
     /// Skips on hosts without a working Bitcomp codec (v3 global is
     /// `None`) — same gate the sibling
@@ -945,6 +940,10 @@ mod tests {
             v3_stats_pre_b.promotions, 0,
             "v3 promotions counter must be zero after reset_global"
         );
+        assert_eq!(
+            v3_stats_pre_b.cross_tier_promotions, 0,
+            "v3 cross_tier_promotions counter must be zero after reset_global"
+        );
 
         // v2 must still hold the cohort keys for the wiring branch
         // to be reachable.
@@ -965,13 +964,30 @@ mod tests {
         );
         let v3_stats_after_b = v3_handle.stats();
         assert!(
-            v3_stats_after_b.promotions >= 1,
-            "v3 promotions must grow on the v2-hit-but-v3-miss call \
-             (Wave Z-3 #1 wiring proof). got promotions={} entries={} \
-             (v3 was reset to empty before this call; only the new \
-             wiring branch can bump promotions while v2 is hot)",
+            v3_stats_after_b.cross_tier_promotions >= 1,
+            "v3 cross_tier_promotions must grow on the v2-hit-but-v3-miss \
+             call (Wave Z-3 #1 wiring proof, strict via Wave Z-4 #1 \
+             dedicated counter). got cross_tier_promotions={} \
+             promotions={} entries={} (v3 was reset to empty before this \
+             call; only `promote_v2_to_v3` bumps the dedicated counter)",
+            v3_stats_after_b.cross_tier_promotions,
             v3_stats_after_b.promotions,
             v3_stats_after_b.entries,
+        );
+        // Strict invariant (Wave Z-4 #1): every v3 promote during
+        // call #2 must be a cross-tier promote. `promotions` is the
+        // sum of legacy `promote(roaring)` + `promote_v2_to_v3`
+        // admissions; if it exceeds `cross_tier_promotions`, the
+        // dispatch path silently fell back to the legacy re-drain
+        // for at least one cohort member, which would defeat the
+        // ~60ms savings premise of the new wiring.
+        assert_eq!(
+            v3_stats_after_b.promotions, v3_stats_after_b.cross_tier_promotions,
+            "every v3 promote during the v2-hit-but-v3-miss call must \
+             go through promote_v2_to_v3 (no legacy promote(roaring) \
+             fallback admitted while v2 was hot). got promotions={} \
+             cross_tier_promotions={}",
+            v3_stats_after_b.promotions, v3_stats_after_b.cross_tier_promotions,
         );
 
         // The wiring branch consumed *the same* Arc<VramTermEntry>

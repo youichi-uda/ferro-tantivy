@@ -133,6 +133,17 @@ fn merge(
         .map(|segment_entry| index.segment(segment_entry.meta().clone()))
         .collect();
 
+    // **FerroSearch Wave 18 follow-up (#8: in-memory hot reload).**
+    // Capture the effective settings (in-memory overlay if installed
+    // via `Index::set_settings_overlay`, otherwise persistent
+    // `Index::settings`) ONCE per merge so the physical reorder and
+    // the cursor-build decision below stay consistent within this
+    // merge even if an overlay swap races with us.  The overlay lets
+    // an operator rotate `sort.field` / `sort.fields` at runtime; the
+    // next merge will physically reorder + build cursors per the new
+    // shape, without re-opening the `Index`.
+    let effective_settings = index.effective_settings();
+
     // An IndexMerger is like a "view" of our merged segments.
     // Wave 15 Phase H-2: thread the index-time sort field through so
     // the merger physically reorders alive docs to match the sort.
@@ -142,7 +153,7 @@ fn merge(
     let merger: IndexMerger = IndexMerger::open_with_sort_by_field(
         index.schema(),
         &segments[..],
-        index.settings().sort_by_field.clone(),
+        effective_settings.sort_by_field.clone(),
     )?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
@@ -177,8 +188,8 @@ fn merge(
     // the missing cursor file but the merge hook itself was wrong.
     // `build_and_write_sort_cursors` already dispatches v2 when
     // `sort_by_fields` is set, so just widening the gate is enough.
-    let needs_cursor_rebuild = index.settings().sort_by_field.is_some()
-        || index.settings().sort_by_fields.is_some();
+    let needs_cursor_rebuild = effective_settings.sort_by_field.is_some()
+        || effective_settings.sort_by_fields.is_some();
     if needs_cursor_rebuild && num_docs > 0 {
         let mut merged_with_max = merged_segment.clone().with_max_doc(num_docs);
         let cursor_fields = crate::index::build_and_write_sort_cursors(&mut merged_with_max)?;
@@ -1424,6 +1435,160 @@ mod tests {
             fields,
             vec![("ts", Order::Desc), ("id", Order::Asc)],
             "v2 cursor must record both configured fields with their orders"
+        );
+
+        Ok(())
+    }
+
+    /// **FerroSearch Wave 18 follow-up #8 — in-memory hot reload.**
+    ///
+    /// `Index::set_settings_overlay` installs an in-memory
+    /// `IndexSettings` overlay that takes precedence over the
+    /// persistent `Index::settings` when `segment_updater::merge`
+    /// decides what cursor shape to build on the merged segment.
+    /// This test pins the contract by comparing two merges on the
+    /// same persistent settings: the first uses the persistent shape
+    /// (single-field "ts" cursor), the second uses an overlay that
+    /// widens the shape to two fields (`(ts, _id)`) — the merged
+    /// segment's cursor must record BOTH fields, proving the merge
+    /// path read the overlay rather than the static settings.
+    #[test]
+    fn test_merge_uses_settings_overlay_for_cursor_build_wave_18_8() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField, Order, SortCursorAny};
+
+        let mut schema_builder = Schema::builder();
+        let ts_field = schema_builder.add_i64_field("ts", FAST);
+        let id_field = schema_builder.add_i64_field("id", FAST);
+        let schema = schema_builder.build();
+
+        // Persistent settings: single-field `(ts, Desc)`.
+        let index = Index::builder()
+            .schema(schema.clone())
+            .settings(IndexSettings {
+                sort_by_fields: Some(vec![IndexSortByField {
+                    field: "ts".to_string(),
+                    order: Order::Desc,
+                }]),
+                ..Default::default()
+            })
+            .create_in_ram()?;
+
+        // Install the hot-reload overlay BEFORE the first commit so
+        // both segments — and the subsequent merge — see the widened
+        // two-field shape via `effective_settings()`.  The persistent
+        // `settings` field stays at its single-field value (a future
+        // restart without `rewrite_settings_on_disk` would fall back
+        // to the persistent shape).
+        index.set_settings_overlay(IndexSettings {
+            sort_by_fields: Some(vec![
+                IndexSortByField {
+                    field: "ts".to_string(),
+                    order: Order::Desc,
+                },
+                IndexSortByField {
+                    field: "id".to_string(),
+                    order: Order::Asc,
+                },
+            ]),
+            ..Default::default()
+        });
+
+        // Sanity-check the overlay is live + the persistent settings
+        // are unchanged.  This is the contract `effective_settings`
+        // promises and the merge path relies on.
+        let eff = index.effective_settings();
+        assert_eq!(
+            eff.sort_by_fields.as_ref().map(|v| v.len()),
+            Some(2),
+            "effective_settings must reflect the 2-field overlay"
+        );
+        assert_eq!(
+            index.settings().sort_by_fields.as_ref().map(|v| v.len()),
+            Some(1),
+            "persistent settings must NOT be mutated by set_settings_overlay"
+        );
+
+        // Two commits → at least 2 segments → in-place merge fires.
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter =
+                index.writer_for_tests()?;
+            writer.add_document(doc!(ts_field=>100i64, id_field=>3i64))?;
+            writer.add_document(doc!(ts_field=>100i64, id_field=>1i64))?;
+            writer.add_document(doc!(ts_field=>50i64, id_field=>2i64))?;
+            writer.commit()?;
+        }
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter =
+                index.writer_for_tests()?;
+            writer.add_document(doc!(ts_field=>200i64, id_field=>5i64))?;
+            writer.add_document(doc!(ts_field=>200i64, id_field=>4i64))?;
+            writer.commit()?;
+        }
+
+        // Force a single-segment merge to exercise the merge hook.
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter =
+                index.writer_for_tests()?;
+            let segment_ids = index.searchable_segment_ids()?;
+            assert!(
+                segment_ids.len() >= 2,
+                "test fixture should have at least 2 pre-merge segments, got {}",
+                segment_ids.len()
+            );
+            writer.merge(&segment_ids).wait()?;
+            writer.wait_merging_operations()?;
+        }
+
+        // The merged segment must advertise the cursor for the
+        // OVERLAY primary field — same shape as Wave 18-2 since the
+        // primary is "ts" in both — but the cursor file payload must
+        // record BOTH fields (proving the overlay drove the build).
+        let merged_segments = index.searchable_segments()?;
+        assert_eq!(merged_segments.len(), 1, "expected 1 merged segment");
+        let merged_meta = merged_segments[0].meta();
+        let advertised: Vec<&str> = merged_meta
+            .sort_cursor_fields()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            advertised,
+            vec!["ts"],
+            "merged segment must advertise the v2 cursor under its primary field name"
+        );
+
+        let segment = index.segment(merged_meta.clone());
+        let slice = segment.open_sort_cursor_read("ts")?;
+        let any = SortCursorAny::open(slice)?;
+        let cursor = match any {
+            SortCursorAny::V2(c) => c,
+            SortCursorAny::V1(_) => panic!(
+                "Wave 18-8 regression: merge hook wrote a v1 single-field cursor \
+                 despite the 2-field overlay — `effective_settings()` is not \
+                 being consulted on the cursor-build path"
+            ),
+        };
+        let fields: Vec<(&str, Order)> = cursor
+            .fields()
+            .iter()
+            .map(|(n, o, _)| (n.as_str(), *o))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![("ts", Order::Desc), ("id", Order::Asc)],
+            "Wave 18-8: merged-segment v2 cursor must record BOTH fields from \
+             the in-memory settings overlay, not the 1-field persistent shape"
+        );
+
+        // After clearing the overlay, `effective_settings` must
+        // revert to the persistent shape.  This pins the
+        // overlay-lifecycle contract (set / read / clear) end-to-end.
+        index.clear_settings_overlay();
+        let eff_after_clear = index.effective_settings();
+        assert_eq!(
+            eff_after_clear.sort_by_fields.as_ref().map(|v| v.len()),
+            Some(1),
+            "clear_settings_overlay must restore the persistent shape"
         );
 
         Ok(())

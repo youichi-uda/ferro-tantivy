@@ -1070,7 +1070,15 @@ pub fn build_and_write_sort_cursors(
 ) -> crate::Result<Vec<String>> {
     use common::TerminatingWrite;
 
-    let settings = segment.index().settings().clone();
+    // **FerroSearch Wave 18 follow-up (#8: in-memory hot reload).**
+    // Read the effective settings (in-memory overlay installed via
+    // `Index::set_settings_overlay`, otherwise persistent
+    // `Index::settings`) so the cursor's recorded `(field, order)`
+    // shape matches the live runtime sort config.  Without this hook
+    // the cursor would always reflect the persistent shape captured
+    // at index-open time, and a hot-reloaded `sort.fields` change
+    // would have no effect on post-overlay merges.
+    let settings = segment.index().effective_settings();
     let max_doc = segment.meta().max_doc();
     if max_doc == 0 {
         // An empty segment carries no doc ids; skip writing a cursor.

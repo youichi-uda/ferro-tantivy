@@ -286,6 +286,17 @@ pub struct Index {
     /// `commit()` updates this slot to the persisted meta so readers
     /// stay consistent with the on-disk manifest.
     soft_meta: Arc<ArcSwapOption<IndexMeta>>,
+    /// In-memory overlay on top of the persistent [`Self::settings`].
+    /// Populated by [`Self::set_settings_overlay`] to enable hot-reload
+    /// of `sort.field` / `sort.fields` without re-opening the directory
+    /// or blocking in-flight readers.  Consulted by
+    /// [`Self::effective_settings`], which is the read path used by
+    /// `segment_updater::merge`'s cursor-build decision — so subsequent
+    /// merges produce cursors that match the overlay shape.  The
+    /// persistent `settings` field is unchanged; operators must pair
+    /// the overlay with [`Self::rewrite_settings_on_disk`] for
+    /// restart-durability.
+    settings_overlay: Arc<ArcSwapOption<IndexSettings>>,
 }
 
 impl Index {
@@ -406,6 +417,7 @@ impl Index {
             executor: Executor::single_thread(),
             inventory,
             soft_meta: Arc::new(ArcSwapOption::empty()),
+            settings_overlay: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -435,6 +447,59 @@ impl Index {
     #[doc(hidden)]
     pub fn clear_soft_meta(&self) {
         self.soft_meta.store(None);
+    }
+
+    /// Returns the effective [`IndexSettings`] — the in-memory overlay
+    /// installed via [`Self::set_settings_overlay`] if any, otherwise
+    /// the persistent [`Self::settings`] captured at index-open time.
+    ///
+    /// This is the read path that `segment_updater::merge` consults
+    /// for the cursor-build decision, so callers can rotate the index
+    /// sort shape at runtime via [`Self::set_settings_overlay`]
+    /// without re-opening the directory or blocking in-flight readers.
+    /// Consumers that only need a single field can copy it out of the
+    /// returned snapshot; the call is cheap (one `ArcSwap` load + one
+    /// `IndexSettings` clone).
+    ///
+    /// **FerroSearch extension (Wave 18 follow-up #8: in-memory hot
+    /// reload).** Pairs with [`Self::rewrite_settings_on_disk`] for
+    /// restart-durability:
+    ///
+    /// 1. Validate the new settings + call `rewrite_settings_on_disk`
+    ///    so a restart picks up the new shape.
+    /// 2. Call `set_settings_overlay` so live
+    ///    `segment_updater::merge` decisions see the new shape
+    ///    without waiting for the restart.
+    /// 3. (Optional) Call
+    ///    `IndexWriter::backfill_sort_cursor_v2` so the existing
+    ///    segments advertise the new cursor shape immediately.
+    pub fn effective_settings(&self) -> IndexSettings {
+        self.settings_overlay
+            .load_full()
+            .map(|arc| (*arc).clone())
+            .unwrap_or_else(|| self.settings.clone())
+    }
+
+    /// Install an in-memory overlay on top of the persistent
+    /// [`Self::settings`].  See [`Self::effective_settings`] for the
+    /// read semantics.  Concurrent reads are safe — the underlying
+    /// `ArcSwapOption` provides lock-free atomic swap, so readers see
+    /// either the old or the new overlay, never a torn snapshot.
+    ///
+    /// The overlay only affects write-side decisions that go through
+    /// [`Self::effective_settings`] (currently
+    /// `segment_updater::merge`'s cursor-build path).  The persistent
+    /// [`Self::settings`] field is unchanged; restart-durability
+    /// requires pairing with [`Self::rewrite_settings_on_disk`].
+    pub fn set_settings_overlay(&self, overlay: IndexSettings) {
+        self.settings_overlay.store(Some(Arc::new(overlay)));
+    }
+
+    /// Remove the in-memory settings overlay (if any).  Subsequent
+    /// [`Self::effective_settings`] calls fall back to the persistent
+    /// [`Self::settings`].
+    pub fn clear_settings_overlay(&self) {
+        self.settings_overlay.store(None);
     }
 
     /// Setter for the tokenizer manager.

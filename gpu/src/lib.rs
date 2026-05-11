@@ -28,6 +28,7 @@ pub mod device;
 pub mod error;
 pub mod integration;
 pub mod kernel;
+pub mod posting;
 pub mod scorer;
 pub mod vector;
 

@@ -2465,6 +2465,62 @@ mod tests {
     }
 
     #[test]
+    fn terms_aggregation_no_missing_param_repro() -> crate::Result<()> {
+        // FerroSearch repro: 2 fields each with multi-field children
+        // (author.name+author.name.raw, foo+foo.keyword). Doc 1 only
+        // writes foo+foo.keyword; doc 0 + doc 2 write author.name+raw.
+        // Agg on author.name.raw should only count alice once, bob once.
+        use crate::indexer::UserOperation;
+        let mut schema_builder = Schema::builder();
+        let id_field = schema_builder.add_text_field("_id", crate::schema::STRING);
+        let author_name = schema_builder.add_text_field("author.name", FAST);
+        let author_raw = schema_builder.add_text_field("author.name.raw", FAST);
+        let foo = schema_builder.add_text_field("foo", FAST);
+        let foo_keyword = schema_builder.add_text_field("foo.keyword", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            let ops: Vec<UserOperation<crate::TantivyDocument>> = vec![
+                UserOperation::Delete(crate::Term::from_field_text(id_field, "a")),
+                UserOperation::Add(
+                    doc!(id_field => "a", author_name => "alice", author_raw => "alice"),
+                ),
+                UserOperation::Delete(crate::Term::from_field_text(id_field, "r1")),
+                UserOperation::Add(doc!(id_field => "r1", foo => "bar", foo_keyword => "bar")),
+                UserOperation::Delete(crate::Term::from_field_text(id_field, "b")),
+                UserOperation::Add(
+                    doc!(id_field => "b", author_name => "bob", author_raw => "bob"),
+                ),
+            ];
+            index_writer.run(ops)?;
+            index_writer.commit()?;
+        }
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "a": { "terms": { "field": "author.name.raw" } }
+        }))
+        .unwrap();
+        let res = exec_request_with_query(agg_req, &index, None)?;
+        let buckets = res["a"]["buckets"].as_array().unwrap();
+        eprintln!("REPRO buckets: {buckets:?}");
+        let mut alice_count = 0u64;
+        let mut bob_count = 0u64;
+        for b in buckets {
+            let key = b["key"].as_str().unwrap();
+            let count = b["doc_count"].as_u64().unwrap();
+            if key == "alice" {
+                alice_count = count;
+            }
+            if key == "bob" {
+                bob_count = count;
+            }
+        }
+        assert_eq!(alice_count, 1, "alice over-count: buckets = {buckets:?}");
+        assert_eq!(bob_count, 1, "bob count: buckets = {buckets:?}");
+        Ok(())
+    }
+
+    #[test]
     fn terms_aggregation_missing1() -> crate::Result<()> {
         let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", FAST);

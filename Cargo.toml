@@ -145,6 +145,15 @@ compare_hash_only = ["stacker/compare_hash_only"]
 # GPU-accelerated aggregation, scoring, and vector search
 gpu = ["tantivy-gpu"]
 
+# Phase 2 C-3 (Wave 5) Roaring posting list — ferro-compress Bitcomp
+# bridge. Off by default: the OSS fork builds standalone with the
+# passthrough `IdentityBitcompCodec`. Wave 6 (C-4) will add the
+# `path = "../../ferrosearch-gpu-compress/crates/ferro-compress"`
+# dependency and replace the short-circuiting `FerroBitcompCodec`
+# placeholder; until then this feature gate lets downstream crates
+# opt into the trait abstraction surface without wiring the dep.
+ferro-compress = []
+
 [workspace]
 members = [
     "query-grammar",
@@ -212,4 +221,12 @@ harness = false
 
 [[bench]]
 name = "regex_all_terms"
+harness = false
+
+[[bench]]
+name = "multithread_executor"
+harness = false
+
+[[bench]]
+name = "sort_simd"
 harness = false

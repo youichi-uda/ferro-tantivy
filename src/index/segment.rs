@@ -53,6 +53,18 @@ impl Segment {
         }
     }
 
+    /// **FerroSearch extension (Wave 15).** Records that auxiliary sort
+    /// cursor files were written for `fields` when this segment was
+    /// finalised, so the cursors are advertised in `meta.json` and
+    /// retained by the directory GC.
+    #[must_use]
+    pub fn with_sort_cursor_fields(self, fields: Vec<String>) -> Segment {
+        Segment {
+            index: self.index,
+            meta: self.meta.with_sort_cursor_fields(fields),
+        }
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn with_delete_meta(self, num_deleted_docs: u32, opstamp: Opstamp) -> Segment {
@@ -86,5 +98,32 @@ impl Segment {
         let path = self.relative_path(component);
         let write = self.index.directory_mut().open_write(&path)?;
         Ok(write)
+    }
+
+    /// Opens the auxiliary sort cursor file for `field` for reading.
+    ///
+    /// **FerroSearch extension (Wave 15).** The path is
+    /// `{segment_uuid}.{field}.sortcursor`.
+    pub fn open_sort_cursor_read(&self, field: &str) -> Result<FileSlice, OpenReadError> {
+        let path = self.meta.sort_cursor_path(field);
+        self.index.directory().open_read(&path)
+    }
+
+    /// Opens the auxiliary sort cursor file for `field` for writing.
+    ///
+    /// **FerroSearch extension (Wave 15).**
+    ///
+    /// Marks the cursor path as "pending publication" via
+    /// [`Directory::mark_pending`] before opening — see the Wave 15
+    /// Phase H-6 root-cause notes on [`Directory::mark_pending`] for
+    /// the GC race this guards against.  Callers must pair this with
+    /// a `release_pending` after the owning `SegmentMeta` has been
+    /// added to the segment manager (the segment-updater pool handles
+    /// this in `schedule_add_segment` and `end_merge`).
+    pub fn open_sort_cursor_write(&mut self, field: &str) -> Result<WritePtr, OpenWriteError> {
+        let path = self.meta.sort_cursor_path(field);
+        let directory = self.index.directory_mut();
+        directory.mark_pending(&path);
+        directory.open_write(&path)
     }
 }

@@ -219,4 +219,15 @@ impl SegmentManager {
         let registers_lock = self.read();
         registers_lock.committed.segment_metas()
     }
+
+    /// **FerroSearch Wave 17-2.** Returns the committed segment entries
+    /// (excluding uncommitted ones).  Used by
+    /// `IndexWriter::backfill_sort_cursor` to walk only the segments
+    /// that already landed on disk and are visible to readers — the
+    /// uncommitted ones will pick up the new sort_cursor field on the
+    /// next regular commit via the existing on-commit path.
+    pub fn committed_segment_entries(&self) -> Vec<SegmentEntry> {
+        let registers_lock = self.read();
+        registers_lock.committed.segment_entries()
+    }
 }

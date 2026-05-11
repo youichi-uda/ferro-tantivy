@@ -9,12 +9,19 @@ mod segment;
 mod segment_component;
 mod segment_id;
 mod segment_reader;
+mod sort_cursor;
 
 pub use self::index::{Index, IndexBuilder};
 pub(crate) use self::index_meta::SegmentMetaInventory;
-pub use self::index_meta::{IndexMeta, IndexSettings, Order, SegmentMeta};
+pub use self::index_meta::{IndexMeta, IndexSettings, IndexSortByField, Order, SegmentMeta};
 pub use self::inverted_index_reader::InvertedIndexReader;
 pub use self::segment::Segment;
 pub use self::segment_component::SegmentComponent;
 pub use self::segment_id::SegmentId;
 pub use self::segment_reader::{FieldMetadata, SegmentReader};
+pub use self::sort_cursor::{
+    build_and_write_sort_cursor_for, build_and_write_sort_cursor_v2_for,
+    build_and_write_sort_cursors, build_sort_cursor_from_fast_fields,
+    build_sort_cursor_v2_from_fast_fields, SortCursorAny, SortCursorIndex, SortCursorIndexV2,
+    ValueKind, SORT_CURSOR_MAX_FIELDS,
+};

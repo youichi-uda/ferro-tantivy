@@ -564,6 +564,7 @@ mod tests {
                 docstore_blocksize: 1_000_000,
                 docstore_compress_dedicated_thread: true,
                 sort_by_field: None,
+                sort_by_fields: None,
             },
             segments: Vec::new(),
             schema,

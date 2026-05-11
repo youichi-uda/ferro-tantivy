@@ -317,8 +317,64 @@ post-correction.
   cargo bench -p tantivy-gpu --features cuda-tensor-core --bench binary_distance
   ```
 
+## Re-validation — 2026-05-11
+
+Refresh of every measurement above on the same RTX 4070 Ti SUPER host
+after the Phase 5-3 work landed. Full evidence pinned at
+`reports/cuda-backend-bench-2026-05-11/` (bench log + four JSON
+snapshots; `gpu/benches/data/*.json` is overwritten on every run, the
+`reports/` copies are immutable).
+
+Headline result, end-to-end k-NN at the production target:
+
+| Path | Shape | Wall-clock | vs CPU oracle | vs WGSL knn |
+|---|---|---:|---:|---:|
+| CPU oracle (host) | dim=768 N=1 M Q=64 K=100 | 1.627 s | 1.00× | — |
+| WGSL `xor_popcount_batched` (cold, no top-K) | same | 249.71 ms | 6.52× | — |
+| CUDA INT8 IMMA cold (no top-K) | same | 96.48 ms | 16.86× | 2.59× |
+| CUDA cached `Vec<u32>` (no top-K) | same | 73.45 ms | 22.15× | 3.45× |
+| CUDA cached + pinned (Phase 5-1, no top-K) | same | 27.22 ms | 59.77× | 9.30× |
+| **CUDA E2E k-NN (cached + on-GPU top-K)** | same, K=100 reducer | **61.92 ms** | **26.28×** | n/a |
+
+`reports/cuda-backend-bench-2026-05-11/README.md` carries the full ladder
+(single-query, batched, k-NN, cuda-vs-WGSL cold/cached/pinned, Phase 5-2
+double-buffered, Phase 5-3 BMMA-vs-INT8). Every CUDA path remained
+byte-equal to the WGSL/CPU oracle on every shape (no DIVERGE). The
+N=100 k Q=64 Go-threshold gate at the cold path holds at **5.68×**;
+cached + pinned at the same shape clears **12.06×**. BMMA ran 1.22-1.91×
+faster than cuBLASLt INT8 across every shape — confirming the Phase 5-3-a
+follow-up below is worth the engineering.
+
+## Open follow-up (as of 2026-05-11)
+
+- **Phase 5-3-a**: migrate BMMA into the cached + pinned production
+  path. Needs `CudaBinaryCorpusBmma` (1-bit packed corpus on device,
+  no INT8 unpack), warp-cooperation in the `mma.sync` kernel for
+  larger dim-K loops, and a parity sweep matching
+  `cuda_tensor_core_parity.rs` shape coverage.
+- **Phase 5-4-a**: replace the placeholder sign-bit packer in
+  `ferro-bench-runner` with the production BBQ encoder, re-measure
+  `recall@k` so the SIFT1M gate clears the 0.95 target.
+- **`ferrosearch` feature passthrough** (added 2026-05-11): the
+  `cuda-tensor-core` feature is wired in `tantivy-gpu` but **not yet
+  exposed through the top-level `ferrosearch` `Cargo.toml`**, so a
+  default `ferrosearch` build inherits no CUDA. Wiring is tracked
+  under scope 4 of the 2026-05-11 session — once landed, deployments
+  opt in via `cargo build --release --features
+  ferrosearch/cuda-tensor-core` (or the equivalent passthrough), and
+  the existing `BinaryDistanceKernel` instances pick up the fast
+  path with no code change in the search engine.
+- **Off-NVIDIA fallback regression coverage**: today the parity test
+  skips at runtime on no-NVIDIA hosts, which means the
+  `try_new`/`compute_batched` fallback contracts are exercised
+  in CI only by the no-feature build. A small targeted regression
+  test that compiles with the feature enabled but `mock`s the
+  cudarc loader at the FFI boundary would catch contract drift —
+  also tracked under scope 4 of the 2026-05-11 session.
+
 ## Reference
 
 - Wave 4 verdict: `~/git/Inferentia2/ferro-knn-inf2/reports/g1-final-verdict-with-direct-l4.md`
 - INT8 reference: `~/git/Inferentia2/ferro-knn-inf2/code/neuron/g1_int8_bench.py`
 - L4 multi-query: `~/git/Inferentia2/ferro-knn-inf2/reports/g1_l4_multi_query.json`
+- 2026-05-11 re-validation: `reports/cuda-backend-bench-2026-05-11/`

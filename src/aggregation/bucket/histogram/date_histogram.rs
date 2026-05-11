@@ -236,8 +236,8 @@ pub(crate) fn parse_into_milliseconds(input: &str) -> Result<i64, AggregationErr
     };
 
     let val = number * unit_in_ms;
-    // The field type is in nanoseconds precision, so validate the value to fit the range
-    val.checked_mul(1_000_000)
+    // The field type is in microseconds precision, so validate the value to fit the range
+    val.checked_mul(1_000)
         .ok_or_else(|| DateHistogramParseError::OutOfBounds(input.to_string()))?;
 
     Ok(val)

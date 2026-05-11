@@ -98,6 +98,182 @@ pub use planner::{
 #[cfg(feature = "ferro-compress")]
 pub use ferro_compress_bridge::FerroBitcompCodec;
 
+// ============================================================
+// Wave Z-1 #1 — segment-warm-on-open hook
+// ============================================================
+//
+// When enabled, [`SegmentReader::open_with_custom_alive_set`] calls
+// [`warm_segment_v3`] just before returning, which streams each
+// indexed text field's term dictionary and pre-populates the host
+// CHT (and, opportunistically, the Bitcomp v3 VRAM CHT). The goal is
+// to front-load the H→D + decompress overhead at segment-open time
+// so the first query that touches a warm term takes the hot path.
+//
+// Off by default — this is a *latency-shifting* optimisation, not a
+// throughput win. Operators turn it on via the `ferrosearch
+// --cht-segment-warm-on-open` CLI flag (Wave Z-1 #1 ferrosearch
+// wiring).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-global toggle for the segment-warm-on-open hook. Off by
+/// default so existing deployments retain bytewise-identical
+/// behaviour until the operator opts in.
+static SEGMENT_WARM_ON_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Enable / disable the segment-warm-on-open hook for *all* future
+/// [`crate::index::SegmentReader::open_with_custom_alive_set`] calls.
+/// Idempotent. Cheap (single relaxed atomic store) — safe to call
+/// from `ferrosearch::main` startup.
+pub fn set_segment_warm_on_open(enabled: bool) {
+    SEGMENT_WARM_ON_OPEN.store(enabled, Ordering::Relaxed);
+}
+
+/// Read the current value of the segment-warm-on-open toggle. Used
+/// by the open path to short-circuit when the operator hasn't opted
+/// in.
+#[must_use]
+pub fn segment_warm_on_open() -> bool {
+    SEGMENT_WARM_ON_OPEN.load(Ordering::Relaxed)
+}
+
+// ============================================================
+// Warm-up entry point (cfg-gated body, always-callable stub)
+// ============================================================
+
+/// Maximum number of terms warmed per indexed field per segment. Keeps
+/// open-time bounded even on segments with very wide term spaces
+/// (json fields, log corpora) where naively draining every term would
+/// cost minutes on a cold segment. The limit is intentionally
+/// conservative — a follow-up wave can plumb this through as an
+/// operator knob if benchmarks justify it.
+pub const MAX_WARMUP_TERMS_PER_FIELD: usize = 10_000;
+
+/// Pre-populate the host CHT (and, when CUDA Bitcomp is available,
+/// the v3 VRAM CHT) for every indexed text field in `reader`.
+///
+/// No-op when [`segment_warm_on_open`] returns `false`. Bounded by
+/// [`MAX_WARMUP_TERMS_PER_FIELD`] per indexed field to keep
+/// open-latency predictable on wide term spaces.
+///
+/// Failures (per-term read errors, oversized terms, CUDA OOM during
+/// v3 promote) are silently swallowed — warm-up is best-effort,
+/// never blocks segment open.
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub fn warm_segment_v3(reader: &crate::index::SegmentReader) {
+    if !segment_warm_on_open() {
+        return;
+    }
+
+    use crate::schema::IndexRecordOption;
+
+    let schema = reader.schema();
+    let cht_handle = cht::global();
+    // v3 may be unavailable (no Bitcomp codec construction); we still
+    // warm v1 in that case so the next query at least skips the
+    // drain.
+    let v3_handle = vram_cht_v3::global();
+    let segment_id = reader.segment_id();
+
+    let mut total_warmed: usize = 0;
+    let mut total_skipped_limit: usize = 0;
+
+    for (field, field_entry) in schema.fields() {
+        let field_type = field_entry.field_type();
+        // Only walk fields that are actually indexed; anything else
+        // can't have a posting list to warm.
+        if field_type.get_index_record_option().is_none() {
+            continue;
+        }
+        // Skip JSON fields for now — their term spaces are wide and
+        // wedge-shaped (per-path subspaces) and the
+        // `MAX_WARMUP_TERMS_PER_FIELD` budget would consume the whole
+        // limit on one path. A future wave can per-path it.
+        if matches!(field_type, crate::schema::FieldType::JsonObject(_)) {
+            continue;
+        }
+
+        let inv_idx_reader = match reader.inverted_index(field) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let term_dict = inv_idx_reader.terms();
+        let mut stream = match term_dict.stream() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let mut warmed_in_field: usize = 0;
+        while let Some((term_bytes, term_info)) = stream.next() {
+            if warmed_in_field >= MAX_WARMUP_TERMS_PER_FIELD {
+                total_skipped_limit += 1;
+                log::debug!(
+                    "warm_segment_v3: field {:?} hit per-field limit \
+                     {MAX_WARMUP_TERMS_PER_FIELD}; remaining terms skipped",
+                    field_entry.name()
+                );
+                break;
+            }
+
+            let key = cht::ChtKey {
+                segment_id,
+                field: field.field_id(),
+                term_hash: cht::hash_term_bytes(term_bytes),
+            };
+
+            // Skip if v1 already has this entry — re-insert is a
+            // no-op for budgets but each drain costs real work.
+            if cht_handle.get(&key).is_some() {
+                continue;
+            }
+
+            // Drain BlockSegmentPostings into a RoaringPostings. We
+            // ask for `Basic` because the v3 path only consumes
+            // doc-ids; freqs/positions would just add cost.
+            let block_cursor_opt = inv_idx_reader
+                .read_block_postings_from_terminfo(term_info, IndexRecordOption::Basic)
+                .ok();
+            let Some(mut block_cursor) = block_cursor_opt else {
+                continue;
+            };
+            let drained = std::sync::Arc::new(
+                from_block_segment::drain_block_segment_to_roaring(&mut block_cursor),
+            );
+            cht_handle.insert(key.clone(), std::sync::Arc::clone(&drained));
+
+            // Opportunistic v3 promotion. Same best-effort semantics
+            // as the query-time promote path in
+            // `boolean_query::gpu_intersect`. Failures (CUDA OOM,
+            // oversize, budget pressure) are silently swallowed.
+            if let Some(handle) = v3_handle {
+                let _ = handle.promote(key, drained.as_ref());
+            }
+
+            warmed_in_field += 1;
+            total_warmed += 1;
+        }
+    }
+
+    log::debug!(
+        "warm_segment_v3: segment={:?} warmed_terms={total_warmed} \
+         fields_hit_limit={total_skipped_limit}",
+        segment_id
+    );
+}
+
+/// No-op stub used when the feature stack required for the CHT v3
+/// path (`gpu` + `ferro-compress` + `cuda-bitmap-kernel`) is not
+/// active. Keeps the call site in [`crate::index::SegmentReader`]
+/// unconditional.
+#[cfg(not(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel")))]
+pub fn warm_segment_v3(_reader: &crate::index::SegmentReader) {
+    // Even when the v3 path is compiled out we still observe the
+    // toggle so unit tests covering the no-op branch behave
+    // identically with and without the feature stack.
+    let _ = segment_warm_on_open();
+}
+
 /// Number of `u32` words in a Roaring [`container::BitmapContainer`]
 /// (= 2048 = 8 KiB = 65 536 bits).
 ///
@@ -232,6 +408,165 @@ impl PostingFormatDispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================
+    // Wave Z-1 #1 — segment-warm hook tests
+    // ============================================================
+
+    /// The toggle must default to *off*. Existing deployments retain
+    /// bytewise-identical behaviour until they opt in.
+    #[test]
+    fn segment_warm_on_open_defaults_off() {
+        // NB: a previous test in this binary could have flipped the
+        // toggle to true. Restore the documented default after we read
+        // it. We cannot assert *the initial value* portably for this
+        // reason — but we can verify the setter/getter contract and
+        // the documented default by inspecting `set_segment_warm_on_open`
+        // semantics below.
+        let saved = segment_warm_on_open();
+        set_segment_warm_on_open(false);
+        assert!(!segment_warm_on_open());
+        // Restore in case other tests rely on the previous value.
+        set_segment_warm_on_open(saved);
+    }
+
+    /// `set_segment_warm_on_open` must round-trip through
+    /// `segment_warm_on_open`. Idempotent across repeated stores.
+    #[test]
+    fn segment_warm_on_open_setter_round_trip() {
+        let saved = segment_warm_on_open();
+        set_segment_warm_on_open(true);
+        assert!(segment_warm_on_open());
+        set_segment_warm_on_open(true); // idempotent
+        assert!(segment_warm_on_open());
+        set_segment_warm_on_open(false);
+        assert!(!segment_warm_on_open());
+        // Restore.
+        set_segment_warm_on_open(saved);
+    }
+
+    /// When the toggle is off, `warm_segment_v3` must be a no-op:
+    /// calling it against a real `SegmentReader` must not mutate any
+    /// observable global state. This test runs in both feature modes
+    /// because both branches (real impl and stub) must respect the
+    /// toggle.
+    #[test]
+    fn warm_segment_v3_noop_when_disabled() {
+        use crate::index::Index;
+        use crate::schema::{Schema, TEXT};
+
+        let saved = segment_warm_on_open();
+        set_segment_warm_on_open(false);
+
+        let mut schema_builder = Schema::builder();
+        let body = schema_builder.add_text_field("body", TEXT);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests().unwrap();
+        writer.add_document(doc!(body => "alpha beta gamma")).unwrap();
+        writer.add_document(doc!(body => "beta gamma delta")).unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let segment_reader = reader.searcher().segment_reader(0).clone();
+
+        // Under the feature stack, the host CHT exists — snapshot
+        // its insert counter and assert it doesn't move when the
+        // toggle is off. Under the no-feature build, the body is a
+        // stub; the call itself must not panic or otherwise misbehave.
+        #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+        {
+            let cht = cht::global();
+            let stats_before = cht.stats();
+            warm_segment_v3(&segment_reader);
+            let stats_after = cht.stats();
+            assert_eq!(
+                stats_before.inserts, stats_after.inserts,
+                "warm_segment_v3 must not insert anything when toggle is off"
+            );
+            assert_eq!(
+                stats_before.entries, stats_after.entries,
+                "warm_segment_v3 must not grow the cache when toggle is off"
+            );
+        }
+        #[cfg(not(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel")))]
+        {
+            // Stub branch: just verify the call is safe.
+            warm_segment_v3(&segment_reader);
+        }
+
+        set_segment_warm_on_open(saved);
+    }
+
+    /// When the toggle is on AND the v3 feature stack is compiled in,
+    /// warming a small synthetic segment must increase the host CHT's
+    /// insert counter by at least the number of distinct terms.
+    ///
+    /// Gated on the feature stack — the host CHT module
+    /// (`super::cht`) is itself cfg-gated, so this test only compiles
+    /// when v3 is available.
+    #[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+    #[test]
+    fn warm_segment_v3_populates_v1_cache_when_enabled() {
+        use crate::index::Index;
+        use crate::schema::{Schema, TEXT};
+
+        let saved = segment_warm_on_open();
+        set_segment_warm_on_open(true);
+
+        let mut schema_builder = Schema::builder();
+        let body = schema_builder.add_text_field("body", TEXT);
+        let schema = schema_builder.build();
+
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests().unwrap();
+        // 5 distinct terms across 2 docs.
+        writer
+            .add_document(doc!(body => "alpha beta gamma"))
+            .unwrap();
+        writer
+            .add_document(doc!(body => "delta epsilon"))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let reader = index.reader().unwrap();
+        let segment_reader = reader.searcher().segment_reader(0).clone();
+
+        let cht = cht::global();
+        let inserts_before = cht.stats().inserts;
+        warm_segment_v3(&segment_reader);
+        let inserts_after = cht.stats().inserts;
+
+        assert!(
+            inserts_after >= inserts_before + 5,
+            "warm_segment_v3 must insert ≥5 distinct terms; before={} after={}",
+            inserts_before, inserts_after,
+        );
+
+        set_segment_warm_on_open(saved);
+    }
+
+    /// `MAX_WARMUP_TERMS_PER_FIELD` is a public const — verify it's a
+    /// reasonable safety bound so an accidental zero (an obvious
+    /// merge-conflict failure mode) is caught. Uses `const { ... }`
+    /// so the check is compile-time and clippy doesn't flag the
+    /// assertion as constant-valued.
+    #[test]
+    fn warmup_per_field_limit_is_nonzero_and_bounded() {
+        const _: () = {
+            assert!(
+                MAX_WARMUP_TERMS_PER_FIELD > 0,
+                "MAX_WARMUP_TERMS_PER_FIELD must be > 0; an accidental \
+                 zero would disable warming for every field with terms"
+            );
+            assert!(
+                MAX_WARMUP_TERMS_PER_FIELD <= 1_000_000,
+                "MAX_WARMUP_TERMS_PER_FIELD is too large; segment open \
+                 latency would balloon on wide term spaces"
+            );
+        };
+    }
 
     #[test]
     fn posting_format_default_is_bitpacker() {

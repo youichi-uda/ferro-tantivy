@@ -190,7 +190,7 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
-        Ok(SegmentReader {
+        let reader = SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
             max_doc,
@@ -204,7 +204,18 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite,
             schema,
-        })
+        };
+
+        // Wave Z-1 #1 — segment-warm hook for CHT v3 eager cache fill.
+        // No-op unless the operator opted in via
+        // `crate::postings::roaring::set_segment_warm_on_open(true)`
+        // (ferrosearch flag `--cht-segment-warm-on-open`). The hook
+        // front-loads the H→D + decompress cost onto segment-open
+        // latency so the first query that touches a warm term takes
+        // the hot path.
+        crate::postings::roaring::warm_segment_v3(&reader);
+
+        Ok(reader)
     }
 
     /// Returns a field reader associated with the field given in argument.

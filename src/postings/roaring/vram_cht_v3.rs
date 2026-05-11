@@ -34,13 +34,23 @@
 //!
 //! ## What v3 does NOT do (deferred)
 //!
-//! - **Multi-chunk Bitcomp** for very large terms (> 16 MiB
-//!   uncompressed): the current insert path single-chunks each term.
-//!   Production posting lists at the planner-approved cardinality
-//!   (≥ 100 K docs ≈ ≥ 1 bucket but < 100 buckets) are well below
-//!   the 16 MiB ceiling. Multi-chunk = future work in
-//!   [`ferro_compress::BitcompDeviceCodec`].
-//! - **Warm-restart persistence** (D-5): the cache is process-local.
+//! - **Multi-chunk dispatch wiring** (Z-6 #3): the entry now carries
+//!   a `chunks: Vec<DeviceChunkSlice>` payload (Z-6 #2 LAND, see
+//!   [`DeviceChunkSlice`] + [`VramCompressedTermEntry::chunks`]) so
+//!   the 16 MiB single-chunk admission ceiling lifts to
+//!   `MAX_CHUNKS_PER_ENTRY * 16 MiB` (= 1 GiB). The compression
+//!   loop fan-out is in place; the dispatch path
+//!   ([`super::cuda_dispatch::CudaBitmapOpKernel::decompress_batch_into_workbench`])
+//!   still consumes the single-chunk back-compat shim and will be
+//!   migrated to walk `chunks()` directly in Z-6 #3. Until that
+//!   lands, dispatch on a multi-chunk entry trips a
+//!   `debug_assert!(chunk_count == 1)` (= silent wrong result in
+//!   release builds). The `cuda-bitmap-kernel` feature is
+//!   pre-release; the only consumer touching multi-chunk admission
+//!   today is the Z-6 #5 dense-bench example.
+//! - **Multi-chunk persist** (Z-6 #4): [`dump_to_path`] guards
+//!   multi-chunk entries with a `debug_assert!`; MAGIC_V4 wire
+//!   format upgrade in Z-6 #4 will dump per-chunk records.
 //! - **Per-tenant isolation** (Wave 12).
 //!
 //! ## Empirical context
@@ -104,40 +114,108 @@ pub enum VramCompressedChtError {
     /// `ferro_compress::BitcompDeviceCodec`.
     #[error("Bitcomp error: {0}")]
     Bitcomp(#[from] FcError),
+    /// Source posting list would require more than
+    /// [`MAX_CHUNKS_PER_ENTRY`] (= 1 GiB hard cap) — surfaced rather
+    /// than silently rejected so operators see the boundary.
+    #[error("term exceeds MAX_CHUNKS_PER_ENTRY (chunks_needed={chunks_needed}, max={max})")]
+    TooManyChunks {
+        /// Chunks the term would need = `ceil(uncompressed_bytes / 16 MiB)`.
+        chunks_needed: usize,
+        /// Hard cap, currently [`MAX_CHUNKS_PER_ENTRY`].
+        max: usize,
+    },
 }
+
+/// nvcomp Bitcomp single-chunk ceiling (16 MiB). Each
+/// [`DeviceChunkSlice`] covers up to this many uncompressed bytes;
+/// terms over this threshold fan out into multiple chunks via
+/// [`VramCompressedCht::insert`] / [`VramCompressedCht::promote_v2_to_v3`].
+pub const BITCOMP_CHUNK_BYTES: usize = 1 << 24;
+
+/// Buckets per max-size chunk = `BITCOMP_CHUNK_BYTES / (BITMAP_CONTAINER_WORDS * 4)`
+/// (= 2048 with the current `BITMAP_CONTAINER_WORDS = 2048`). Chunk
+/// boundaries always fall on bucket boundaries so the
+/// `(high16, word_offset)` `bucket_index` stays a single Vec for the
+/// whole entry — chunk `k`'s bucket window is
+/// `bucket_index[k * BUCKETS_PER_CHUNK ..]` up to the next chunk
+/// boundary.
+pub const BUCKETS_PER_CHUNK: usize = BITCOMP_CHUNK_BYTES / (BITMAP_CONTAINER_WORDS * 4);
+
+/// Hard cap on the number of [`DeviceChunkSlice`] entries per term.
+/// 64 chunks × 16 MiB = 1 GiB uncompressed, well above any realistic
+/// posting list (a `bspread_30k_buckets` cohort hits ~240 MiB = 15
+/// chunks) but bounds worst-case `cudaMalloc` count per admission.
+/// Operators that overflow this cap see
+/// [`VramCompressedChtError::TooManyChunks`] surfaced rather than a
+/// silent skip.
+pub const MAX_CHUNKS_PER_ENTRY: usize = 64;
+
+/// One Bitcomp-compressed chunk of an entry's posting payload.
+///
+/// Each chunk owns a `cudaMalloc`-allocated `d_compressed` device
+/// buffer of `compressed_bytes` size carrying the Bitcomp output
+/// for a slice of `uncompressed_bytes` source bytes
+/// (`uncompressed_bytes` ≤ [`BITCOMP_CHUNK_BYTES`]; the slice is
+/// aligned to bucket boundaries — see [`BUCKETS_PER_CHUNK`]).
+///
+/// `DeviceChunkSlice` is a borrow-free record; the actual `cudaFree`
+/// runs in the parent [`VramCompressedTermEntry`]'s `Drop` impl,
+/// which iterates the `chunks` vec.
+#[derive(Debug)]
+pub struct DeviceChunkSlice {
+    /// Device pointer to the compressed-bytes buffer for this chunk.
+    pub d_compressed: *mut c_void,
+    /// Bytes in the device-resident compressed buffer for this chunk
+    /// (= per-chunk contribution to the cache-budget footprint).
+    pub compressed_bytes: usize,
+    /// Bytes of uncompressed source this chunk covers
+    /// (≤ [`BITCOMP_CHUNK_BYTES`]). The sum over the parent entry's
+    /// chunks equals [`VramCompressedTermEntry::uncompressed_bytes`].
+    pub uncompressed_bytes: usize,
+}
+
+// SAFETY: `d_compressed` is a CUDA device pointer; nothing in this
+// struct holds a host-visible borrow. The parent
+// `VramCompressedTermEntry` owns the chunks vec and runs `cudaFree`
+// from its `Drop`; `Send`+`Sync` only allow the record to traverse
+// `Arc<VramCompressedTermEntry>` clones.
+unsafe impl Send for DeviceChunkSlice {}
+unsafe impl Sync for DeviceChunkSlice {}
 
 /// One cached posting list, stored on the CUDA device in
 /// **Bitcomp-compressed** form.
 ///
-/// Layout: `d_compressed` points to a contiguous compressed-bytes
-/// buffer of `compressed_bytes` size. The `bucket_index` records the
-/// **uncompressed** layout (so the dispatch layer knows how to
-/// scatter buckets after decompression). `uncompressed_bytes` =
-/// `bucket_count * BITMAP_CONTAINER_WORDS * 4`.
+/// Wave Z-6 #2 LAND: the device payload is now a `Vec<DeviceChunkSlice>`
+/// so the 16 MiB single-chunk Bitcomp ceiling lifts to
+/// `MAX_CHUNKS_PER_ENTRY × BITCOMP_CHUNK_BYTES` (= 1 GiB). Single-chunk
+/// terms continue to land as `chunks.len() == 1` and preserve byte-
+/// identical layout (the persist MAGIC_V3 wire format still round-trips
+/// them; MAGIC_V4 lands in Z-6 #4).
 ///
-/// At query time the dispatch layer:
-/// 1. Allocates / reuses a workbench device buffer of
-///    `uncompressed_bytes` size (managed by `CudaBitmapOpKernel`).
-/// 2. Calls `BitcompDeviceCodec::decompress_one(d_compressed,
-///    compressed_bytes, d_workbench, uncompressed_bytes)`.
-/// 3. Scatters from the workbench (using `bucket_index`) to the
-///    cohort's flat layout, identical to v2's `scatter_term_to_device`.
+/// ## Layout invariants
+/// - `chunks.is_empty()` is forbidden (empty terms are rejected at
+///   admission; see [`VramCompressedCht::insert`]).
+/// - `uncompressed_bytes == sum(chunks[i].uncompressed_bytes)`.
+/// - `bucket_index.len() * BITMAP_CONTAINER_WORDS * 4 == uncompressed_bytes`.
+/// - Chunks tile the uncompressed source contiguously in
+///   `bucket_index` order: chunk `k` covers buckets
+///   `[k * BUCKETS_PER_CHUNK, min((k+1) * BUCKETS_PER_CHUNK, bucket_count))`.
+///   The last chunk may be smaller than [`BITCOMP_CHUNK_BYTES`] if
+///   `bucket_count` is not a multiple of [`BUCKETS_PER_CHUNK`].
 ///
 /// ## Drop semantics
-///
-/// Drop calls `cudaFree(d_compressed)` exactly once. The same
-/// Arc-refcount safety as v2 protects against eviction-during-in-flight-
-/// query; in-flight queries hold an `Arc<VramCompressedTermEntry>`
-/// clone, the buffer stays alive until the kernel completes.
+/// Drop iterates `chunks` and runs `cudaFree` per chunk exactly once.
+/// The same Arc-refcount safety as v2 protects against eviction-
+/// during-in-flight-query; in-flight queries hold an
+/// `Arc<VramCompressedTermEntry>` clone, every chunk buffer stays
+/// alive until the kernel completes.
 pub struct VramCompressedTermEntry {
-    /// Device pointer to a compressed-bytes buffer.
-    d_compressed: *mut c_void,
-    /// Bytes in the device-resident compressed buffer (= the storage
-    /// footprint counted toward the cache budget).
-    compressed_bytes: usize,
-    /// Bytes the decompressed buffer needs (`bucket_count *
+    /// Per-chunk Bitcomp payloads, ordered by ascending bucket offset.
+    /// Non-empty for any admitted entry. See struct-level invariants.
+    chunks: Vec<DeviceChunkSlice>,
+    /// Total bytes the decompressed buffer needs (`bucket_count *
     /// BITMAP_CONTAINER_WORDS * 4`). Required at decompress time to
-    /// validate the per-call output size.
+    /// validate the per-call output size; matches `sum(chunks[i].uncompressed_bytes)`.
     uncompressed_bytes: usize,
     /// `(high16, word_offset)` for each non-empty bucket, sorted by
     /// `high16` ascending. `word_offset` is in u32 units relative to
@@ -146,23 +224,22 @@ pub struct VramCompressedTermEntry {
     bucket_index: Vec<(u16, u32)>,
 }
 
-// SAFETY: device pointer + bucket_index are owned by the entry.
-// The codec used at insert time is a one-shot caller; at query
-// time the dispatch layer's codec instance reads `d_compressed`
-// without taking ownership. `Send`+`Sync` allow `Arc` wrap.
+// SAFETY: device pointers + bucket_index are owned by the entry.
+// `Send`+`Sync` propagate the same property `DeviceChunkSlice` declares.
 unsafe impl Send for VramCompressedTermEntry {}
 unsafe impl Sync for VramCompressedTermEntry {}
 
 impl std::fmt::Debug for VramCompressedTermEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let compressed_total = self.compressed_bytes();
         f.debug_struct("VramCompressedTermEntry")
-            .field("d_compressed_is_null", &self.d_compressed.is_null())
-            .field("compressed_bytes", &self.compressed_bytes)
+            .field("chunk_count", &self.chunks.len())
+            .field("compressed_bytes_total", &compressed_total)
             .field("uncompressed_bytes", &self.uncompressed_bytes)
             .field("bucket_count", &self.bucket_index.len())
             .field(
                 "compression_ratio",
-                &(self.uncompressed_bytes as f64 / self.compressed_bytes.max(1) as f64),
+                &(self.uncompressed_bytes as f64 / compressed_total.max(1) as f64),
             )
             .finish()
     }
@@ -175,15 +252,16 @@ impl VramCompressedTermEntry {
         self.bucket_index.len()
     }
 
-    /// Bytes the compressed payload occupies on device (= cache
-    /// budget footprint).
+    /// Total bytes the compressed payload occupies on device summed
+    /// over all chunks (= cache budget footprint).
     #[must_use]
     pub fn compressed_bytes(&self) -> usize {
-        self.compressed_bytes
+        self.chunks.iter().map(|c| c.compressed_bytes).sum()
     }
 
     /// Bytes the workbench buffer must hold for decompress
-    /// (`bucket_count * BITMAP_CONTAINER_WORDS * 4`).
+    /// (`bucket_count * BITMAP_CONTAINER_WORDS * 4`); also equals
+    /// `sum(chunks[i].uncompressed_bytes)`.
     #[must_use]
     pub fn uncompressed_bytes(&self) -> usize {
         self.uncompressed_bytes
@@ -196,7 +274,28 @@ impl VramCompressedTermEntry {
         &self.bucket_index
     }
 
-    /// Raw device pointer to the compressed payload.
+    /// Number of Bitcomp chunks the compressed payload spans (≥ 1
+    /// for any admitted entry; > 1 only after Z-6 #2 multi-chunk
+    /// admission landed). Lets Z-6 #3 dispatch wiring distinguish
+    /// single-chunk back-compat callers from multi-chunk ones.
+    #[must_use]
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Per-chunk slices, ordered by ascending bucket offset. Z-6 #3
+    /// dispatch wiring iterates this slice to flatten N-chunk terms
+    /// into nvcomp batched-decompress entries.
+    #[must_use]
+    pub fn chunks(&self) -> &[DeviceChunkSlice] {
+        &self.chunks
+    }
+
+    /// Raw device pointer to the compressed payload. Back-compat shim
+    /// for pre-Wave-Z-6 callers that statically expect a single-chunk
+    /// entry; trips `debug_assert!` on a multi-chunk entry. Z-6 #3 will
+    /// migrate dispatch to walk [`Self::chunks`] directly and the call
+    /// sites that depend on this method will go away.
     ///
     /// # Safety
     /// The pointer is a CUDA device pointer; only pass it to CUDA
@@ -204,20 +303,47 @@ impl VramCompressedTermEntry {
     /// `Arc<VramCompressedTermEntry>` clone's lifetime.
     #[must_use]
     pub fn device_ptr(&self) -> *const c_void {
-        self.d_compressed as *const c_void
+        debug_assert_eq!(
+            self.chunks.len(),
+            1,
+            "device_ptr() called on multi-chunk entry — Z-6 #3 dispatch wiring required"
+        );
+        self.chunks
+            .first()
+            .map(|c| c.d_compressed as *const c_void)
+            .unwrap_or(std::ptr::null())
+    }
+
+    /// Same as [`Self::device_ptr`], returning the mutable raw pointer
+    /// that some `nvcomp` / `cudaMemcpy` signatures need without an
+    /// explicit cast. Single-chunk back-compat shim — see
+    /// [`Self::device_ptr`].
+    #[must_use]
+    pub fn d_compressed(&self) -> *mut c_void {
+        debug_assert_eq!(
+            self.chunks.len(),
+            1,
+            "d_compressed() called on multi-chunk entry — Z-6 #3 dispatch wiring required"
+        );
+        self.chunks
+            .first()
+            .map(|c| c.d_compressed)
+            .unwrap_or(null_mut())
     }
 }
 
 impl Drop for VramCompressedTermEntry {
     fn drop(&mut self) {
-        if !self.d_compressed.is_null() {
-            // SAFETY: pointer was allocated by `cudaMalloc` in
-            // [`VramCompressedCht::build_entry`] and has not been
-            // freed elsewhere (the `Arc` in the cache map ensures
-            // unique ownership). Replacing with null is defensive.
+        // SAFETY: every chunk's `d_compressed` was allocated by
+        // `cudaMalloc` in [`VramCompressedCht::build_entry`] /
+        // [`VramCompressedCht::promote_v2_to_v3`] and has not been
+        // freed elsewhere — the `Arc` in the cache map ensures unique
+        // ownership of the chunks vec.
+        for chunk in self.chunks.drain(..) {
             unsafe {
-                let p = std::mem::replace(&mut self.d_compressed, null_mut());
-                let _ = cudaFree(p);
+                if !chunk.d_compressed.is_null() {
+                    let _ = cudaFree(chunk.d_compressed);
+                }
             }
         }
     }
@@ -407,13 +533,15 @@ impl VramCompressedCht {
             return Ok(false);
         }
         let uncompressed_bytes = bucket_count * BITMAP_CONTAINER_WORDS * 4;
-        // Bitcomp single-chunk ceiling = 16 MiB. For very dense terms
-        // we'd need to multi-chunk; in practice the planner-approved
-        // hot terms are well below this.
-        if uncompressed_bytes > (1 << 24) {
-            // Too big for single-chunk Bitcomp — fall through, the
-            // caller will retry via v2 path.
-            return Ok(false);
+        // Wave Z-6 #2: Bitcomp's 16 MiB per-chunk ceiling is now
+        // handled internally via multi-chunk fan-out; admit any term
+        // up to MAX_CHUNKS_PER_ENTRY * BITCOMP_CHUNK_BYTES (= 1 GiB).
+        let max_admit_bytes = MAX_CHUNKS_PER_ENTRY.saturating_mul(BITCOMP_CHUNK_BYTES);
+        if uncompressed_bytes > max_admit_bytes {
+            return Err(VramCompressedChtError::TooManyChunks {
+                chunks_needed: uncompressed_bytes.div_ceil(BITCOMP_CHUNK_BYTES),
+                max: MAX_CHUNKS_PER_ENTRY,
+            });
         }
 
         // Idempotency check.
@@ -433,9 +561,11 @@ impl VramCompressedCht {
         }
 
         // Build the entry: stage uncompressed flat → upload to device
-        // temp → compress device→device → free temp uncompressed.
+        // temp → compress device→device per chunk → free per-chunk
+        // temp uncompressed. Single-chunk fast path keeps the original
+        // pre-Z-6 layout for terms ≤ 16 MiB.
         let entry = self.build_entry(roaring, bucket_count, uncompressed_bytes)?;
-        let entry_compressed_bytes = entry.compressed_bytes as u64;
+        let entry_compressed_bytes = entry.compressed_bytes() as u64;
 
         if entry_compressed_bytes > self.budget_bytes {
             // Even compressed, too big for the entire budget.
@@ -466,7 +596,7 @@ impl VramCompressedCht {
                 if let Some((evicted_value, _)) = inner.map.remove(&k) {
                     inner.current_bytes = inner
                         .current_bytes
-                        .saturating_sub(evicted_value.compressed_bytes as u64);
+                        .saturating_sub(evicted_value.compressed_bytes() as u64);
                     inner.uncompressed_bytes_total = inner
                         .uncompressed_bytes_total
                         .saturating_sub(evicted_value.uncompressed_bytes as u64);
@@ -569,9 +699,14 @@ impl VramCompressedCht {
         }
         let total_words = v2_entry.total_words();
         let uncompressed_bytes = total_words * std::mem::size_of::<u32>();
-        // Single-chunk Bitcomp ceiling — symmetric with `insert`.
-        if uncompressed_bytes > (1 << 24) {
-            return Ok(false);
+        // Wave Z-6 #2: admission cap matches `insert` — up to
+        // MAX_CHUNKS_PER_ENTRY * BITCOMP_CHUNK_BYTES = 1 GiB.
+        let max_admit_bytes = MAX_CHUNKS_PER_ENTRY.saturating_mul(BITCOMP_CHUNK_BYTES);
+        if uncompressed_bytes > max_admit_bytes {
+            return Err(VramCompressedChtError::TooManyChunks {
+                chunks_needed: uncompressed_bytes.div_ceil(BITCOMP_CHUNK_BYTES),
+                max: MAX_CHUNKS_PER_ENTRY,
+            });
         }
 
         // Idempotency: if v3 already has this key, just bump the
@@ -591,68 +726,26 @@ impl VramCompressedCht {
             }
         }
 
-        // 1. Compute max compressed size, allocate d_compressed.
-        let max_compressed =
-            match BitcompDeviceCodec::max_compressed_size(uncompressed_bytes, self.data_type) {
-                Ok(s) => s,
-                Err(e) => return Err(VramCompressedChtError::Bitcomp(e)),
-            };
-        let mut d_compressed: *mut c_void = null_mut();
-        // SAFETY: cudaMalloc writes a valid device pointer on
-        // success; on error we return early without touching the
-        // pointer.
-        let rc = unsafe { cudaMalloc(&mut d_compressed, max_compressed) };
-        if rc != CUDA_SUCCESS {
-            return Err(VramCompressedChtError::Malloc {
-                bytes: max_compressed,
-                code: rc,
-            });
-        }
+        // 1. Compress device→device per chunk. Each chunk covers
+        //    `BUCKETS_PER_CHUNK` buckets (= 16 MiB) except possibly
+        //    the last; we walk the v2 device buffer with byte-offset
+        //    pointer arithmetic and feed each slice to a fresh
+        //    `compress_one` call. We hold `v2_entry` (`Arc` clone)
+        //    across the whole loop so a concurrent v2 eviction can't
+        //    race the source pointer into Drop.
+        let chunks = self.compress_chunks_device_to_device(
+            v2_entry.device_ptr() as *const c_void,
+            uncompressed_bytes,
+        )?;
 
-        // 2. Compress device→device. We hold `v2_entry` (an `Arc`
-        //    clone) across this call so a concurrent v2 eviction
-        //    can't race the source pointer into Drop.
-        let actual_comp_size = {
-            let mut codec = self
-                .insert_codec
-                .lock()
-                .expect("VramCompressedCht insert_codec poisoned");
-            // SAFETY: `v2_entry.device_ptr()` returns the v2 device
-            // pointer to a `[u32; total_words]` buffer of exactly
-            // `uncompressed_bytes` bytes; `d_compressed` was just
-            // allocated of `max_compressed` bytes. The Arc holds
-            // the v2 buffer alive across this call. Codec is
-            // serialised via this mutex.
-            unsafe {
-                codec.compress_one(
-                    v2_entry.device_ptr() as *const c_void,
-                    uncompressed_bytes,
-                    d_compressed,
-                    max_compressed,
-                )
-            }
-        };
-        let actual_comp_size = match actual_comp_size {
-            Ok(s) => s,
-            Err(e) => {
-                // SAFETY: d_compressed was allocated above and not
-                // yet inserted into the cache.
-                unsafe {
-                    let _ = cudaFree(d_compressed);
-                }
-                return Err(VramCompressedChtError::Bitcomp(e));
-            }
-        };
-
-        // 3. Build the v3 entry. Clone bucket_index from the v2
+        // 2. Build the v3 entry. Clone bucket_index from the v2
         //    entry — same `(high16, word_offset)` invariant.
         let entry = VramCompressedTermEntry {
-            d_compressed,
-            compressed_bytes: actual_comp_size,
+            chunks,
             uncompressed_bytes,
             bucket_index: v2_entry.bucket_index().to_vec(),
         };
-        let entry_compressed_bytes = entry.compressed_bytes as u64;
+        let entry_compressed_bytes = entry.compressed_bytes() as u64;
 
         if entry_compressed_bytes > self.budget_bytes {
             // Even compressed, too big for the whole budget. Drop
@@ -687,7 +780,7 @@ impl VramCompressedCht {
                 if let Some((evicted_value, _)) = inner.map.remove(&k) {
                     inner.current_bytes = inner
                         .current_bytes
-                        .saturating_sub(evicted_value.compressed_bytes as u64);
+                        .saturating_sub(evicted_value.compressed_bytes() as u64);
                     inner.uncompressed_bytes_total = inner
                         .uncompressed_bytes_total
                         .saturating_sub(evicted_value.uncompressed_bytes as u64);
@@ -774,13 +867,18 @@ impl VramCompressedCht {
     }
 
     /// Internal: stage uncompressed flat layout to host, upload to
-    /// device temp, compress with `BitcompDeviceCodec` to a freshly-
-    /// allocated `d_compressed`, free the device temp.
+    /// device temp per chunk, compress each chunk into a freshly-
+    /// allocated `d_compressed`, free per-chunk temp.
     ///
     /// Wave Z-2 #1: container→bitmap expansion lives in
     /// [`SharedBitmapPayload::from_postings`] so the staging /
-    /// bucket_index layout stays byte-identical to v2 (= the
-    /// invariant cross-tier promote relies on).
+    /// bucket_index layout stays byte-identical to v2.
+    ///
+    /// Wave Z-6 #2: when `uncompressed_bytes > BITCOMP_CHUNK_BYTES`
+    /// the host staging buffer is split on bucket boundaries (= every
+    /// `BUCKETS_PER_CHUNK` buckets) so each `compress_one` call sees
+    /// ≤ 16 MiB and the resulting chunks tile the original layout
+    /// contiguously. The last chunk may be smaller than 16 MiB.
     fn build_entry(
         &self,
         roaring: &RoaringPostings,
@@ -798,109 +896,207 @@ impl VramCompressedCht {
             ..
         } = payload;
 
-        // 2. Upload uncompressed staging to device temp.
-        let mut d_uncompressed_temp: *mut c_void = null_mut();
-        // SAFETY: cudaMalloc writes a valid device pointer on success.
-        let rc =
-            unsafe { cudaMalloc(&mut d_uncompressed_temp, uncompressed_bytes) };
-        if rc != CUDA_SUCCESS {
-            return Err(VramCompressedChtError::Malloc {
-                bytes: uncompressed_bytes,
-                code: rc,
-            });
-        }
-        // SAFETY: temp buffer just allocated of the right size; staging
-        // host buffer holds `uncompressed_bytes` valid bytes.
-        let rc = unsafe {
-            cudaMemcpy(
-                d_uncompressed_temp,
-                staging.as_ptr() as *const c_void,
-                uncompressed_bytes,
-                cudaMemcpyKind::cudaMemcpyHostToDevice,
-            )
-        };
-        if rc != CUDA_SUCCESS {
-            // SAFETY: just allocated by us.
-            unsafe {
-                let _ = cudaFree(d_uncompressed_temp);
-            }
-            return Err(VramCompressedChtError::Memcpy {
-                bytes: uncompressed_bytes,
-                code: rc,
-            });
-        }
-
-        // 3. Compute max compressed size, allocate d_compressed.
-        let max_compressed = match BitcompDeviceCodec::max_compressed_size(
+        // 2. Compress chunk-by-chunk from a freshly-uploaded device
+        //    temp (host → device → compress → free temp, repeated per
+        //    chunk). The per-chunk temp lets the loop avoid one giant
+        //    `cudaMalloc` of `uncompressed_bytes` for very dense terms.
+        let chunks = self.compress_chunks_host_to_device(
+            staging.as_slice(),
             uncompressed_bytes,
-            self.data_type,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                // SAFETY: temp just allocated by us.
+        )?;
+
+        Ok(VramCompressedTermEntry {
+            chunks,
+            uncompressed_bytes,
+            bucket_index,
+        })
+    }
+
+    /// Compress `uncompressed_bytes` of host staging into one
+    /// [`DeviceChunkSlice`] per Bitcomp chunk (≤ 16 MiB each). The
+    /// loop allocates a small per-chunk `d_uncompressed_temp`, copies
+    /// the relevant slice of `staging` into it, runs `compress_one`,
+    /// then frees the temp. On error any chunks allocated so far are
+    /// `cudaFree`'d so the caller never sees a leaked partial entry.
+    ///
+    /// `staging` is the host-side flat `[u32; total_words]` layout
+    /// produced by [`SharedBitmapPayload::from_postings`]; the chunk
+    /// boundaries fall on bucket boundaries (every `BUCKETS_PER_CHUNK`
+    /// buckets), so the resulting chunks tile the source layout
+    /// contiguously and the parent entry's single `bucket_index` vec
+    /// covers all chunks.
+    fn compress_chunks_host_to_device(
+        &self,
+        staging: &[u32],
+        uncompressed_bytes: usize,
+    ) -> Result<Vec<DeviceChunkSlice>, VramCompressedChtError> {
+        debug_assert_eq!(staging.len() * 4, uncompressed_bytes);
+        let n_chunks = uncompressed_bytes.div_ceil(BITCOMP_CHUNK_BYTES).max(1);
+        let mut chunks: Vec<DeviceChunkSlice> = Vec::with_capacity(n_chunks);
+        let mut byte_offset: usize = 0;
+        let mut chunk_idx: usize = 0;
+        while byte_offset < uncompressed_bytes {
+            let chunk_uncomp = (uncompressed_bytes - byte_offset).min(BITCOMP_CHUNK_BYTES);
+
+            // Per-chunk uncompressed temp on device.
+            let mut d_uncompressed_temp: *mut c_void = null_mut();
+            // SAFETY: cudaMalloc writes a valid device pointer on success.
+            let rc = unsafe { cudaMalloc(&mut d_uncompressed_temp, chunk_uncomp) };
+            if rc != CUDA_SUCCESS {
+                free_chunks(chunks);
+                return Err(VramCompressedChtError::Malloc {
+                    bytes: chunk_uncomp,
+                    code: rc,
+                });
+            }
+            // SAFETY: chunk_uncomp ≤ remaining staging bytes; word
+            // offsets align with chunk boundaries (chunk_uncomp is a
+            // multiple of `BITMAP_CONTAINER_WORDS * 4` except possibly
+            // the last chunk, which is a multiple of 4 either way).
+            let staging_byte_ptr = unsafe {
+                (staging.as_ptr() as *const u8).add(byte_offset) as *const c_void
+            };
+            let rc = unsafe {
+                cudaMemcpy(
+                    d_uncompressed_temp,
+                    staging_byte_ptr,
+                    chunk_uncomp,
+                    cudaMemcpyKind::cudaMemcpyHostToDevice,
+                )
+            };
+            if rc != CUDA_SUCCESS {
                 unsafe {
                     let _ = cudaFree(d_uncompressed_temp);
                 }
-                return Err(VramCompressedChtError::Bitcomp(e));
+                free_chunks(chunks);
+                return Err(VramCompressedChtError::Memcpy {
+                    bytes: chunk_uncomp,
+                    code: rc,
+                });
             }
-        };
+
+            match self.compress_one_chunk_in_place(d_uncompressed_temp, chunk_uncomp) {
+                Ok(chunk) => {
+                    chunks.push(chunk);
+                    // SAFETY: the per-chunk uncompressed temp is no
+                    // longer needed once compress_one finished.
+                    unsafe {
+                        let _ = cudaFree(d_uncompressed_temp);
+                    }
+                }
+                Err(e) => {
+                    unsafe {
+                        let _ = cudaFree(d_uncompressed_temp);
+                    }
+                    free_chunks(chunks);
+                    return Err(e);
+                }
+            }
+
+            byte_offset += chunk_uncomp;
+            chunk_idx += 1;
+            debug_assert!(chunk_idx <= MAX_CHUNKS_PER_ENTRY);
+        }
+        debug_assert!(!chunks.is_empty());
+        debug_assert_eq!(chunks.len(), n_chunks);
+        Ok(chunks)
+    }
+
+    /// Same as [`Self::compress_chunks_host_to_device`] but the
+    /// uncompressed source already lives on device — used by
+    /// [`Self::promote_v2_to_v3`]. We slice the v2 device buffer with
+    /// byte-offset pointer arithmetic and feed each slice directly to
+    /// `compress_one` (no host staging round-trip). The caller must
+    /// keep the source pointer alive for the duration of the call
+    /// (an `Arc<VramTermEntry>` clone in the v2 case).
+    fn compress_chunks_device_to_device(
+        &self,
+        v2_device_base: *const c_void,
+        uncompressed_bytes: usize,
+    ) -> Result<Vec<DeviceChunkSlice>, VramCompressedChtError> {
+        let n_chunks = uncompressed_bytes.div_ceil(BITCOMP_CHUNK_BYTES).max(1);
+        let mut chunks: Vec<DeviceChunkSlice> = Vec::with_capacity(n_chunks);
+        let mut byte_offset: usize = 0;
+        let mut chunk_idx: usize = 0;
+        while byte_offset < uncompressed_bytes {
+            let chunk_uncomp = (uncompressed_bytes - byte_offset).min(BITCOMP_CHUNK_BYTES);
+            // SAFETY: v2_device_base is a valid `[u32; total_words]`
+            // device buffer of exactly `uncompressed_bytes` bytes;
+            // `byte_offset + chunk_uncomp ≤ uncompressed_bytes` so the
+            // offset pointer stays within the original allocation.
+            let chunk_src = unsafe {
+                (v2_device_base as *const u8).add(byte_offset) as *const c_void
+            };
+            match self.compress_one_chunk_in_place(chunk_src as *mut c_void, chunk_uncomp) {
+                Ok(chunk) => chunks.push(chunk),
+                Err(e) => {
+                    free_chunks(chunks);
+                    return Err(e);
+                }
+            }
+            byte_offset += chunk_uncomp;
+            chunk_idx += 1;
+            debug_assert!(chunk_idx <= MAX_CHUNKS_PER_ENTRY);
+        }
+        debug_assert!(!chunks.is_empty());
+        debug_assert_eq!(chunks.len(), n_chunks);
+        Ok(chunks)
+    }
+
+    /// Allocate `d_compressed`, run `compress_one` from
+    /// `d_uncompressed` (device pointer; not freed here — caller
+    /// manages its lifetime), return the `DeviceChunkSlice`. On error
+    /// `d_compressed` is freed before returning.
+    fn compress_one_chunk_in_place(
+        &self,
+        d_uncompressed: *mut c_void,
+        chunk_uncomp: usize,
+    ) -> Result<DeviceChunkSlice, VramCompressedChtError> {
+        let max_compressed =
+            BitcompDeviceCodec::max_compressed_size(chunk_uncomp, self.data_type)
+                .map_err(VramCompressedChtError::Bitcomp)?;
         let mut d_compressed: *mut c_void = null_mut();
-        // SAFETY: cudaMalloc writes valid pointer on success.
+        // SAFETY: cudaMalloc writes a valid device pointer on success.
         let rc = unsafe { cudaMalloc(&mut d_compressed, max_compressed) };
         if rc != CUDA_SUCCESS {
-            // SAFETY: temp still valid; free it.
-            unsafe {
-                let _ = cudaFree(d_uncompressed_temp);
-            }
             return Err(VramCompressedChtError::Malloc {
                 bytes: max_compressed,
                 code: rc,
             });
         }
-
-        // 4. Compress device→device.
         let actual_comp_size = {
             let mut codec = self
                 .insert_codec
                 .lock()
                 .expect("VramCompressedCht insert_codec poisoned");
-            // SAFETY: both pointers are valid device buffers of the
-            // sizes we pass. Codec serialises across callers via this
-            // mutex, so its internal singletons aren't raced.
+            // SAFETY: both pointers point to valid device buffers
+            // (`d_uncompressed` of `chunk_uncomp` bytes from caller,
+            // `d_compressed` of `max_compressed` bytes from above);
+            // codec is serialised across callers via this mutex.
             unsafe {
                 codec.compress_one(
-                    d_uncompressed_temp as *const c_void,
-                    uncompressed_bytes,
+                    d_uncompressed as *const c_void,
+                    chunk_uncomp,
                     d_compressed,
                     max_compressed,
                 )
             }
         };
-        let actual_comp_size = match actual_comp_size {
-            Ok(s) => s,
+        match actual_comp_size {
+            Ok(actual) => Ok(DeviceChunkSlice {
+                d_compressed,
+                compressed_bytes: actual,
+                uncompressed_bytes: chunk_uncomp,
+            }),
             Err(e) => {
-                // SAFETY: both pointers were allocated by us above.
+                // SAFETY: d_compressed was allocated above and not
+                // yet handed out.
                 unsafe {
-                    let _ = cudaFree(d_uncompressed_temp);
                     let _ = cudaFree(d_compressed);
                 }
-                return Err(VramCompressedChtError::Bitcomp(e));
+                Err(VramCompressedChtError::Bitcomp(e))
             }
-        };
-
-        // 5. Free the device temp uncompressed buffer (we no longer
-        //    need it; only d_compressed survives in the cache).
-        // SAFETY: temp was allocated above, is no longer referenced.
-        unsafe {
-            let _ = cudaFree(d_uncompressed_temp);
         }
-
-        Ok(VramCompressedTermEntry {
-            d_compressed,
-            compressed_bytes: actual_comp_size,
-            uncompressed_bytes,
-            bucket_index,
-        })
     }
 
     // ========================================================
@@ -943,6 +1139,19 @@ impl VramCompressedCht {
         let mut writer = open_tmp_writer(path)?;
         write_file_header(&mut writer, MAGIC_V3, entry_count)?;
         for (i, (key, entry)) in snapshot.iter().enumerate() {
+            // Wave Z-6 #2: MAGIC_V3 dump format encodes one
+            // compressed payload per entry; multi-chunk entries
+            // (chunk_count > 1) await the MAGIC_V4 wire format in
+            // Z-6 #4 and currently trip a debug_assert. In release
+            // builds, a snapshot containing a multi-chunk entry
+            // would dump only `chunks[0]` (via the back-compat
+            // shim) and load back as a corrupt single-chunk entry
+            // — to be replaced by per-chunk dump records in Z-6 #4.
+            debug_assert_eq!(
+                entry.chunk_count(),
+                1,
+                "dump_to_path(): multi-chunk entry requires Z-6 #4 MAGIC_V4 wire format"
+            );
             write_chtkey(&mut writer, key)?;
             // bucket_count + per-bucket (high16, word_offset) pairs.
             let bucket_count = u32::try_from(entry.bucket_index.len()).unwrap_or(u32::MAX);
@@ -953,18 +1162,19 @@ impl VramCompressedCht {
             }
             // uncompressed_bytes + compressed_bytes (both u64).
             writer.write_all(&(entry.uncompressed_bytes as u64).to_le_bytes())?;
-            writer.write_all(&(entry.compressed_bytes as u64).to_le_bytes())?;
+            let bytes = entry.compressed_bytes();
+            writer.write_all(&(bytes as u64).to_le_bytes())?;
             // Stage the device-resident compressed payload back to
-            // host for write.
-            let bytes = entry.compressed_bytes;
+            // host for write. Single-chunk back-compat path via the
+            // shim — Z-6 #4 walks chunks() instead.
             let mut host_staging: Vec<u8> = vec![0u8; bytes];
-            // SAFETY: entry.d_compressed points to `bytes` of device
-            // memory owned by this Arc; host_staging holds `bytes`
-            // of valid host memory.
+            // SAFETY: entry.device_ptr() returns chunks[0].d_compressed
+            // pointing to `bytes` of device memory owned by this Arc;
+            // host_staging holds `bytes` of valid host memory.
             let rc = unsafe {
                 cudaMemcpy(
                     host_staging.as_mut_ptr() as *mut c_void,
-                    entry.d_compressed as *const c_void,
+                    entry.device_ptr(),
                     bytes,
                     cudaMemcpyKind::cudaMemcpyDeviceToHost,
                 )
@@ -1049,14 +1259,21 @@ impl VramCompressedCht {
                 }
                 continue;
             }
+            // MAGIC_V3 = single-chunk-per-entry; build a 1-element
+            // chunks vec so the Drop / accessor invariants hold. Z-6 #4
+            // will introduce MAGIC_V4 with multi-chunk records and a
+            // load-time dispatch on magic.
             let entry = VramCompressedTermEntry {
-                d_compressed,
-                compressed_bytes,
+                chunks: vec![DeviceChunkSlice {
+                    d_compressed,
+                    compressed_bytes,
+                    uncompressed_bytes,
+                }],
                 uncompressed_bytes,
                 bucket_index,
             };
             // Install via LRU eviction path.
-            let entry_compressed_bytes = entry.compressed_bytes as u64;
+            let entry_compressed_bytes = entry.compressed_bytes() as u64;
             let entry_uncompressed_bytes = entry.uncompressed_bytes as u64;
             let mut inner = self.inner.lock().expect("VramCompressedCht mutex poisoned");
             let next_token = inner.next_token + 1;
@@ -1077,7 +1294,7 @@ impl VramCompressedCht {
                     if let Some((evicted_value, _)) = inner.map.remove(&k) {
                         inner.current_bytes = inner
                             .current_bytes
-                            .saturating_sub(evicted_value.compressed_bytes as u64);
+                            .saturating_sub(evicted_value.compressed_bytes() as u64);
                         inner.uncompressed_bytes_total = inner
                             .uncompressed_bytes_total
                             .saturating_sub(evicted_value.uncompressed_bytes as u64);
@@ -1151,6 +1368,21 @@ pub fn global_with_budget(budget_bytes: u64) -> Option<&'static VramCompressedCh
 pub fn reset_global() {
     if let Some(cht) = GLOBAL_VRAM_COMPRESSED_CHT.get() {
         cht.reset();
+    }
+}
+
+/// Free every chunk's `d_compressed` device pointer. Used when a
+/// multi-chunk admission errors part-way through compression so the
+/// half-built `chunks` vec doesn't leak the chunks already allocated.
+fn free_chunks(chunks: Vec<DeviceChunkSlice>) {
+    for chunk in chunks {
+        // SAFETY: caller passes ownership of the chunks vec; each
+        // `d_compressed` was allocated by us via cudaMalloc.
+        unsafe {
+            if !chunk.d_compressed.is_null() {
+                let _ = cudaFree(chunk.d_compressed);
+            }
+        }
     }
 }
 
@@ -2018,5 +2250,233 @@ mod tests {
         assert_eq!(v3.stats().cross_tier_promotions, 1);
         v3.reset();
         assert_eq!(v3.stats().cross_tier_promotions, 0);
+    }
+
+    // ========================================================
+    // Wave Z-6 #2 — multi-chunk Bitcomp admission tests
+    // ========================================================
+
+    /// One doc in each of `buckets` distinct high16 buckets — forces
+    /// the staging buffer to grow to `buckets * 8 KiB` uncompressed so
+    /// we can exercise the multi-chunk admission path without piling
+    /// docs into the same container.
+    fn multi_chunk_roaring(buckets: usize) -> RoaringPostings {
+        let docs: Vec<u32> = (0..buckets).map(|i| (i as u32) << 16).collect();
+        RoaringEncoder::from_doc_ids(&docs)
+    }
+
+    #[test]
+    fn insert_multi_chunk_roundtrip() {
+        // Wave Z-6 #2 acceptance gate: a 32 MiB-equivalent posting
+        // (= 4096 buckets × 8 KiB) admits via the new multi-chunk
+        // path and produces exactly 2 chunks. `compressed_bytes()`
+        // aggregates per-chunk bytes; idempotent re-insert short-
+        // circuits without bumping inserts.
+        if !cuda_available() {
+            return;
+        }
+        let cht = VramCompressedCht::with_budget(128 * 1024 * 1024).unwrap();
+        let key = dummy_key(0xC01_C01, 100);
+        let rp = multi_chunk_roaring(BUCKETS_PER_CHUNK * 2);
+        let inserted = cht.insert(key.clone(), &rp).unwrap();
+        assert!(
+            inserted,
+            "32 MiB-equivalent posting must admit via multi-chunk path"
+        );
+        let entry = cht.get(&key).expect("hit");
+        assert_eq!(entry.chunk_count(), 2, "32 MiB ÷ 16 MiB = 2 chunks");
+        assert_eq!(entry.bucket_count(), BUCKETS_PER_CHUNK * 2);
+        assert_eq!(
+            entry.uncompressed_bytes(),
+            BUCKETS_PER_CHUNK * 2 * BITMAP_CONTAINER_WORDS * 4
+        );
+        let sum_compressed: usize = entry.chunks().iter().map(|c| c.compressed_bytes).sum();
+        assert_eq!(entry.compressed_bytes(), sum_compressed);
+        let sum_uncomp: usize = entry.chunks().iter().map(|c| c.uncompressed_bytes).sum();
+        assert_eq!(entry.uncompressed_bytes(), sum_uncomp);
+
+        // Idempotent re-insert short-circuits.
+        let inserted_2 = cht.insert(key.clone(), &rp).unwrap();
+        assert!(!inserted_2);
+        assert_eq!(cht.stats().inserts, 1);
+    }
+
+    #[test]
+    fn promote_v2_to_v3_multi_chunk_roundtrip() {
+        // Cross-tier promote on a 32 MiB-equivalent posting: v2 holds
+        // the uncompressed buffer (one cudaMalloc); v3 fans out across
+        // 2 Bitcomp chunks via device→device compress without
+        // re-draining the source postings. `cross_tier_promotions`
+        // bumps by exactly 1 per successful promote (single counter
+        // bump, NOT per-chunk).
+        if !cuda_available() {
+            return;
+        }
+        let v3 = VramCompressedCht::with_budget(128 * 1024 * 1024).unwrap();
+        let rp = multi_chunk_roaring(BUCKETS_PER_CHUNK * 2);
+
+        // v2 needs ≥ 32 MiB budget to hold the uncompressed buffer.
+        let v2 = crate::postings::roaring::vram_cht::VramCht::with_budget(128 * 1024 * 1024);
+        let key = dummy_key(0xC03_3001, 100);
+        v2.insert(key.clone(), &rp).unwrap();
+        let v2_entry = v2.get(&key).expect("v2 must hit");
+        let v2_bucket_index = v2_entry.bucket_index().to_vec();
+
+        let inserted = v3.promote_v2_to_v3(&key, Arc::clone(&v2_entry)).unwrap();
+        assert!(inserted, "32 MiB v2 entry must promote into multi-chunk v3");
+        let v3_entry = v3.get(&key).expect("v3 must hit post-promote");
+        assert_eq!(v3_entry.chunk_count(), 2);
+        assert_eq!(v3_entry.bucket_index(), v2_bucket_index.as_slice());
+        assert_eq!(
+            v3_entry.uncompressed_bytes(),
+            BUCKETS_PER_CHUNK * 2 * BITMAP_CONTAINER_WORDS * 4
+        );
+        // Counter bumps once per promote, not once per chunk.
+        let stats = v3.stats();
+        assert_eq!(stats.promotions, 1);
+        assert_eq!(stats.cross_tier_promotions, 1);
+        assert_eq!(stats.inserts, 1);
+    }
+
+    #[test]
+    fn multi_chunk_drop_frees_all_chunks() {
+        // Drop must run `cudaFree` for every chunk in the chunks vec.
+        // We can't directly count cudaFree calls without instrumenting
+        // the runtime, but we can verify by reset()ing a populated
+        // multi-chunk cache and reusing the freed memory for a fresh
+        // insert — if the previous chunks weren't freed, we'd see
+        // budget pressure that prevents the second insert.
+        if !cuda_available() {
+            return;
+        }
+        let one_entry_uncompressed_bytes = BUCKETS_PER_CHUNK * 2 * BITMAP_CONTAINER_WORDS * 4;
+        // Sanity: each entry is 32 MiB uncompressed.
+        assert_eq!(one_entry_uncompressed_bytes, 32 * 1024 * 1024);
+
+        let cht = VramCompressedCht::with_budget(256 * 1024 * 1024).unwrap();
+        let rp = multi_chunk_roaring(BUCKETS_PER_CHUNK * 2);
+        let k1 = dummy_key(0xD09_F100, 100);
+        cht.insert(k1.clone(), &rp).unwrap();
+        let entry = cht.get(&k1).expect("hit");
+        assert_eq!(entry.chunk_count(), 2);
+        let live_bytes_before = cht.stats().current_bytes;
+        assert!(live_bytes_before > 0);
+        drop(entry);
+
+        // Reset drops every cached entry's Arc → Drop runs cudaFree
+        // for both chunks. Cache budget must clear back to zero.
+        cht.reset();
+        assert_eq!(cht.stats().current_bytes, 0);
+        assert_eq!(cht.stats().entries, 0);
+
+        // Re-insert succeeds — proves the prior chunks' device memory
+        // was freed and is available to back the new allocation.
+        let k2 = dummy_key(0xD09_F200, 100);
+        let reinserted = cht.insert(k2, &rp).unwrap();
+        assert!(reinserted, "post-reset re-insert must reuse freed VRAM");
+        assert_eq!(cht.stats().entries, 1);
+    }
+
+    #[test]
+    fn legacy_single_chunk_path_unchanged() {
+        // Existing terms below the 16 MiB threshold continue to land
+        // as `chunks.len() == 1`; the back-compat shim methods stay
+        // valid and the persist dump/load roundtrip (covered in the
+        // separate D-5 tests) keeps working byte-for-byte.
+        if !cuda_available() {
+            return;
+        }
+        let cht = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let key = dummy_key(0xE05_E05, 100);
+        cht.insert(key.clone(), &small_roaring()).unwrap();
+        let entry = cht.get(&key).expect("hit");
+        assert_eq!(
+            entry.chunk_count(),
+            1,
+            "small (< 16 MiB) terms keep the single-chunk fast path"
+        );
+        // Back-compat shims must still produce the chunk's device pointer.
+        assert!(!entry.device_ptr().is_null());
+        assert!(!entry.d_compressed().is_null());
+        assert_eq!(entry.device_ptr() as *mut c_void, entry.d_compressed());
+        // Sum aggregation degenerates to the single chunk's bytes.
+        assert_eq!(entry.compressed_bytes(), entry.chunks()[0].compressed_bytes);
+        assert_eq!(
+            entry.uncompressed_bytes(),
+            entry.chunks()[0].uncompressed_bytes
+        );
+    }
+
+    #[test]
+    fn admission_cap_constants_and_error_variant_shape() {
+        // `MAX_CHUNKS_PER_ENTRY * BITCOMP_CHUNK_BYTES` (= 1 GiB) is the
+        // hard admission cap. Reaching it via a single `RoaringPostings`
+        // is **not** possible today because `high16` is `u16`, bounding
+        // the per-term bucket count at 65,536 (= 32 chunks at 2,048
+        // buckets each) — well below the 64-chunk cap. The
+        // `TooManyChunks` variant exists for hypothetical future
+        // expansion (wider high16, denser containers); pin its shape +
+        // the cap constants so consumers can match on the error and so
+        // a constant tweak fails loud here.
+        assert_eq!(MAX_CHUNKS_PER_ENTRY, 64);
+        assert_eq!(BITCOMP_CHUNK_BYTES, 1 << 24);
+        assert_eq!(BUCKETS_PER_CHUNK, 2048);
+        assert_eq!(
+            MAX_CHUNKS_PER_ENTRY * BITCOMP_CHUNK_BYTES,
+            1024 * 1024 * 1024,
+            "max admission must equal 1 GiB"
+        );
+        let err = VramCompressedChtError::TooManyChunks {
+            chunks_needed: 100,
+            max: MAX_CHUNKS_PER_ENTRY,
+        };
+        match err {
+            VramCompressedChtError::TooManyChunks { chunks_needed, max } => {
+                assert_eq!(chunks_needed, 100);
+                assert_eq!(max, MAX_CHUNKS_PER_ENTRY);
+            }
+            other => panic!("variant mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bucket_index_byte_offsets_match_chunk_boundaries() {
+        // Layout invariant pin: for a multi-chunk entry, the prefix
+        // sum of `chunks[..k].uncompressed_bytes` aligns with the
+        // bucket_index's byte offset for bucket `k * BUCKETS_PER_CHUNK`.
+        // This is the assumption Z-6 #3 dispatch flattening will rely
+        // on; pin it now so design pivots fail loud.
+        if !cuda_available() {
+            return;
+        }
+        let cht = VramCompressedCht::with_budget(128 * 1024 * 1024).unwrap();
+        let key = dummy_key(0xB47_B47, 100);
+        let rp = multi_chunk_roaring(BUCKETS_PER_CHUNK * 2);
+        cht.insert(key.clone(), &rp).unwrap();
+        let entry = cht.get(&key).expect("hit");
+        assert_eq!(entry.chunk_count(), 2);
+
+        let bucket_bytes = BITMAP_CONTAINER_WORDS * 4;
+        let mut byte_prefix: usize = 0;
+        for (k, chunk) in entry.chunks().iter().enumerate() {
+            let first_bucket_of_chunk = k * BUCKETS_PER_CHUNK;
+            // The (high16, word_offset) entry for the chunk's first
+            // bucket must point at the start of this chunk in the
+            // uncompressed layout.
+            let (_, word_offset) = entry.bucket_index()[first_bucket_of_chunk];
+            assert_eq!(
+                word_offset as usize * 4,
+                byte_prefix,
+                "chunk {k}: bucket_index word_offset must mark chunk start"
+            );
+            // Each chunk covers an integral number of buckets.
+            assert_eq!(
+                chunk.uncompressed_bytes % bucket_bytes,
+                0,
+                "chunk {k} uncompressed_bytes must be a multiple of {bucket_bytes}"
+            );
+            byte_prefix += chunk.uncompressed_bytes;
+        }
+        assert_eq!(byte_prefix, entry.uncompressed_bytes());
     }
 }

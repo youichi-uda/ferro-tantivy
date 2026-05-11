@@ -76,6 +76,7 @@ use ferro_compress::{BitcompDataType, BitcompDeviceCodec, Error as FcError};
 use crate::postings::roaring::cht::ChtKey;
 use crate::postings::roaring::encoder::RoaringPostings;
 use crate::postings::roaring::shared_bitmap_payload::SharedBitmapPayload;
+use crate::postings::roaring::vram_cht::VramTermEntry;
 use crate::postings::roaring::BITMAP_CONTAINER_WORDS;
 
 /// Errors specific to the v3 cache layer. Insert / promote failures
@@ -488,6 +489,217 @@ impl VramCompressedCht {
             self.promotions.fetch_add(1, Ordering::Relaxed);
         }
         Ok(inserted)
+    }
+
+    /// Wave Z-2 #1 — promote a v2 entry to v3 by Bitcomp-compressing
+    /// the v2 device buffer **without re-draining the source
+    /// postings**.
+    ///
+    /// The caller hands in the v2 [`Arc<VramTermEntry>`] (= the
+    /// existing tier hit). The v2 entry already owns:
+    /// - the `bucket_index` produced by the same
+    ///   [`SharedBitmapPayload`] expansion v3 would have produced
+    ///   internally;
+    /// - an uncompressed `[u32; total_words]` device buffer
+    ///   bytewise-identical to what v3's existing `build_entry`
+    ///   would have allocated + filled.
+    ///
+    /// This method reuses both: it skips the host
+    /// container→bitmap walk + `cudaMalloc d_uncompressed_temp` +
+    /// H→D staging copy, and directly feeds the v2 device pointer
+    /// into the Bitcomp `compress_one` call. Caller-visible savings
+    /// on dense terms (10K+ buckets per the recon estimate) are
+    /// ~60ms compared with `insert(roaring)`.
+    ///
+    /// ## Returns
+    /// - `Ok(true)` on successful insertion (admission policy + LRU
+    ///   eviction performed; promotions counter bumped).
+    /// - `Ok(false)` on rejection: kill-switch active OR the
+    ///   compressed entry would alone exceed `budget_bytes` OR the
+    ///   key is already cached (idempotent re-promote).
+    /// - `Err(VramCompressedChtError)` on CUDA / Bitcomp failure.
+    ///
+    /// ## Lifetime / safety
+    /// `v2_entry` is held by `Arc` across the entire compress
+    /// call. The v2 `Drop` (= `cudaFree(d_buckets)`) cannot fire
+    /// while we hold an `Arc` clone, so a concurrent v2 eviction
+    /// of the same key is safe — the device buffer the compressor
+    /// reads stays alive until this method returns. Once the v3
+    /// entry is in the cache map, the v2 `Arc` can be dropped by
+    /// the caller without affecting the v3 entry's freshly-
+    /// allocated `d_compressed`.
+    ///
+    /// ## Layout invariant
+    /// The v2 entry's `d_buckets: *mut u32` points to a contiguous
+    /// `[u32; total_words]` allocation; reinterpret-cast to
+    /// `*const c_void` matches the Bitcomp `compress_one` input
+    /// signature without a device-side copy. v3 (uncompressed
+    /// side) and v2 share this layout by construction — both go
+    /// through [`SharedBitmapPayload::from_postings`] for any
+    /// freshly-built entry, and the v2 dump/load path round-trips
+    /// the same bytes.
+    pub fn promote_v2_to_v3(
+        &self,
+        key: &ChtKey,
+        v2_entry: Arc<VramTermEntry>,
+    ) -> Result<bool, VramCompressedChtError> {
+        if is_disabled() {
+            return Ok(false);
+        }
+
+        let bucket_count = v2_entry.bucket_count();
+        if bucket_count == 0 {
+            // Defensive: a v2 entry with zero buckets shouldn't
+            // exist (the v2 insert path filters empty terms), but
+            // we treat it the same way for symmetry.
+            return Ok(false);
+        }
+        let total_words = v2_entry.total_words();
+        let uncompressed_bytes = total_words * std::mem::size_of::<u32>();
+        // Single-chunk Bitcomp ceiling — symmetric with `insert`.
+        if uncompressed_bytes > (1 << 24) {
+            return Ok(false);
+        }
+
+        // Idempotency: if v3 already has this key, just bump the
+        // LRU token and short-circuit. No device call.
+        {
+            let mut inner = self.inner.lock().expect("VramCompressedCht mutex poisoned");
+            let next_token = inner.next_token + 1;
+            let already_cached = inner
+                .map
+                .get_mut(key)
+                .map(|(_, token)| {
+                    *token = next_token;
+                });
+            if already_cached.is_some() {
+                inner.next_token = next_token;
+                return Ok(false);
+            }
+        }
+
+        // 1. Compute max compressed size, allocate d_compressed.
+        let max_compressed =
+            match BitcompDeviceCodec::max_compressed_size(uncompressed_bytes, self.data_type) {
+                Ok(s) => s,
+                Err(e) => return Err(VramCompressedChtError::Bitcomp(e)),
+            };
+        let mut d_compressed: *mut c_void = null_mut();
+        // SAFETY: cudaMalloc writes a valid device pointer on
+        // success; on error we return early without touching the
+        // pointer.
+        let rc = unsafe { cudaMalloc(&mut d_compressed, max_compressed) };
+        if rc != CUDA_SUCCESS {
+            return Err(VramCompressedChtError::Malloc {
+                bytes: max_compressed,
+                code: rc,
+            });
+        }
+
+        // 2. Compress device→device. We hold `v2_entry` (an `Arc`
+        //    clone) across this call so a concurrent v2 eviction
+        //    can't race the source pointer into Drop.
+        let actual_comp_size = {
+            let mut codec = self
+                .insert_codec
+                .lock()
+                .expect("VramCompressedCht insert_codec poisoned");
+            // SAFETY: `v2_entry.device_ptr()` returns the v2 device
+            // pointer to a `[u32; total_words]` buffer of exactly
+            // `uncompressed_bytes` bytes; `d_compressed` was just
+            // allocated of `max_compressed` bytes. The Arc holds
+            // the v2 buffer alive across this call. Codec is
+            // serialised via this mutex.
+            unsafe {
+                codec.compress_one(
+                    v2_entry.device_ptr() as *const c_void,
+                    uncompressed_bytes,
+                    d_compressed,
+                    max_compressed,
+                )
+            }
+        };
+        let actual_comp_size = match actual_comp_size {
+            Ok(s) => s,
+            Err(e) => {
+                // SAFETY: d_compressed was allocated above and not
+                // yet inserted into the cache.
+                unsafe {
+                    let _ = cudaFree(d_compressed);
+                }
+                return Err(VramCompressedChtError::Bitcomp(e));
+            }
+        };
+
+        // 3. Build the v3 entry. Clone bucket_index from the v2
+        //    entry — same `(high16, word_offset)` invariant.
+        let entry = VramCompressedTermEntry {
+            d_compressed,
+            compressed_bytes: actual_comp_size,
+            uncompressed_bytes,
+            bucket_index: v2_entry.bucket_index().to_vec(),
+        };
+        let entry_compressed_bytes = entry.compressed_bytes as u64;
+
+        if entry_compressed_bytes > self.budget_bytes {
+            // Even compressed, too big for the whole budget. Drop
+            // the freshly-allocated d_compressed and return false.
+            drop(entry);
+            return Ok(false);
+        }
+
+        // 4. Install under LRU eviction. Symmetric with `insert`'s
+        //    post-build branch (idempotency re-check + evict-to-fit
+        //    + bump counters).
+        let mut inner = self.inner.lock().expect("VramCompressedCht mutex poisoned");
+        let next_token = inner.next_token + 1;
+        if let Some((_, token)) = inner.map.get_mut(key) {
+            // Race: another thread populated the same key between
+            // the pre-alloc idempotency check and now. Drop ours.
+            *token = next_token;
+            inner.next_token = next_token;
+            drop(inner);
+            // entry's `Drop` runs cudaFree on d_compressed.
+            return Ok(false);
+        }
+        while inner.current_bytes + entry_compressed_bytes > self.budget_bytes
+            && !inner.map.is_empty()
+        {
+            let oldest_key = inner
+                .map
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest_key {
+                if let Some((evicted_value, _)) = inner.map.remove(&k) {
+                    inner.current_bytes = inner
+                        .current_bytes
+                        .saturating_sub(evicted_value.compressed_bytes as u64);
+                    inner.uncompressed_bytes_total = inner
+                        .uncompressed_bytes_total
+                        .saturating_sub(evicted_value.uncompressed_bytes as u64);
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+        let entry_uncompressed_bytes = entry.uncompressed_bytes as u64;
+        inner.next_token = next_token;
+        inner.current_bytes += entry_compressed_bytes;
+        inner.uncompressed_bytes_total += entry_uncompressed_bytes;
+        inner
+            .map
+            .insert(key.clone(), (Arc::new(entry), next_token));
+        self.inserts.fetch_add(1, Ordering::Relaxed);
+        self.promotions.fetch_add(1, Ordering::Relaxed);
+        // Drop the inner lock before returning so the caller doesn't
+        // hold it any longer than necessary.
+        drop(inner);
+        // `v2_entry` Arc is released here (caller's clone or the
+        // method-scope binding); the v2 cache still holds its own
+        // clone if it's resident.
+        Ok(true)
     }
 
     /// Snapshot of current stats. Cheap (atomic loads + one mutex
@@ -1463,5 +1675,230 @@ mod tests {
             assert!(inserted);
             assert!(cht.get(&key).is_some());
         }
+    }
+
+    // ========================================================
+    // Wave Z-2 #1 — promote_v2_to_v3 cross-tier tests
+    // ========================================================
+
+    /// Build a freshly-populated v2 cache + extract the
+    /// `Arc<VramTermEntry>` so the v3 cross-tier promote tests
+    /// don't have to repeat the boilerplate.
+    fn populate_v2(roaring: &RoaringPostings) -> (crate::postings::roaring::vram_cht::VramCht, ChtKey, Arc<VramTermEntry>) {
+        let v2 = crate::postings::roaring::vram_cht::VramCht::with_budget(64 * 1024 * 1024);
+        let key = dummy_key(0xC03_3000, 100);
+        v2.insert(key.clone(), roaring).unwrap();
+        let entry = v2.get(&key).expect("v2 must hit after insert");
+        (v2, key, entry)
+    }
+
+    #[test]
+    fn promote_v2_to_v3_reuses_bucket_index() {
+        // Acceptance gate: the v2 entry's `bucket_index` survives
+        // the cross-tier promote byte-for-byte. Same `(high16,
+        // word_offset)` invariant the v3 dump/load path relies on,
+        // re-used here from the v2 source instead of re-expanding
+        // the postings.
+        if !cuda_available() {
+            return;
+        }
+        let v3 = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let rp = small_roaring();
+        let (_v2, key, v2_entry) = populate_v2(&rp);
+        let v2_bucket_index = v2_entry.bucket_index().to_vec();
+        let v2_total_words = v2_entry.total_words();
+
+        let inserted = v3.promote_v2_to_v3(&key, Arc::clone(&v2_entry)).unwrap();
+        assert!(inserted, "promote must admit a fresh key");
+
+        let v3_entry = v3.get(&key).expect("v3 must hit post-promote");
+        assert_eq!(
+            v3_entry.bucket_index(),
+            v2_bucket_index.as_slice(),
+            "v3 bucket_index must be byte-identical to v2 source"
+        );
+        assert_eq!(
+            v3_entry.uncompressed_bytes(),
+            v2_total_words * 4,
+            "v3 uncompressed_bytes must equal v2 total_words*4"
+        );
+        assert_eq!(v3_entry.bucket_count(), v2_entry.bucket_count());
+        // Stats: promotion was counted.
+        let stats = v3.stats();
+        assert_eq!(stats.inserts, 1);
+        assert_eq!(stats.promotions, 1);
+    }
+
+    #[test]
+    fn promote_v2_to_v3_skips_redrain() {
+        // Acceptance gate: promote works purely from the
+        // `Arc<VramTermEntry>` handle — the caller does NOT need to
+        // hold or re-drain the original `RoaringPostings`. We
+        // populate v2, drop the source `RoaringPostings`, and the
+        // promote still succeeds (the v2 device buffer is the
+        // canonical copy).
+        if !cuda_available() {
+            return;
+        }
+        let v3 = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let key;
+        let v2_entry;
+        let v2_holder;
+        {
+            let rp = dense_roaring(0);
+            let (v2, k, e) = populate_v2(&rp);
+            key = k;
+            v2_entry = e;
+            v2_holder = v2;
+            // `rp` drops here — the original RoaringPostings is gone.
+        }
+        // We still have the Arc<VramTermEntry>; promote uses ONLY
+        // that handle (no roaring re-drain).
+        let inserted = v3.promote_v2_to_v3(&key, Arc::clone(&v2_entry)).unwrap();
+        assert!(inserted, "promote must succeed from Arc handle alone");
+        let v3_entry = v3.get(&key).expect("v3 must hit");
+        assert_eq!(v3_entry.bucket_index(), v2_entry.bucket_index());
+        // Drop the v2 cache last to release its Arc — v3 lifetime
+        // is independent.
+        drop(v2_holder);
+        // v3 entry remains usable.
+        assert!(!v3_entry.device_ptr().is_null());
+        assert!(v3_entry.compressed_bytes() > 0);
+    }
+
+    #[test]
+    fn promote_v2_to_v3_rejection_for_oversize_entry() {
+        // Admission policy: when the compressed entry alone would
+        // exceed the budget, promote returns Ok(false) and does NOT
+        // install the entry. The cudaMalloc for d_compressed does
+        // fire (we need actual_comp_size to make the budget
+        // decision), but the entry is dropped before insertion so
+        // the cache state stays clean.
+        //
+        // We probe one entry's compressed size on a wide budget
+        // first, then construct a v3 cache whose budget is < that
+        // (so the post-compress check rejects).
+        if !cuda_available() {
+            return;
+        }
+        let rp = dense_roaring(0);
+        let probe = VramCompressedCht::with_budget(1 << 30).unwrap();
+        let pkey = dummy_key(0xff00, 100);
+        probe.insert(pkey, &rp).unwrap();
+        let one_entry_compressed = probe.stats().compressed_bytes_total;
+        drop(probe);
+
+        let tight = VramCompressedCht::with_budget(one_entry_compressed.saturating_sub(1).max(1)).unwrap();
+        let (_v2, key, v2_entry) = populate_v2(&rp);
+        let admitted = tight.promote_v2_to_v3(&key, v2_entry).unwrap();
+        assert!(
+            !admitted,
+            "compressed entry > budget must reject (got admitted=true)"
+        );
+        let stats = tight.stats();
+        assert_eq!(stats.inserts, 0);
+        assert_eq!(stats.promotions, 0);
+        assert_eq!(stats.entries, 0);
+        // Live cache must be empty + reusable.
+        assert!(tight.get(&key).is_none());
+    }
+
+    #[test]
+    fn promote_v2_to_v3_arc_lifetime_safe() {
+        // Lifetime test: the v2 Arc is held across the entire
+        // promote call, so a concurrent v2 cache eviction of the
+        // same key during the compress step cannot Drop the source
+        // device buffer. We simulate this by resetting the v2 cache
+        // mid-way (= the cache map drops ITS Arc clone; ours is
+        // still live).
+        if !cuda_available() {
+            return;
+        }
+        let v3 = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let rp = small_roaring();
+        let (v2, key, v2_entry) = populate_v2(&rp);
+
+        // Reset the v2 cache. This drops the v2 map's Arc clone.
+        // Our `v2_entry` clone keeps the device buffer alive.
+        v2.reset();
+        assert!(v2.get(&key).is_none(), "v2 reset must clear map");
+
+        // Promote with our still-live v2 Arc handle.
+        let inserted = v3.promote_v2_to_v3(&key, Arc::clone(&v2_entry)).unwrap();
+        assert!(
+            inserted,
+            "promote must succeed even after the v2 cache evicted the map entry"
+        );
+        // v3 entry queryable.
+        let v3_entry = v3.get(&key).expect("v3 must hit");
+        assert_eq!(v3_entry.bucket_index(), v2_entry.bucket_index());
+        // Drop the original Arc — v3 owns its own d_compressed,
+        // unaffected by the v2 source dropping.
+        drop(v2_entry);
+        assert!(!v3_entry.device_ptr().is_null());
+    }
+
+    #[test]
+    fn promote_v2_to_v3_idempotent() {
+        // Re-promoting the same key short-circuits without a
+        // duplicate cudaMalloc. The second call returns Ok(false)
+        // and does not bump `inserts` / `promotions`.
+        if !cuda_available() {
+            return;
+        }
+        let v3 = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let rp = small_roaring();
+        let (_v2, key, v2_entry) = populate_v2(&rp);
+
+        let first = v3.promote_v2_to_v3(&key, Arc::clone(&v2_entry)).unwrap();
+        assert!(first);
+        let bytes_after_first = v3.stats().current_bytes;
+        let inserts_after_first = v3.stats().inserts;
+        let promotions_after_first = v3.stats().promotions;
+
+        let second = v3.promote_v2_to_v3(&key, Arc::clone(&v2_entry)).unwrap();
+        assert!(!second, "re-promote of same key must short-circuit");
+        let stats = v3.stats();
+        assert_eq!(stats.current_bytes, bytes_after_first);
+        assert_eq!(stats.inserts, inserts_after_first);
+        assert_eq!(stats.promotions, promotions_after_first);
+    }
+
+    #[test]
+    fn promote_v2_to_v3_matches_insert_layout() {
+        // Cross-validation: the v3 entry produced via
+        // promote_v2_to_v3 has the same `(bucket_index,
+        // uncompressed_bytes)` layout as one produced via the
+        // legacy `insert(roaring)` path. Compressed bytes may
+        // differ because Bitcomp output can vary microscopically
+        // by codec state, but the metadata invariants must match.
+        if !cuda_available() {
+            return;
+        }
+        let rp = small_roaring();
+        let v3_legacy = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let legacy_key = dummy_key(0x11, 100);
+        v3_legacy.insert(legacy_key.clone(), &rp).unwrap();
+        let legacy_entry = v3_legacy.get(&legacy_key).unwrap();
+
+        let v3_promote = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let promote_key = dummy_key(0x22, 100);
+        let (_v2, _vk, v2_entry) = populate_v2(&rp);
+        v3_promote
+            .promote_v2_to_v3(&promote_key, v2_entry)
+            .unwrap();
+        let promote_entry = v3_promote.get(&promote_key).unwrap();
+
+        assert_eq!(
+            legacy_entry.bucket_index(),
+            promote_entry.bucket_index(),
+            "promote_v2_to_v3 must produce the same bucket_index as insert(roaring)"
+        );
+        assert_eq!(
+            legacy_entry.uncompressed_bytes(),
+            promote_entry.uncompressed_bytes(),
+            "uncompressed_bytes must match"
+        );
+        assert_eq!(legacy_entry.bucket_count(), promote_entry.bucket_count());
     }
 }

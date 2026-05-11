@@ -313,7 +313,8 @@ impl TopDocs {
     ///
     /// Documents whose sort field value does not pass the cursor threshold are excluded:
     /// - `Order::Desc`: only documents with value **strictly less than** the cursor are collected.
-    /// - `Order::Asc`: only documents with value **strictly greater than** the cursor are collected.
+    /// - `Order::Asc`: only documents with value **strictly greater than** the cursor are
+    ///   collected.
     ///
     /// This is used to implement Elasticsearch-compatible `search_after` functionality.
     pub fn order_by_fast_field_with_cursor<TFastValue>(
@@ -570,8 +571,7 @@ impl<Score, D, C> From<TopNComputerDeser<Score, D, C>> for TopNComputer<Score, D
 }
 
 impl<Score: std::fmt::Debug, D, C> std::fmt::Debug for TopNComputer<Score, D, C>
-where
-    C: Comparator<Score>,
+where C: Comparator<Score>
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         f.debug_struct("TopNComputer")

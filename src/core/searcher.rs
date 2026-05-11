@@ -2,13 +2,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::{fmt, io};
 
+use common::OwnedBytes;
+
 use crate::collector::Collector;
 use crate::core::Executor;
 use crate::index::{SegmentId, SegmentReader};
 use crate::query::{Bm25StatisticsProvider, EnableScoring, Query};
 use crate::schema::document::DocumentDeserialize;
 use crate::schema::{Schema, Term};
-use common::OwnedBytes;
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
 use crate::{DocAddress, Index, Opstamp, TrackedObject};
@@ -171,7 +172,8 @@ impl Searcher {
                 .collect();
             indexed.sort_unstable_by_key(|(_, doc_id)| *doc_id);
             let doc_ids: Vec<crate::DocId> = indexed.iter().map(|(_, d)| *d).collect();
-            let mut batch = store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
+            let mut batch =
+                store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
             let mut results: Vec<Option<common::OwnedBytes>> = vec![None; doc_addresses.len()];
             for (i, &(orig_idx, _)) in indexed.iter().enumerate() {
                 results[orig_idx] = batch[i].take();
@@ -199,7 +201,8 @@ impl Searcher {
             let group = &indexed[seg_start..seg_end];
             let doc_ids: Vec<crate::DocId> = group.iter().map(|(_, a)| a.doc_id).collect();
             let store_reader = &self.inner.store_readers[seg_ord as usize];
-            let mut batch = store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
+            let mut batch =
+                store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
             for (i, &(orig_idx, _)) in group.iter().enumerate() {
                 results[orig_idx] = batch[i].take();
             }
@@ -353,10 +356,10 @@ impl Searcher {
                 if pair_idx < ord_pairs.len() {
                     let orig_idx = ord_pairs[pair_idx].0;
                     // SSTable data is valid UTF-8 for StrColumn; zero-copy via from_utf8
-                    results[orig_idx] = Some(
-                        String::from_utf8(bytes.to_vec())
-                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
-                    );
+                    results[orig_idx] =
+                        Some(String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
+                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                        }));
                     pair_idx += 1;
                 }
                 Ok(())

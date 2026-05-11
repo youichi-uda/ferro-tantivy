@@ -169,7 +169,9 @@ mod value;
 use std::collections::BTreeMap;
 use std::mem;
 
-pub(crate) use self::de::{BinaryDocumentDeserializer, extract_field_bytes_from_doc, extract_field_bytes_range_from_doc};
+pub(crate) use self::de::{
+    extract_field_bytes_from_doc, extract_field_bytes_range_from_doc, BinaryDocumentDeserializer,
+};
 pub use self::de::{
     ArrayAccess, DeserializeError, DocumentDeserialize, DocumentDeserializer, ObjectAccess,
     ValueDeserialize, ValueDeserializer, ValueType, ValueVisitor,
@@ -186,13 +188,11 @@ use super::*;
 pub trait Document: Send + Sync + 'static {
     /// The value of the field.
     type Value<'a>: Value<'a> + Clone
-    where
-        Self: 'a;
+    where Self: 'a;
 
     /// The iterator over all of the fields and values within the doc.
     type FieldsValuesIter<'a>: Iterator<Item = (Field, Self::Value<'a>)>
-    where
-        Self: 'a;
+    where Self: 'a;
 
     /// Get an iterator iterating over all fields and values in a document.
     fn iter_fields_and_values(&self) -> Self::FieldsValuesIter<'_>;

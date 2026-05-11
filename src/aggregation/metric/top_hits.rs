@@ -149,9 +149,7 @@ impl Serialize for KeyOrder {
 
 impl<'de> Deserialize<'de> for KeyOrder {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let mut key_order = <HashMap<String, Order>>::deserialize(deserializer)?.into_iter();
         let (field, order) = key_order.next().ok_or(serde::de::Error::custom(
             "Expected exactly one key-value pair in sort parameter of top_hits, found none",
@@ -908,7 +906,9 @@ mod tests {
             json!({
                 "hits": [
                     {
-                        "sort": [common::i64_to_u64(date_2017.unix_timestamp_nanos() as i64)],
+                        // `common::DateTime` stores microseconds; convert ns→μs for the
+                        // sort-key u64 mapping so it matches the fast-field representation.
+                        "sort": [common::i64_to_u64((date_2017.unix_timestamp_nanos() / 1_000) as i64)],
                         "docvalue_fields": {
                             "date": [ OwnedValue::Date(DateTime::from_utc(date_2017)) ],
                             "text": [ "ccc" ],
@@ -917,7 +917,7 @@ mod tests {
                         }
                     },
                     {
-                        "sort": [common::i64_to_u64(date_2016.unix_timestamp_nanos() as i64)],
+                        "sort": [common::i64_to_u64((date_2016.unix_timestamp_nanos() / 1_000) as i64)],
                         "docvalue_fields": {
                             "date": [ OwnedValue::Date(DateTime::from_utc(date_2016)) ],
                             "text": [ "aaa" ],

@@ -145,7 +145,10 @@ pub struct HistogramAggregation {
     /// Whether to return the buckets as a hash map
     #[serde(default)]
     pub keyed: bool,
-    /// Whether the values are normalized to ns for date time values. Defaults to false.
+    /// Whether the values are normalized to the fastfield-storage units (microseconds, since
+    /// `common::DateTime` switched from nanoseconds to microseconds). Kept as
+    /// `is_normalized_to_ns` for serde-wire compatibility with older snapshots. Defaults to
+    /// false.
     #[serde(default)]
     pub is_normalized_to_ns: bool,
 }
@@ -153,16 +156,16 @@ pub struct HistogramAggregation {
 impl HistogramAggregation {
     pub(crate) fn normalize_date_time(&mut self) {
         if !self.is_normalized_to_ns {
-            // values are provided in ms, but the fastfield is in nano seconds
-            self.interval *= 1_000_000.0;
-            self.offset = self.offset.map(|off| off * 1_000_000.0);
+            // values are provided in ms, but the fastfield is in microseconds
+            self.interval *= 1_000.0;
+            self.offset = self.offset.map(|off| off * 1_000.0);
             self.hard_bounds = self.hard_bounds.map(|bounds| HistogramBounds {
-                min: bounds.min * 1_000_000.0,
-                max: bounds.max * 1_000_000.0,
+                min: bounds.min * 1_000.0,
+                max: bounds.max * 1_000.0,
             });
             self.extended_bounds = self.extended_bounds.map(|bounds| HistogramBounds {
-                min: bounds.min * 1_000_000.0,
-                max: bounds.max * 1_000_000.0,
+                min: bounds.min * 1_000.0,
+                max: bounds.max * 1_000.0,
             });
             self.is_normalized_to_ns = true;
         }
@@ -212,9 +215,7 @@ pub struct HistogramBounds {
 }
 
 fn deserialize_date_or_num<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
+where D: serde::Deserializer<'de> {
     let value: serde_json::Value = Deserialize::deserialize(deserializer)?;
 
     // Check if the value is a string representing an Rfc3339 formatted date
@@ -560,12 +561,12 @@ pub(crate) fn intermediate_histogram_buckets_to_final_buckets(
     };
 
     // If we have a date type on the histogram buckets, we add the `key_as_string` field as rfc339
-    // and normalize from nanoseconds to milliseconds
+    // and normalize from microseconds to milliseconds
     if is_date_agg {
         for bucket in buckets.iter_mut() {
             if let crate::aggregation::Key::F64(ref mut val) = bucket.key {
                 let key_as_string = format_date(*val as i64)?;
-                *val /= 1_000_000.0;
+                *val /= 1_000.0;
                 bucket.key_as_string = Some(key_as_string);
             }
         }

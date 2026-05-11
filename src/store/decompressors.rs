@@ -15,6 +15,11 @@ pub enum Decompressor {
     /// Use the zstd decompressor
     #[cfg(feature = "zstd-compression")]
     Zstd,
+    /// Use the snappy decompressor (raw block format).
+    /// Companion to `Compressor::Snappy` — see that variant for the
+    /// Phase 0 numbers behind the Hot tier choice.
+    #[cfg(feature = "snappy-compression")]
+    Snappy,
 }
 
 impl From<Compressor> for Decompressor {
@@ -25,6 +30,8 @@ impl From<Compressor> for Decompressor {
             Compressor::Lz4 => Decompressor::Lz4,
             #[cfg(feature = "zstd-compression")]
             Compressor::Zstd(_) => Decompressor::Zstd,
+            #[cfg(feature = "snappy-compression")]
+            Compressor::Snappy => Decompressor::Snappy,
         }
     }
 }
@@ -37,6 +44,12 @@ impl Decompressor {
             1 => Decompressor::Lz4,
             #[cfg(feature = "zstd-compression")]
             4 => Decompressor::Zstd,
+            // ID 5 newly allocated for Snappy. The doc-store footer rejects
+            // unknown IDs with a panic, so this is a forward-compat break:
+            // a Snappy-compressed segment can only be read by builds that
+            // have the `snappy-compression` feature enabled.
+            #[cfg(feature = "snappy-compression")]
+            5 => Decompressor::Snappy,
             _ => panic!("unknown compressor id {id:?}"),
         }
     }
@@ -48,6 +61,8 @@ impl Decompressor {
             Self::Lz4 => 1,
             #[cfg(feature = "zstd-compression")]
             Self::Zstd => 4,
+            #[cfg(feature = "snappy-compression")]
+            Self::Snappy => 5,
         }
     }
 
@@ -73,6 +88,8 @@ impl Decompressor {
             Self::Lz4 => super::compression_lz4_block::decompress(compressed, decompressed),
             #[cfg(feature = "zstd-compression")]
             Self::Zstd => super::compression_zstd_block::decompress(compressed, decompressed),
+            #[cfg(feature = "snappy-compression")]
+            Self::Snappy => super::compression_snappy_block::decompress(compressed, decompressed),
         }
     }
 }

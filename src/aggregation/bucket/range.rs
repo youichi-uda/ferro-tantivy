@@ -760,13 +760,16 @@ mod tests {
     fn range_date_test_with_opt(merge_segments: bool) -> crate::Result<()> {
         let index = get_test_index_2_segments(merge_segments)?;
 
+        // Range bounds for a `DateTime` fast field are passed in the field's internal
+        // storage units. Since `common::DateTime` switched from nanoseconds to microseconds,
+        // these literals are now `unix_micros` (2019-01-01T00:00:00Z and 2019-01-02T00:00:00Z).
         let agg_req: Aggregations = serde_json::from_value(json!({
             "date_ranges": {
                 "range": {
                     "field": "date",
                     "ranges": [
-                        {"to": 1546300800000000000i64},
-                        {"from": 1546300800000000000i64, "to": 1546387200000000000i64},
+                        {"to": 1546300800000000i64},
+                        {"from": 1546300800000000i64, "to": 1546387200000000i64},
                     ],
                     "keyed": false
                 },

@@ -388,7 +388,11 @@ fn intersection_count_with_carrying_slop_ordered(
 
         // Ordered: require right_val >= left_val (in shifted coords).
         let ordered_ok = right_val >= left_val;
-        let gap = if ordered_ok { right_val - left_val } else { u32::MAX };
+        let gap = if ordered_ok {
+            right_val - left_val
+        } else {
+            u32::MAX
+        };
         let distance = slop_so_far as u32 + gap;
         if ordered_ok && distance <= max_slop {
             // For ordered, smaller/larger assignment: always left <= right.

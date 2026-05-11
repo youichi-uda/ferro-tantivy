@@ -3,12 +3,15 @@ use time::OffsetDateTime;
 
 use crate::TantivyError;
 
+/// `val` is in microseconds-since-epoch (matches `common::DateTime` internal precision after
+/// the switch from nanoseconds to microseconds).
 pub(crate) fn format_date(val: i64) -> crate::Result<String> {
-    let datetime = OffsetDateTime::from_unix_timestamp_nanos(val as i128).map_err(|err| {
-        TantivyError::InvalidArgument(format!(
-            "Could not convert {val:?} to OffsetDateTime, err {err:?}"
-        ))
-    })?;
+    let datetime =
+        OffsetDateTime::from_unix_timestamp_nanos((val as i128) * 1_000).map_err(|err| {
+            TantivyError::InvalidArgument(format!(
+                "Could not convert {val:?} to OffsetDateTime, err {err:?}"
+            ))
+        })?;
     let key_as_string = datetime
         .format(&Rfc3339)
         .map_err(|_err| TantivyError::InvalidArgument("Could not serialize date".to_string()))?;

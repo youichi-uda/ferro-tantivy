@@ -69,6 +69,15 @@ fn test_write_commit_fails() -> tantivy::Result<()> {
 // - https://github.com/quickwit-oss/quickwit/issues/730
 // Details at
 // - https://github.com/quickwit-oss/tantivy/issues/1198
+//
+// NOTE on loop size: the fork raised `PIPELINE_MAX_SIZE_IN_DOCS` from 10K to
+// 100K (commit `03fbeb8b3 perf: increase PIPELINE_MAX_SIZE_IN_DOCS from 10K
+// to 100K`). With a 100K-deep channel the producer's previous 100_000-doc
+// loop fits entirely in the channel before the worker has a chance to flush
+// a segment and hit the failpoint, so the test exited without seeing the
+// injected error. Loop bound bumped to 1_000_000 so the producer is
+// guaranteed to be backpressured by the channel and the worker has time to
+// fill its memory budget and invoke `close_term`.
 #[test]
 fn test_fail_on_flush_segment() -> tantivy::Result<()> {
     let _fail_scenario_guard = fail::FailScenario::setup();
@@ -77,7 +86,7 @@ fn test_fail_on_flush_segment() -> tantivy::Result<()> {
     let index = Index::create_in_ram(schema_builder.build());
     let index_writer: IndexWriter = index.writer_with_num_threads(1, 15_000_000)?;
     fail::cfg("FieldSerializer::close_term", "return(simulatederror)").unwrap();
-    for i in 0..100_000 {
+    for i in 0..1_000_000 {
         if index_writer
             .add_document(doc!(text_field => format!("hellohappytaxpayerlongtokenblabla{}", i)))
             .is_err()
@@ -96,7 +105,7 @@ fn test_fail_on_flush_segment_but_one_worker_remains() -> tantivy::Result<()> {
     let index = Index::create_in_ram(schema_builder.build());
     let index_writer: IndexWriter = index.writer_with_num_threads(2, 30_000_000)?;
     fail::cfg("FieldSerializer::close_term", "1*return(simulatederror)").unwrap();
-    for i in 0..100_000 {
+    for i in 0..1_000_000 {
         if index_writer
             .add_document(doc!(text_field => format!("hellohappytaxpayerlongtokenblabla{}", i)))
             .is_err()

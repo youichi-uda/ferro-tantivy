@@ -72,7 +72,12 @@ impl BlockWandScorer {
         }
 
         // Find new minimum.
-        self.current_doc = self.scorers.iter().map(|s| s.doc()).min().unwrap_or(TERMINATED);
+        self.current_doc = self
+            .scorers
+            .iter()
+            .map(|s| s.doc())
+            .min()
+            .unwrap_or(TERMINATED);
 
         if self.current_doc != TERMINATED {
             self.compute_score();
@@ -109,7 +114,12 @@ impl DocSet for BlockWandScorer {
             return TERMINATED;
         }
 
-        self.current_doc = self.scorers.iter().map(|s| s.doc()).min().unwrap_or(TERMINATED);
+        self.current_doc = self
+            .scorers
+            .iter()
+            .map(|s| s.doc())
+            .min()
+            .unwrap_or(TERMINATED);
 
         if self.current_doc != TERMINATED {
             self.compute_score();
@@ -125,7 +135,11 @@ impl DocSet for BlockWandScorer {
     }
 
     fn size_hint(&self) -> u32 {
-        self.scorers.iter().map(|s| s.size_hint()).max().unwrap_or(0)
+        self.scorers
+            .iter()
+            .map(|s| s.size_hint())
+            .max()
+            .unwrap_or(0)
     }
 }
 

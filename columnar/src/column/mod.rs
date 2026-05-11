@@ -16,8 +16,7 @@ pub use serialize::{
 
 use crate::column_index::{ColumnIndex, Set};
 use crate::column_values::monotonic_mapping::StrictlyMonotonicMappingToInternal;
-use crate::column_values::VecColumn;
-use crate::column_values::{ColumnValues, monotonic_map_column};
+use crate::column_values::{ColumnValues, VecColumn, monotonic_map_column};
 use crate::{Cardinality, DocId, EmptyColumnValues, MonotonicallyMappableToU64, RowId};
 
 #[derive(Clone)]

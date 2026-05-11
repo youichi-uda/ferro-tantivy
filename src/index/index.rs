@@ -650,13 +650,12 @@ impl Index {
     /// before the field existed.
     ///
     /// The caller is responsible for:
-    ///   - Making sure the new schema is a **superset** of the existing one
-    ///     (same field names/types for all pre-existing fields; only additions
-    ///     are safe). Removing or re-typing fields will corrupt reads.
-    ///   - Draining / committing any in-flight writes and dropping the
-    ///     existing `IndexWriter` before calling, then re-opening the `Index`
-    ///     so subsequent writers use the new schema. This method does not
-    ///     acquire the writer lock.
+    ///   - Making sure the new schema is a **superset** of the existing one (same field names/types
+    ///     for all pre-existing fields; only additions are safe). Removing or re-typing fields will
+    ///     corrupt reads.
+    ///   - Draining / committing any in-flight writes and dropping the existing `IndexWriter`
+    ///     before calling, then re-opening the `Index` so subsequent writers use the new schema.
+    ///     This method does not acquire the writer lock.
     ///
     /// After a successful call, re-open the directory with
     /// [`Index::open`] to get an `Index` whose in-memory schema matches the

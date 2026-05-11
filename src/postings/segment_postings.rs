@@ -273,15 +273,18 @@ impl Postings for SegmentPostings {
             self.cum_freq_cur = cur + 1;
 
             let read_offset = self.block_cursor.position_offset() + freq_sum;
-            // SAFETY: position_reader.read() will write exactly `term_freq` elements
-            // starting at `prev_len`, fully initializing the extended region.
-            // We use reserve + set_len instead of resize to avoid zeroing memory
-            // that will be immediately overwritten.
-            output.reserve(term_freq as usize);
-            unsafe {
-                output.set_len(prev_len + term_freq as usize);
+            // SAFETY: `position_reader.read` writes exactly `term_freq` elements starting at
+            // `prev_len`, fully initializing the extended region before any reader observes it.
+            // We use `reserve` + `set_len` instead of `resize(_, 0)` to avoid zeroing memory
+            // that is immediately overwritten on the hot positions-decode path.
+            #[allow(clippy::uninit_vec)]
+            {
+                output.reserve(term_freq as usize);
+                unsafe {
+                    output.set_len(prev_len + term_freq as usize);
+                }
+                position_reader.read(read_offset, &mut output[prev_len..]);
             }
-            position_reader.read(read_offset, &mut output[prev_len..]);
             let mut cum = offset;
             for output_mut in output[prev_len..].iter_mut() {
                 cum += *output_mut;

@@ -291,45 +291,13 @@ impl VramCompressedTermEntry {
         &self.chunks
     }
 
-    /// Raw device pointer to the compressed payload. Back-compat shim
-    /// for pre-Wave-Z-6 callers that statically expect a single-chunk
-    /// entry; trips `debug_assert!` on a multi-chunk entry. Z-6 #3 will
-    /// migrate dispatch to walk [`Self::chunks`] directly and the call
-    /// sites that depend on this method will go away.
-    ///
-    /// # Safety
-    /// The pointer is a CUDA device pointer; only pass it to CUDA
-    /// runtime / driver / nvcomp APIs. Stable for the
-    /// `Arc<VramCompressedTermEntry>` clone's lifetime.
-    #[must_use]
-    pub fn device_ptr(&self) -> *const c_void {
-        debug_assert_eq!(
-            self.chunks.len(),
-            1,
-            "device_ptr() called on multi-chunk entry — Z-6 #3 dispatch wiring required"
-        );
-        self.chunks
-            .first()
-            .map(|c| c.d_compressed as *const c_void)
-            .unwrap_or(std::ptr::null())
-    }
-
-    /// Same as [`Self::device_ptr`], returning the mutable raw pointer
-    /// that some `nvcomp` / `cudaMemcpy` signatures need without an
-    /// explicit cast. Single-chunk back-compat shim — see
-    /// [`Self::device_ptr`].
-    #[must_use]
-    pub fn d_compressed(&self) -> *mut c_void {
-        debug_assert_eq!(
-            self.chunks.len(),
-            1,
-            "d_compressed() called on multi-chunk entry — Z-6 #3 dispatch wiring required"
-        );
-        self.chunks
-            .first()
-            .map(|c| c.d_compressed)
-            .unwrap_or(null_mut())
-    }
+    // Wave Z-6 #3 removed the `device_ptr()` / `d_compressed()`
+    // back-compat shims (which `debug_assert!`-ed single-chunk and
+    // returned `chunks[0].d_compressed`). Dispatch now walks
+    // [`Self::chunks`] for every payload access, including the
+    // [`VramCompressedCht::dump_to_path`] single-chunk path which
+    // indexes `chunks()[0]` directly under its own debug_assert until
+    // Z-6 #4 introduces MAGIC_V4 per-chunk records.
 }
 
 impl Drop for VramCompressedTermEntry {
@@ -1165,16 +1133,17 @@ impl VramCompressedCht {
             let bytes = entry.compressed_bytes();
             writer.write_all(&(bytes as u64).to_le_bytes())?;
             // Stage the device-resident compressed payload back to
-            // host for write. Single-chunk back-compat path via the
-            // shim — Z-6 #4 walks chunks() instead.
+            // host for write. Single-chunk path — the `debug_assert`
+            // above guarantees `chunks.len() == 1` until Z-6 #4 walks
+            // per-chunk records via MAGIC_V4.
             let mut host_staging: Vec<u8> = vec![0u8; bytes];
-            // SAFETY: entry.device_ptr() returns chunks[0].d_compressed
-            // pointing to `bytes` of device memory owned by this Arc;
+            // SAFETY: chunks()[0].d_compressed points to `bytes` of
+            // device memory owned by this Arc (Z-6 #2 invariant);
             // host_staging holds `bytes` of valid host memory.
             let rc = unsafe {
                 cudaMemcpy(
                     host_staging.as_mut_ptr() as *mut c_void,
-                    entry.device_ptr(),
+                    entry.chunks()[0].d_compressed as *const c_void,
                     bytes,
                     cudaMemcpyKind::cudaMemcpyDeviceToHost,
                 )
@@ -1573,7 +1542,7 @@ mod tests {
         // Clone is still usable post-reset (host metadata immutable,
         // device buffer alive via Arc refcount).
         assert!(live_clone.bucket_count() >= 1);
-        assert!(!live_clone.device_ptr().is_null());
+        assert!(!live_clone.chunks()[0].d_compressed.is_null());
         drop(live_clone);
         // Cache empty + reusable.
         assert_eq!(cht.stats().entries, 0);
@@ -1714,7 +1683,7 @@ mod tests {
             let rc = unsafe {
                 cudaMemcpy(
                     staging.as_mut_ptr() as *mut c_void,
-                    e.device_ptr(),
+                    e.chunks()[0].d_compressed as *const c_void,
                     bytes,
                     cudaMemcpyKind::cudaMemcpyDeviceToHost,
                 )
@@ -1743,7 +1712,7 @@ mod tests {
             let rc = unsafe {
                 cudaMemcpy(
                     staging.as_mut_ptr() as *mut c_void,
-                    got.device_ptr(),
+                    got.chunks()[0].d_compressed as *const c_void,
                     got.compressed_bytes(),
                     cudaMemcpyKind::cudaMemcpyDeviceToHost,
                 )
@@ -1814,7 +1783,7 @@ mod tests {
         // index + non-zero compressed bytes (the buyer DD signal
         // for "compressed hot tier survives restart").
         let entry = got.unwrap();
-        assert!(!entry.device_ptr().is_null());
+        assert!(!entry.chunks()[0].d_compressed.is_null());
         assert!(entry.compressed_bytes() > 0);
         assert!(entry.uncompressed_bytes() > 0);
         assert!(entry.bucket_count() >= 1);
@@ -2011,7 +1980,7 @@ mod tests {
         // is independent.
         drop(v2_holder);
         // v3 entry remains usable.
-        assert!(!v3_entry.device_ptr().is_null());
+        assert!(!v3_entry.chunks()[0].d_compressed.is_null());
         assert!(v3_entry.compressed_bytes() > 0);
     }
 
@@ -2084,7 +2053,7 @@ mod tests {
         // Drop the original Arc — v3 owns its own d_compressed,
         // unaffected by the v2 source dropping.
         drop(v2_entry);
-        assert!(!v3_entry.device_ptr().is_null());
+        assert!(!v3_entry.chunks()[0].d_compressed.is_null());
     }
 
     #[test]
@@ -2395,10 +2364,10 @@ mod tests {
             1,
             "small (< 16 MiB) terms keep the single-chunk fast path"
         );
-        // Back-compat shims must still produce the chunk's device pointer.
-        assert!(!entry.device_ptr().is_null());
-        assert!(!entry.d_compressed().is_null());
-        assert_eq!(entry.device_ptr() as *mut c_void, entry.d_compressed());
+        // Wave Z-6 #3: the single live chunk exposes a non-null device
+        // pointer (the back-compat shims this test originally asserted
+        // against were removed once dispatch migrated to `chunks()`).
+        assert!(!entry.chunks()[0].d_compressed.is_null());
         // Sum aggregation degenerates to the single chunk's bytes.
         assert_eq!(entry.compressed_bytes(), entry.chunks()[0].compressed_bytes);
         assert_eq!(

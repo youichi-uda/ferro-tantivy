@@ -742,11 +742,21 @@ impl CudaBitmapOpKernel {
     /// the workbench (a flat slab sized for the sum of all terms'
     /// uncompressed bytes).
     ///
+    /// Wave Z-6 #3: a term may hold up to
+    /// [`super::vram_cht_v3::MAX_CHUNKS_PER_ENTRY`] Bitcomp chunks; we
+    /// flatten `M` terms × `N_i` chunks/term into `Σ N_i` independent
+    /// nvcomp batched-decompress entries, each landing at
+    /// `term_offsets[i] + chunk_byte_offset` (the running prefix sum of
+    /// preceding chunks' `uncompressed_bytes` within the term). One
+    /// `decompress_batch` call still suffices — the nvcomp API is
+    /// per-entry independent.
+    ///
     /// # Safety
     /// - Caller has ensured the workbench is sized for the sum of all
     ///   `terms[i].uncompressed_bytes()` and not concurrently grown.
-    /// - All `terms[i].device_ptr()` point to live VRAM owned by the
-    ///   term entries (held alive via `Arc`).
+    /// - All chunk pointers (`chunk.d_compressed` for every chunk of
+    ///   every term) point to live VRAM owned by the term entries
+    ///   (held alive via `Arc`).
     unsafe fn decompress_batch_into_workbench(
         &self,
         terms: &[Arc<VramCompressedTermEntry>],
@@ -776,19 +786,31 @@ impl CudaBitmapOpKernel {
         })?;
         // Build the entries vector for the batch API:
         // (d_compressed, comp_size, expected_uncomp_size, d_uncompressed_slot)
+        // M × N_i flatten — see method rustdoc.
+        let total_chunks: usize = terms.iter().map(|t| t.chunk_count()).sum();
         let mut entries: Vec<(*const c_void, usize, usize, *mut c_void)> =
-            Vec::with_capacity(terms.len());
-        for (term, &offset) in terms.iter().zip(term_offsets.iter()) {
-            // SAFETY: workbench_ptr is a single contiguous allocation of
-            // ≥ sum(uncompressed_bytes); offset is in-bounds because it
-            // is the partial sum.
-            let slot = unsafe { (workbench_ptr as *mut u8).add(offset) as *mut c_void };
-            entries.push((
-                term.device_ptr(),
-                term.compressed_bytes(),
-                term.uncompressed_bytes(),
-                slot,
-            ));
+            Vec::with_capacity(total_chunks);
+        for (term, &term_offset) in terms.iter().zip(term_offsets.iter()) {
+            let mut chunk_byte_offset: usize = 0;
+            for chunk in term.chunks() {
+                // SAFETY: workbench_ptr is a single contiguous allocation
+                // of ≥ Σ terms[i].uncompressed_bytes(); `term_offset` is
+                // the partial-sum start for this term within the slab;
+                // `chunk_byte_offset` is the running prefix sum of
+                // preceding chunks' uncompressed_bytes within the term
+                // and is < term.uncompressed_bytes() by construction.
+                let slot = unsafe {
+                    (workbench_ptr as *mut u8).add(term_offset + chunk_byte_offset)
+                        as *mut c_void
+                };
+                entries.push((
+                    chunk.d_compressed as *const c_void,
+                    chunk.compressed_bytes,
+                    chunk.uncompressed_bytes,
+                    slot,
+                ));
+                chunk_byte_offset += chunk.uncompressed_bytes;
+            }
         }
         // SAFETY: device pointers + workbench slots valid for the call;
         // the codec uses our stream so chained scatter/compute see the
@@ -930,14 +952,25 @@ impl CudaBitmapOpKernel {
             code: 0,
         })?;
         // SAFETY: device buffers are valid; codec uses our stream.
-        codec
-            .decompress_one(
-                term.device_ptr(),
-                term.compressed_bytes(),
-                workbench_ptr,
-                term.uncompressed_bytes(),
-            )
-            .map_err(CudaBitmapError::Inner)?;
+        // Wave Z-6 #3: walk chunks() so multi-chunk entries decompress
+        // contiguously starting at `workbench_ptr` (each chunk lands at
+        // its `chunk_byte_offset` running prefix sum). For single-chunk
+        // entries this degenerates to one `decompress_one` call.
+        let mut chunk_byte_offset: usize = 0;
+        for chunk in term.chunks() {
+            let slot = unsafe {
+                (workbench_ptr as *mut u8).add(chunk_byte_offset) as *mut c_void
+            };
+            codec
+                .decompress_one(
+                    chunk.d_compressed as *const c_void,
+                    chunk.compressed_bytes,
+                    slot,
+                    chunk.uncompressed_bytes,
+                )
+                .map_err(CudaBitmapError::Inner)?;
+            chunk_byte_offset += chunk.uncompressed_bytes;
+        }
         drop(codec_guard);
 
         // 2. Scatter from workbench to dst (per-bucket DtD memcpy +
@@ -1022,16 +1055,25 @@ impl CudaBitmapOpKernel {
                 what: "v3 decompress codec unavailable",
                 code: 0,
             })?;
-            // SAFETY: see decompress_then_scatter.
-            unsafe {
-                codec
-                    .decompress_one(
-                        term.device_ptr(),
-                        term.compressed_bytes(),
-                        workbench_ptr,
-                        term.uncompressed_bytes(),
-                    )
-                    .map_err(CudaBitmapError::Inner)?;
+            // SAFETY: see decompress_then_scatter. Wave Z-6 #3: walk
+            // chunks() so multi-chunk entries decompress into
+            // contiguous workbench slots starting at `workbench_ptr`.
+            let mut chunk_byte_offset: usize = 0;
+            for chunk in term.chunks() {
+                let slot = unsafe {
+                    (workbench_ptr as *mut u8).add(chunk_byte_offset) as *mut c_void
+                };
+                unsafe {
+                    codec
+                        .decompress_one(
+                            chunk.d_compressed as *const c_void,
+                            chunk.compressed_bytes,
+                            slot,
+                            chunk.uncompressed_bytes,
+                        )
+                        .map_err(CudaBitmapError::Inner)?;
+                }
+                chunk_byte_offset += chunk.uncompressed_bytes;
             }
         }
         // Now gather into host buffer (same shape as
@@ -1962,6 +2004,112 @@ mod tests {
             assert_eq!(
                 v2_result, v3_result,
                 "{op:?} v3 fold (decompressed) must equal v2 fold byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn v3_fold_multi_chunk_matches_single_chunk_oracle() {
+        // Wave Z-6 #3 acceptance gate: a cohort containing a
+        // multi-chunk Bitcomp entry (≥ 2 chunks of 16 MiB each) must
+        // fold byte-identically to the CPU oracle that materialises
+        // each term in cohort layout and applies the op per-word.
+        // The multi-chunk path exercises the M × N_i flatten in
+        // `decompress_batch_into_workbench`; the single-chunk partner
+        // covers the degenerate `N_i = 1` case in the same call.
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+            256 * 1024 * 1024,
+        )
+        .ok();
+        let Some(cache) = cache else { return };
+
+        // Force a 2-chunk admission: BUCKETS_PER_CHUNK * 2 unique
+        // high16 values (each with one doc-id), producing a 32-MiB-
+        // equivalent uncompressed posting that splits across two
+        // Bitcomp chunks. The companion term is a small single-chunk
+        // posting that overlaps a few of the multi-chunk term's
+        // buckets so AND / OR / XOR all see non-trivial bit patterns.
+        let n_multi_buckets =
+            crate::postings::roaring::vram_cht_v3::BUCKETS_PER_CHUNK * 2;
+        let docs_multi: Vec<u32> =
+            (0..n_multi_buckets).map(|i| (i as u32) << 16).collect();
+        let rp_multi =
+            crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(
+                &docs_multi,
+            );
+        // Single-chunk partner: a handful of doc-ids inside the first
+        // bucket of the multi-chunk term plus one bucket past the
+        // chunk boundary, so the AND fold has a few set bits and the
+        // OR / XOR folds touch multiple high16 buckets.
+        let single_high16 = (crate::postings::roaring::vram_cht_v3::BUCKETS_PER_CHUNK
+            as u32
+            + 1)
+            << 16;
+        let rp_single =
+            crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+                0,
+                1 << 16,
+                single_high16,
+            ]);
+
+        let Some(v3_multi) = vram_v3_term_entry(&rp_multi, &cache, 0xc6_03_01)
+        else {
+            return;
+        };
+        let Some(v3_single) = vram_v3_term_entry(&rp_single, &cache, 0xc6_03_02)
+        else {
+            return;
+        };
+
+        // Pin the multi-chunk fixture invariant — if admission ever
+        // changes such that this test stops exercising N_i ≥ 2, the
+        // assertion below fails loud so the test isn't silently
+        // degraded into a single-chunk-only run.
+        assert!(
+            v3_multi.chunk_count() >= 2,
+            "test fixture must exercise multi-chunk dispatch (got chunk_count={})",
+            v3_multi.chunk_count()
+        );
+        assert_eq!(v3_single.chunk_count(), 1);
+
+        let term_refs: Vec<&crate::postings::roaring::RoaringPostings> =
+            vec![&rp_multi, &rp_single];
+        let union_keys =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &term_refs,
+            );
+        let v3_terms = vec![v3_multi, v3_single];
+
+        // CPU oracle: materialise each term's flat buffer in cohort
+        // layout once, then apply each op per-word.
+        let buf_multi =
+            crate::postings::roaring::gpu_dispatch::flat_buffer_for_term_for_test(
+                &rp_multi,
+                &union_keys,
+            );
+        let buf_single =
+            crate::postings::roaring::gpu_dispatch::flat_buffer_for_term_for_test(
+                &rp_single,
+                &union_keys,
+            );
+
+        for op in [BoolOp::And, BoolOp::Or, BoolOp::Xor] {
+            let v3_result = kernel
+                .compute_fold_v3(op, &v3_terms, &union_keys)
+                .expect("multi-chunk v3 fold");
+            let expected: Vec<u32> = buf_multi
+                .iter()
+                .zip(buf_single.iter())
+                .map(|(&a, &b)| match op {
+                    BoolOp::And => a & b,
+                    BoolOp::Or => a | b,
+                    BoolOp::Xor => a ^ b,
+                })
+                .collect();
+            assert_eq!(
+                v3_result, expected,
+                "{op:?} multi-chunk v3 fold must equal CPU oracle byte-for-byte"
             );
         }
     }

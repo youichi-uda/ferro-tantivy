@@ -1,0 +1,75 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.05s
+     Running benches/binary_distance.rs (target/release/deps/binary_distance-eac4e7ba82f7dc6b)
+=== tantivy-gpu Binary Distance — Phase 2 A integration bench ===
+
+GPU: NVIDIA GeForce RTX 4070 Ti SUPER (Vulkan) | HW GPU: true
+
+--- Single-query kernel (vec4 SIMD) ---
+shape                            CPU         GPU   speedup     match
+dim=768  N=1024                9.6µs      2.11ms     0.00x        ok
+dim=768  N=4096               38.5µs      2.08ms     0.02x        ok
+dim=768  N=16384             158.5µs      2.21ms     0.07x        ok
+dim=1024 N=16384             171.1µs      2.34ms     0.07x        ok
+
+--- Batched kernel (Q queries × N corpus, no top-K) ---
+shape                                    CPU         GPU   speedup     match
+dim=768  N=10000   Q=8               839.7µs     299.4µs     2.81x        ok
+dim=768  N=10000   Q=64               7.38ms     498.4µs    14.82x        ok
+dim=768  N=100000  Q=8                8.55ms      2.43ms     3.52x        ok
+dim=768  N=100000  Q=64              71.29ms      4.24ms    16.83x        ok
+
+--- End-to-end k-NN (batched + on-GPU top-K) ---
+shape                                            CPU         GPU   speedup
+dim=768  N=10000   Q=8   K=10                 1.57ms      1.26ms     1.24x
+dim=768  N=10000   Q=64  K=100               12.78ms     609.8µs    20.96x
+dim=768  N=100000  Q=8   K=10                16.87ms     11.89ms     1.42x
+dim=768  N=100000  Q=64  K=100              150.14ms      5.99ms    25.07x
+
+--- Headline: dim=768 N=1000000 Q=64 K=100 ---
+(running CPU oracle — this may take a few seconds...)
+CPU oracle time : 1.627s
+GPU end-to-end  : 61.92ms
+Speedup         : 26.28x
+ASSERT SKIPPED  : BINARY_DIST_BENCH_NO_ASSERT set
+
+--- CUDA Tensor Core vs WGSL (batched Q × N) ---
+shape                                   WGSL        CUDA   speedup     match
+dim=768  N=10000   Q=8                2.54ms     309.6µs     8.20x        ok
+dim=768  N=10000   Q=64               2.87ms     497.7µs     5.77x        ok
+dim=768  N=100000  Q=8                6.38ms      2.43ms     2.62x        ok
+dim=768  N=100000  Q=64              24.26ms      4.27ms     5.68x        ok
+dim=768  N=1000000 Q=64             249.71ms     96.48ms     2.59x        ok
+wrote /home/y1/git/ferroSearchProjects/tantivy/gpu/benches/data/cuda_vs_wgsl.json
+(N=1M tracking only): CUDA 2.59x WGSL — see ADR-001 §Consequences
+
+--- CUDA cached corpus vs WGSL (production calling pattern) ---
+(prepare_corpus once, then time only the per-query batch)
+(CUDA-c = `Vec<u32>` API, CUDA-p = `_into_pinned` Phase 5-1 path)
+shape                                   WGSL      CUDA-c      CUDA-p    c/WGSL    p/WGSL     match
+dim=768  N=100000  Q=64              26.55ms      2.28ms      2.20ms    11.62x    12.06x        ok
+dim=768  N=1000000 Q=64             253.26ms     73.45ms     27.22ms     3.45x     9.30x        ok
+wrote /home/y1/git/ferroSearchProjects/tantivy/gpu/benches/data/cuda_cached_vs_wgsl.json
+
+--- Phase 5-2 double-buffered batched pipeline ---
+(B batches × Q queries × N corpus × dim 768; one prepare_corpus,
+ then `compute_batched_into_pinned` × B serially vs `compute_batches_into_pinned`)
+shape                                         serial   doublebuf   speedup     match
+B=10  Q=4   N=100000                          3.02ms      2.39ms     1.27x        ok
+B=10  Q=64  N=100000                         24.17ms     20.04ms     1.21x        ok
+B=10  Q=64  N=1000000                       272.37ms    206.13ms     1.32x        ok
+wrote /home/y1/git/ferroSearchProjects/tantivy/gpu/benches/data/cuda_doublebuf.json
+(N=1M tracking): double-buffer speedup = 1.32x serial
+
+--- Phase 5-3 BMMA vs cuBLASLt INT8 (cold path) ---
+shape                                    INT8        BMMA  INT8/BMMA     match
+dim=128  N=1024    Q=8                 39.7µs      20.8µs     1.91x        ok
+dim=256  N=10000   Q=8                155.1µs     101.2µs     1.53x        ok
+dim=512  N=10000   Q=64               425.1µs     337.9µs     1.26x        ok
+dim=768  N=10000   Q=64               494.0µs     376.3µs     1.31x        ok
+dim=768  N=100000  Q=64                4.14ms      3.02ms     1.37x        ok
+dim=1024 N=100000  Q=64                4.79ms      3.29ms     1.46x        ok
+dim=768  N=1000000 Q=64               97.13ms     79.38ms     1.22x        ok
+wrote /home/y1/git/ferroSearchProjects/tantivy/gpu/benches/data/cuda_bmma_vs_int8.json
+ASSERT SKIPPED  : BINARY_DIST_BENCH_NO_ASSERT set
+
+=== Done ===

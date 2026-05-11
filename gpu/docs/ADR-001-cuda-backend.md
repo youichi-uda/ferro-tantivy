@@ -345,6 +345,20 @@ cached + pinned at the same shape clears **12.06×**. BMMA ran 1.22-1.91×
 faster than cuBLASLt INT8 across every shape — confirming the Phase 5-3-a
 follow-up below is worth the engineering.
 
+### Hardware class assumptions for the bench thresholds
+
+The 5×/3×/4× threshold assertions in `gpu/benches/binary_distance.rs` and
+`gpu/benches/hnsw_binary.rs` were calibrated against the reference hosts
+above (Ada / sm_89, RTX 4070 Ti SUPER and L4). On lower-bandwidth
+architectures — Turing (sm_75, RTX 2080 Ti class) and consumer Ampere
+(sm_86, RTX 30-series), and on integrated / mobile GPUs — expect 40–60 %
+of the headline speedup: enough to validate correctness but below the
+assertion floor. Set `BINARY_DIST_BENCH_NO_ASSERT=1` for those runs.
+
+These thresholds are not enforced in CI — `cargo +nightly bench --no-run`
+only validates compilation. Their role is regression detection on a
+reference host and anchoring the speedup numbers quoted in this ADR.
+
 ## Open follow-up (as of 2026-05-11)
 
 - **Phase 5-3-a**: migrate BMMA into the cached + pinned production

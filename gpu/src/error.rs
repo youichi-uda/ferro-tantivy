@@ -53,6 +53,17 @@ pub enum GpuError {
         /// Reason the GPU path was not used.
         reason: String,
     },
+
+    /// GPU or pinned-host allocation failed because the device / host is
+    /// out of memory. Distinct from [`Self::CpuFallback`]: a CPU retry
+    /// will not magically gain memory, and the caller is best positioned
+    /// to release working sets, batch differently, or reject the query.
+    #[error("Out of memory: {reason}")]
+    OutOfMemory {
+        /// Source of the request (e.g. `"cuMemHostAlloc"`, `"cuMemAlloc"`,
+        /// `"cuBLASLt"`) and the byte size if known.
+        reason: String,
+    },
 }
 
 /// Result type alias for GPU operations.

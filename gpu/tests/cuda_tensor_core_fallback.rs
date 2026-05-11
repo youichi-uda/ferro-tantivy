@@ -48,7 +48,10 @@ fn compute_batched_zero_dim_returns_empty() {
     // dim_bits = 0 short-circuits before any sizing check, so input
     // length checks aren't tripped — return value is just empty.
     let r = k.compute_batched(&[], &[], 1, 1, 0).expect("ok");
-    assert!(r.is_empty(), "dim_bits=0 must short-circuit to empty result");
+    assert!(
+        r.is_empty(),
+        "dim_bits=0 must short-circuit to empty result"
+    );
 }
 
 #[test]
@@ -152,13 +155,61 @@ fn cached_compute_batched_into_pinned_zero_queries_returns_empty() {
     let corpus = vec![0u32; 8 * 4];
     let cached = k.prepare_corpus(&corpus, 4, 256).expect("prepare");
     // Allocate a non-zero pinned buffer — Q=0 should short-circuit
-    // before touching it. (cuMemHostAlloc(0) is implementation-defined
-    // and asserts in cudarc 0.19 debug builds; use len=1 to dodge.)
+    // before touching it.
     let mut pinned = k.alloc_pinned_u32(1).expect("alloc 1");
     cached
         .compute_batched_into_pinned(&[], 0, &mut pinned)
         .expect("Q=0 must short-circuit, not error");
     // Buffer is unchanged — we only assert the call returned cleanly.
+}
+
+// ── H-3 regression: OOM must propagate, not CpuFallback ────────────────
+//
+// `cuMemHostAlloc(absurd_size)` legitimately returns
+// `CUDA_ERROR_OUT_OF_MEMORY`. The previous error mapping conflated this
+// with init / config failures and produced `GpuError::CpuFallback`, so
+// the caller had no way to distinguish "GPU unavailable on this host
+// — retry on CPU" from "this allocation is too large — release working
+// set or batch differently". OOM must surface as
+// `GpuError::OutOfMemory` so callers can react appropriately.
+#[test]
+fn pinned_alloc_oom_propagates_as_out_of_memory() {
+    let Some(k) = try_build() else { return };
+    // 1 PiB request — guaranteed to exceed every realistic host's pinned
+    // memory budget. We don't actually want this to succeed; we want the
+    // failure to be classified.
+    let absurd_len: usize = 1usize << 48;
+    let err = match k.alloc_pinned_u32(absurd_len) {
+        Ok(_) => panic!("1 PiB pinned alloc must fail, but succeeded"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, GpuError::OutOfMemory { .. }),
+        "expected GpuError::OutOfMemory for cuMemHostAlloc OOM, got {err:?}"
+    );
+}
+
+// ── C-1 regression: alloc_pinned_u32(0) must not UB ────────────────────
+//
+// `cuMemHostAlloc(0, ..)` is implementation-defined per the CUDA Driver
+// API: some driver versions return NULL legitimately. The previous code
+// guarded only with `debug_assert!(!raw.is_null())`, which is stripped in
+// release builds — a release-mode caller could store NULL in `ptr` and
+// trigger UB on the next `from_raw_parts`/`memcpy_dtoh_async`.
+// `alloc_pinned_u32(0)` must therefore short-circuit before calling the
+// driver and yield a safe (empty, never dereferenced) buffer.
+#[test]
+fn pinned_zero_length_alloc_does_not_underflow() {
+    let Some(k) = try_build() else { return };
+    let pinned = k.alloc_pinned_u32(0).expect(
+        "alloc_pinned_u32(0) must succeed without invoking cuMemHostAlloc(0); release-mode null \
+         deref is UB",
+    );
+    assert_eq!(pinned.len(), 0, "zero-length buffer must report len = 0");
+    assert!(pinned.is_empty(), "zero-length buffer must be is_empty()");
+    let slice = pinned.as_slice();
+    assert_eq!(slice.len(), 0, "as_slice() must yield empty slice");
+    // Dropping at scope end must not call cuMemFreeHost(NULL or dangling).
 }
 
 // ── knn_search ─────────────────────────────────────────────────────────
@@ -183,9 +234,7 @@ fn knn_search_zero_k_returns_empty_rows() {
 fn knn_search_zero_queries_returns_empty() {
     let Some(k) = try_build() else { return };
     let corpus = vec![0u32; 8 * 4];
-    let r = k
-        .knn_search(&[], &corpus, 0, 4, 256, 10)
-        .expect("Q=0 ok");
+    let r = k.knn_search(&[], &corpus, 0, 4, 256, 10).expect("Q=0 ok");
     assert!(r.is_empty(), "Q=0 must short-circuit to empty Vec");
 }
 

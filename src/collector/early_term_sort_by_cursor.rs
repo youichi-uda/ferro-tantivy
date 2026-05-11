@@ -147,15 +147,20 @@ impl<T: FastValue> EarlyTermSortByCursorCollector<T> {
     }
 
     /// Returns `true` iff `segment_reader` advertises a sort cursor for
-    /// our `field` whose recorded order matches our `order`.  Callers
-    /// MUST gate the dispatch to this collector on this predicate; the
-    /// segment-level fruit is empty when the cursor is missing or
-    /// mismatched.
+    /// our `field`.  Callers MUST gate the dispatch to this collector
+    /// on this predicate; the segment-level fruit is empty when the
+    /// cursor is missing.
+    ///
+    /// **Wave 20.** A cursor recorded in the opposite of the requested
+    /// order is also accepted — the segment collector walks the cursor
+    /// in reverse, which produces the same sorted-by-value result as a
+    /// forward walk over an opposite-order cursor.  This unlocks the
+    /// `asc-sort-with-after-timestamp` case against a desc-sorted index
+    /// (Rally http_logs `asc_sort_with_after_timestamp` p99 21.5 ms
+    /// → matched-to-ES path) without adding a second cursor file or
+    /// changing the on-disk format.
     pub fn can_handle_segment(&self, segment_reader: &SegmentReader) -> bool {
-        match segment_reader.sort_cursor(&self.field) {
-            Some(cursor) => cursor.order() == self.order,
-            None => false,
-        }
+        segment_reader.sort_cursor(&self.field).is_some()
     }
 }
 
@@ -193,11 +198,18 @@ impl<T: FastValue> Collector for EarlyTermSortByCursorCollector<T> {
         // this segment.  Allocating the bitset has a fixed cost
         // proportional to `max_doc / 64`, so we still want to skip it
         // on the disabled path.
+        //
+        // **Wave 20.** The cursor's recorded order is allowed to differ
+        // from the query's order; in that case `reverse_walk = true`
+        // tells `harvest` to iterate `doc_ids` in reverse, which yields
+        // the same value-sorted walk as a forward iteration over an
+        // opposite-order cursor file.  No on-disk format change is
+        // needed.
         let cursor_opt = segment_reader.sort_cursor(&self.field);
-        let cursor_usable = cursor_opt
-            .as_ref()
-            .map(|c| c.order() == self.order)
-            .unwrap_or(false);
+        let (cursor_usable, reverse_walk) = match cursor_opt.as_ref() {
+            Some(c) => (true, c.order() != self.order),
+            None => (false, false),
+        };
 
         if !cursor_usable || self.limit == 0 {
             return Ok(EarlyTermSortByCursorSegmentCollector {
@@ -208,6 +220,7 @@ impl<T: FastValue> Collector for EarlyTermSortByCursorCollector<T> {
                 matched_bitset: BitSet::with_max_value(0),
                 start_after_u64: None,
                 order: self.order,
+                reverse_walk: false,
                 typ: PhantomData,
             });
         }
@@ -228,6 +241,7 @@ impl<T: FastValue> Collector for EarlyTermSortByCursorCollector<T> {
             // hot loop in `harvest` only does an integer compare.
             start_after_u64: self.start_after.map(|v| v.to_u64()),
             order: self.order,
+            reverse_walk,
             typ: PhantomData,
         })
     }
@@ -275,6 +289,11 @@ pub struct EarlyTermSortByCursorSegmentCollector<T: FastValue> {
     /// skip in the right direction.  Cheap copy; not worth re-reading
     /// from the cursor on every iter.
     order: Order,
+    /// **Wave 20.** When `true`, harvest iterates `cursor.doc_ids()` in
+    /// reverse — used when the cursor was recorded in the opposite of
+    /// the query's order (e.g. asc query against a desc-sorted index).
+    /// Equivalent to having an opposite-order cursor file on disk.
+    reverse_walk: bool,
     typ: PhantomData<T>,
 }
 
@@ -314,7 +333,18 @@ impl<T: FastValue> SegmentCollector for EarlyTermSortByCursorSegmentCollector<T>
         let start_after_u64 = self.start_after_u64;
         let order = self.order;
         let mut hits: Vec<(Option<T>, DocAddress)> = Vec::with_capacity(self.limit);
-        for doc in cursor.iter() {
+        // **Wave 20.** Boxed `dyn Iterator` keeps the per-doc hot loop
+        // identical for forward and reverse walks; the indirection
+        // happens once per segment, not per doc.  Using
+        // `cursor.doc_ids()` directly lets us call `.rev()` without
+        // bringing a `DoubleEndedIterator` constraint into the public
+        // [`SortCursorIndex::iter`] signature.
+        let iter: Box<dyn Iterator<Item = DocId> + '_> = if self.reverse_walk {
+            Box::new(cursor.doc_ids().iter().rev().copied())
+        } else {
+            Box::new(cursor.iter())
+        };
+        for doc in iter {
             if !self.matched_bitset.contains(doc) {
                 continue;
             }
@@ -488,20 +518,72 @@ mod tests {
             "collector should emit empty fruit when no cursor is available"
         );
 
-        // Now also exercise the order-mismatch path: build with Asc
-        // cursor but ask for Desc.
+        // **Wave 20.** Order mismatch is no longer a hard miss — the
+        // collector walks the cursor in reverse and returns the
+        // correctly value-sorted top-K.  Build with an Asc cursor over
+        // [5, 2, 8, 1, 9] (cursor walks 1, 2, 5, 8, 9), then ask for
+        // top-3 desc; the harvest must reverse-walk and produce
+        // [9, 8, 5].
         let index2 = build_index("v", Order::Asc, &values, false, true)?;
         let reader2 = index2.reader()?;
         let searcher2 = reader2.searcher();
         let collector2 = EarlyTermSortByCursorCollector::<i64>::new("v", Order::Desc, 3);
         assert!(
-            !collector2.can_handle_segment(searcher2.segment_reader(0)),
-            "order mismatch → can_handle_segment must be false"
+            collector2.can_handle_segment(searcher2.segment_reader(0)),
+            "Wave 20: order mismatch is handled via reverse walk"
         );
         let hits2: Vec<(Option<i64>, DocAddress)> = searcher2.search(&AllQuery, &collector2)?;
+        let vals2: Vec<i64> = hits2.iter().map(|(v, _)| v.unwrap()).collect();
+        assert_eq!(
+            vals2,
+            vec![9, 8, 5],
+            "Wave 20: reverse walk over asc cursor produces desc top-K"
+        );
+        Ok(())
+    }
+
+    /// **Wave 20.** Reverse-walk against a desc cursor for an asc query
+    /// — the production case exercised by Rally http_logs
+    /// `asc_sort_with_after_timestamp` against `index.sort.order: desc`.
+    #[test]
+    fn wave_20_reverse_walk_asc_query_over_desc_cursor() -> crate::Result<()> {
+        let values: Vec<i64> = vec![50, 10, 40, 20, 30];
+        let index = build_index("v", Order::Desc, &values, false, true)?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let collector = EarlyTermSortByCursorCollector::<i64>::new("v", Order::Asc, 3);
         assert!(
-            hits2.is_empty(),
-            "collector should emit empty fruit on order mismatch"
+            collector.can_handle_segment(searcher.segment_reader(0)),
+            "Wave 20: asc query against desc cursor must dispatch"
+        );
+        let hits: Vec<(Option<i64>, DocAddress)> = searcher.search(&AllQuery, &collector)?;
+        let vals: Vec<i64> = hits.iter().map(|(v, _)| v.unwrap()).collect();
+        assert_eq!(
+            vals,
+            vec![10, 20, 30],
+            "Wave 20: asc top-3 over desc cursor reverse walk"
+        );
+        Ok(())
+    }
+
+    /// **Wave 20.** Reverse walk + `search_after` — the
+    /// asc-with-after-timestamp combo.  Cursor recorded desc; query asc;
+    /// `search_after = 20`: must return strictly-greater values in
+    /// ascending order starting at 30.
+    #[test]
+    fn wave_20_reverse_walk_with_search_after() -> crate::Result<()> {
+        let values: Vec<i64> = vec![50, 10, 40, 20, 30];
+        let index = build_index("v", Order::Desc, &values, false, true)?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let collector = EarlyTermSortByCursorCollector::<i64>::new("v", Order::Asc, 5)
+            .with_search_after(20_i64);
+        let hits: Vec<(Option<i64>, DocAddress)> = searcher.search(&AllQuery, &collector)?;
+        let vals: Vec<i64> = hits.iter().map(|(v, _)| v.unwrap()).collect();
+        assert_eq!(
+            vals,
+            vec![30, 40, 50],
+            "Wave 20: asc + search_after over desc cursor reverse walks past the cursor value"
         );
         Ok(())
     }

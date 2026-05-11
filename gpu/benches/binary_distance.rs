@@ -31,6 +31,25 @@
 //!   end-to-end k-NN beats the CPU batched-distance + top-K oracle by ≥ 5×. If your hardware can't
 //!   sustain that, set `BINARY_DIST_BENCH_NO_ASSERT=1` in the environment to skip the assert (the
 //!   numbers still print).
+//!
+//! ## Hardware assumptions for the headline thresholds
+//!
+//! The 5×/3×/4× threshold assertions in this file and in
+//! `gpu/benches/hnsw_binary.rs` are calibrated against the **reference
+//! hardware** documented in `gpu/docs/ADR-001-cuda-backend.md` §Re-validation:
+//!
+//! - NVIDIA RTX 4070 Ti SUPER (Ada, sm_89, ~672 GB/s HBM-equivalent)
+//! - NVIDIA L4 (Ada, sm_89, datacenter)
+//!
+//! On older NVIDIA architectures (Turing sm_75 / Ampere sm_80–86 consumer
+//! cards with smaller memory channels) and on integrated / mobile GPUs,
+//! expect 40–60 % of the headline speedups — sufficient to validate the
+//! fast path's correctness but below the assertion floor. Use
+//! `BINARY_DIST_BENCH_NO_ASSERT=1` for those runs.
+//!
+//! These thresholds are **not** enforced in CI (`cargo +nightly bench
+//! --no-run` only checks compilation); they exist to catch regressions on
+//! reference dev hosts and to anchor the ADR's speedup commitments.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};

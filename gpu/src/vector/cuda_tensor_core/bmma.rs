@@ -167,11 +167,34 @@ pub(super) struct BmmaKernels {
     pub(super) general: CudaFunction,
 }
 
+/// `mma.b1.xor.popc` requires compute capability ≥ 7.5 (Turing). NVRTC
+/// will *compile* sm_75 PTX on lower-capability hosts, but launching it on
+/// a Maxwell / Pascal / Volta device produces undefined behavior (the
+/// runtime typically surfaces an opaque `CUDA_ERROR_INVALID_PTX` or hangs).
+/// Reject sub-7.5 devices up-front with `CpuFallback` so callers can route
+/// to the cuBLASLt INT8 path (sm_61+) or pure CPU.
+///
+/// Factored out as a pure `(major, minor) -> Result` predicate so the gate
+/// is testable without a non-Turing GPU.
+pub(super) fn check_sm_at_least_7_5(major: i32, minor: i32) -> GpuResult<()> {
+    if (major, minor) < (7, 5) {
+        return Err(GpuError::CpuFallback {
+            reason: format!(
+                "BMMA (mma.sync.b1.xor.popc) requires compute capability >= 7.5 (Turing); device \
+                 reports sm_{major}{minor}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Compile both BMMA kernels. NVRTC needs the architecture flag for
 /// inline PTX; `sm_75` (Turing) is the floor for binary tensor cores
 /// and the conservative target — Ampere / Ada / Hopper all
 /// forward-compatible.
 pub(super) fn build_kernels(ctx: &Arc<CudaContext>) -> GpuResult<BmmaKernels> {
+    let (major, minor) = ctx.compute_capability().map_err(map_drv)?;
+    check_sm_at_least_7_5(major, minor)?;
     let opts = CompileOptions {
         arch: Some("sm_75"),
         ..Default::default()
@@ -262,9 +285,20 @@ pub(super) fn compute_batched_bmma(
     Ok(out)
 }
 
+/// Classify CUDA Driver API errors. `CUDA_ERROR_OUT_OF_MEMORY` propagates
+/// as [`GpuError::OutOfMemory`]; other failures fall back to CPU. Mirrors
+/// `kernel::map_drv` but kept local so this module has no `super` import
+/// dependency.
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
-    GpuError::CpuFallback {
-        reason: format!("CUDA driver error: {e}"),
+    use cudarc::driver::sys::CUresult;
+    if e.0 == CUresult::CUDA_ERROR_OUT_OF_MEMORY {
+        GpuError::OutOfMemory {
+            reason: format!("CUDA driver: {e}"),
+        }
+    } else {
+        GpuError::CpuFallback {
+            reason: format!("CUDA driver error: {e}"),
+        }
     }
 }
 
@@ -453,6 +487,41 @@ mod tests {
                     .zip(cpu.iter())
                     .position(|(a, b)| a != b)
                     .unwrap_or(0)
+            );
+        }
+    }
+
+    // ── H-1 regression: SM 7.5+ gate ───────────────────────────────────
+    //
+    // `mma.sync.b1.xor.popc` is sm_75+. NVRTC will happily compile sm_75
+    // PTX on a host with a lower-capability device; the launch then
+    // produces undefined behavior. The `check_sm_at_least_7_5` predicate
+    // gates `build_kernels` so callers see a clean `CpuFallback` instead.
+    // These tests cover the gate in isolation so they pass on any host.
+
+    #[test]
+    fn sm_gate_accepts_turing() {
+        check_sm_at_least_7_5(7, 5).expect("sm_75 (Turing) must be accepted");
+    }
+
+    #[test]
+    fn sm_gate_accepts_ampere_ada_hopper() {
+        for (major, minor) in [(8, 0), (8, 6), (8, 9), (9, 0)] {
+            check_sm_at_least_7_5(major, minor).unwrap_or_else(|e| {
+                panic!("sm_{major}{minor} must be accepted, got {e:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn sm_gate_rejects_pre_turing() {
+        for (major, minor) in [(5, 0), (5, 2), (6, 0), (6, 1), (7, 0), (7, 2)] {
+            let err = check_sm_at_least_7_5(major, minor).expect_err(&format!(
+                "sm_{major}{minor} (< 7.5) must be rejected with CpuFallback"
+            ));
+            assert!(
+                matches!(err, GpuError::CpuFallback { .. }),
+                "expected CpuFallback for sm_{major}{minor}, got {err:?}"
             );
         }
     }

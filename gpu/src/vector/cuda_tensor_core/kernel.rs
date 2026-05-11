@@ -236,10 +236,7 @@ impl CudaGemmRunner {
         // (32 MiB on Hopper+, 4 MiB elsewhere). 4 MiB is plenty for our
         // GEMM shapes — typical IMMA algorithms use < 1 MiB.
         let workspace_size = 4 * 1024 * 1024usize;
-        let workspace =
-            unsafe { stream.alloc::<u8>(workspace_size) }.map_err(|e| GpuError::CpuFallback {
-                reason: format!("workspace alloc {} bytes failed: {e}", workspace_size),
-            })?;
+        let workspace = unsafe { stream.alloc::<u8>(workspace_size) }.map_err(map_drv)?;
 
         // Compile the unpack + correction kernels via NVRTC. We do
         // this once at construction so per-call latency stays low.
@@ -295,14 +292,7 @@ impl CudaGemmRunner {
         let mut built: [Option<PipelineSlot>; 2] = [None, None];
         for slot in built.iter_mut() {
             let stream = self.ctx.new_stream().map_err(map_drv)?;
-            let workspace = unsafe { stream.alloc::<u8>(self.workspace_size) }.map_err(|e| {
-                GpuError::CpuFallback {
-                    reason: format!(
-                        "pipeline workspace alloc {} bytes failed: {e}",
-                        self.workspace_size
-                    ),
-                }
-            })?;
+            let workspace = unsafe { stream.alloc::<u8>(self.workspace_size) }.map_err(map_drv)?;
             *slot = Some(PipelineSlot { stream, workspace });
         }
         let slots = [built[0].take().unwrap(), built[1].take().unwrap()];
@@ -937,14 +927,39 @@ impl CudaGemmRunner {
             stream_raw,
         );
 
-        // Always destroy descriptors, even on failure.
-        let _ = blas_result::destroy_matmul_pref(pref);
-        let _ = blas_result::destroy_matmul_desc(matmul_desc);
-        let _ = blas_result::destroy_matrix_layout(a_layout);
-        let _ = blas_result::destroy_matrix_layout(b_layout);
-        let _ = blas_result::destroy_matrix_layout(c_layout);
+        // Always destroy descriptors, even on failure. Surfacing destroy
+        // errors at warn level keeps a long-running search loop's leak
+        // pressure visible — under cuBLASLt these usually mean
+        // CUBLAS_STATUS_NOT_INITIALIZED (handle already dead) which is
+        // benign at shutdown but worth logging if it happens mid-flight.
+        log_blas_destroy(
+            "cublasLtMatmulPreferenceDestroy",
+            blas_result::destroy_matmul_pref(pref),
+        );
+        log_blas_destroy(
+            "cublasLtMatmulDescDestroy",
+            blas_result::destroy_matmul_desc(matmul_desc),
+        );
+        log_blas_destroy(
+            "cublasLtMatrixLayoutDestroy(A)",
+            blas_result::destroy_matrix_layout(a_layout),
+        );
+        log_blas_destroy(
+            "cublasLtMatrixLayoutDestroy(B)",
+            blas_result::destroy_matrix_layout(b_layout),
+        );
+        log_blas_destroy(
+            "cublasLtMatrixLayoutDestroy(C)",
+            blas_result::destroy_matrix_layout(c_layout),
+        );
 
         res.map_err(map_blas)
+    }
+}
+
+fn log_blas_destroy(op: &'static str, res: Result<(), blas_result::CublasError>) {
+    if let Err(e) = res {
+        log::warn!("cuBLASLt {op} failed: {e}");
     }
 }
 
@@ -952,8 +967,11 @@ impl Drop for CudaGemmRunner {
     fn drop(&mut self) {
         let handle = std::mem::replace(&mut self.handle, std::ptr::null_mut());
         if !handle.is_null() {
+            // SAFETY: handle was created by `create_handle` in `try_new`
+            // and only freed here. Best-effort: a destroy failure at
+            // process shutdown is benign; log it for long-lived services.
             unsafe {
-                let _ = blas_result::destroy_handle(handle);
+                log_blas_destroy("cublasLtDestroy", blas_result::destroy_handle(handle));
             }
         }
     }
@@ -979,14 +997,34 @@ fn launch_cfg(total: u64) -> LaunchConfig {
     }
 }
 
+/// Classify CUDA Driver API errors. `CUDA_ERROR_OUT_OF_MEMORY` propagates
+/// as [`GpuError::OutOfMemory`] so callers can release working sets or
+/// shrink batches; other failures (init, no device, denied permission,
+/// transient) route through `CpuFallback`.
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
-    GpuError::CpuFallback {
-        reason: format!("CUDA driver error: {e}"),
+    use cudarc::driver::sys::CUresult;
+    if e.0 == CUresult::CUDA_ERROR_OUT_OF_MEMORY {
+        GpuError::OutOfMemory {
+            reason: format!("CUDA driver: {e}"),
+        }
+    } else {
+        GpuError::CpuFallback {
+            reason: format!("CUDA driver error: {e}"),
+        }
     }
 }
 
+/// Classify cuBLASLt errors. Allocation failures propagate as
+/// [`GpuError::OutOfMemory`]; everything else falls back to CPU.
 fn map_blas(e: blas_result::CublasError) -> GpuError {
-    GpuError::CpuFallback {
-        reason: format!("cuBLASLt error: {e}"),
+    use cudarc::cublaslt::sys::cublasStatus_t;
+    if matches!(e.0, cublasStatus_t::CUBLAS_STATUS_ALLOC_FAILED) {
+        GpuError::OutOfMemory {
+            reason: format!("cuBLASLt: {e}"),
+        }
+    } else {
+        GpuError::CpuFallback {
+            reason: format!("cuBLASLt error: {e}"),
+        }
     }
 }

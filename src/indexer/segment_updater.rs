@@ -82,6 +82,26 @@ fn garbage_collect_files(
         .garbage_collect(move || segment_updater.list_files())
 }
 
+/// FerroSearch Wave 15 Phase H-6: releases the pending-publication
+/// marks on all sort cursor files advertised by `segment_meta`.
+///
+/// Invoked from `schedule_add_segment` and `end_merge` on the
+/// segment-updater pool, immediately before the segment is added to
+/// `SegmentManager` — at that point `list_files` starts covering the
+/// cursor paths, so the pending set is only needed for the gap
+/// between `open_sort_cursor_write` and this call.
+fn release_sort_cursor_pending(segment_updater: &SegmentUpdater, segment_meta: &SegmentMeta) {
+    let cursor_fields = segment_meta.sort_cursor_fields();
+    if cursor_fields.is_empty() {
+        return;
+    }
+    let directory = segment_updater.index.directory();
+    for field in cursor_fields {
+        let path = segment_meta.sort_cursor_path(field);
+        directory.release_pending(&path);
+    }
+}
+
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
 /// This function happens in the calling thread and is computationally expensive.
 fn merge(
@@ -114,7 +134,16 @@ fn merge(
         .collect();
 
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger = IndexMerger::open(index.schema(), &segments[..])?;
+    // Wave 15 Phase H-2: thread the index-time sort field through so
+    // the merger physically reorders alive docs to match the sort.
+    // After this, the merged segment's doc-id sequence == sort order
+    // and the existing `SortByStaticFastValue` SIMD top-K threshold
+    // filter early-terminates naturally on subsequent queries.
+    let merger: IndexMerger = IndexMerger::open_with_sort_by_field(
+        index.schema(),
+        &segments[..],
+        index.settings().sort_by_field.clone(),
+    )?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
     let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
@@ -123,7 +152,40 @@ fn merge(
 
     let merged_segment_id = merged_segment.id();
 
-    let segment_meta = index.new_segment_meta(merged_segment_id, num_docs);
+    let mut segment_meta = index.new_segment_meta(merged_segment_id, num_docs);
+    // **FerroSearch Wave 15 Phase H-1.** Rebuild the auxiliary sort
+    // cursor for the merged segment when the index advertises a sort
+    // field.  Phase A's per-segment cursors do not survive merges
+    // (each input segment had its own cursor; the merged output
+    // segment is fresh and starts with `sort_cursor_fields = []`).
+    // Without this hook the Phase E dispatch gate falls back to the
+    // legacy `SortByStaticFastValue` path on every post-merge query —
+    // exactly the http_logs `*-after-force-merge-1-seg` ES-wins case.
+    //
+    // We use the same `with_max_doc` → `build_and_write_sort_cursors`
+    // → `with_sort_cursor_fields` sequence that
+    // `IndexWriter::index_documents` runs after a fresh segment write.
+    //
+    // **Wave 18-2 fix (2026-05-11).** Originally this gate only
+    // checked `sort_by_field` (singular, Wave 15 single-field path),
+    // missing the Wave 18-1 multi-field `sort_by_fields` case. On
+    // multi-field-only indices every background merge + force-merge
+    // dropped the cursor, leaving the merged segment with empty
+    // `sort_cursor_fields`. The Phase G 5M-doc EC2 bench
+    // (2026-05-11) caught this — operator-issued
+    // `POST /_rebuild_sort_cursor` after force-merge papered over
+    // the missing cursor file but the merge hook itself was wrong.
+    // `build_and_write_sort_cursors` already dispatches v2 when
+    // `sort_by_fields` is set, so just widening the gate is enough.
+    let needs_cursor_rebuild =
+        index.settings().sort_by_field.is_some() || index.settings().sort_by_fields.is_some();
+    if needs_cursor_rebuild && num_docs > 0 {
+        let mut merged_with_max = merged_segment.clone().with_max_doc(num_docs);
+        let cursor_fields = crate::index::build_and_write_sort_cursors(&mut merged_with_max)?;
+        if !cursor_fields.is_empty() {
+            segment_meta = segment_meta.with_sort_cursor_fields(cursor_fields);
+        }
+    }
     Ok(Some(SegmentEntry::new(segment_meta, delete_cursor, None)))
 }
 
@@ -218,12 +280,37 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     )?;
     let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
-    let merger: IndexMerger =
-        IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?;
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment)?;
+    // Wave 15 Phase H-2: cross-index merge variant.  Same sort-order
+    // reorder hook as the in-place `merge` path, gated on the target
+    // settings rather than per-source-segment settings (cross-index
+    // merge always emits into a fresh target with `target_settings`).
+    let merger: IndexMerger = IndexMerger::open_with_custom_alive_set_and_sort(
+        merged_index.schema(),
+        segments,
+        filter_doc_ids,
+        target_settings.sort_by_field.clone(),
+    )?;
+    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
     let num_docs = merger.write(segment_serializer)?;
 
-    let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
+    let mut segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
+    // **FerroSearch Wave 15 Phase H-1** (cross-index merge variant).
+    // Same rebuild as the in-place `merge` path — when the target
+    // settings advertise an index sort, the merged-into-output-dir
+    // segment must also carry the auxiliary sort cursor so a post-merge
+    // searcher's Phase E dispatch can find it.
+    // Wave 18-2 fix (2026-05-11): see in-place `merge()` for the
+    // Phase G EC2 root-cause narrative.  `sort_by_fields` was
+    // dropped at merge time; widen the gate.
+    let needs_cursor_rebuild =
+        target_settings.sort_by_field.is_some() || target_settings.sort_by_fields.is_some();
+    if needs_cursor_rebuild && num_docs > 0 {
+        let mut merged_with_max = merged_segment.with_max_doc(num_docs);
+        let cursor_fields = crate::index::build_and_write_sort_cursors(&mut merged_with_max)?;
+        if !cursor_fields.is_empty() {
+            segment_meta = segment_meta.with_sort_cursor_fields(cursor_fields);
+        }
+    }
 
     let stats = format!(
         "Segments Merge: [{}]",
@@ -267,6 +354,17 @@ pub(crate) struct InnerSegmentUpdater {
     killed: AtomicBool,
     stamper: Stamper,
     merge_operations: MergeOperationInventory,
+}
+
+impl InnerSegmentUpdater {
+    /// **FerroSearch Wave 17-2.** Crate-internal accessor for the
+    /// segment manager so `IndexWriter::backfill_sort_cursor` can
+    /// read the committed register and publish updated entries.  Not
+    /// exposed in the public API — callers should go through
+    /// `IndexWriter`.
+    pub(crate) fn segment_manager(&self) -> &SegmentManager {
+        &self.segment_manager
+    }
 }
 
 impl SegmentUpdater {
@@ -348,6 +446,14 @@ impl SegmentUpdater {
     pub fn schedule_add_segment(&self, segment_entry: SegmentEntry) -> FutureResult<()> {
         let segment_updater = self.clone();
         self.schedule_task(move || {
+            // FerroSearch Wave 15 Phase H-6: release the cursor-file
+            // pending-publication marks BEFORE add_segment publishes
+            // the meta.  Once `segment_manager.add_segment` returns
+            // the cursor paths are covered by `list_files` and the
+            // pending set is purely cleanup.  Releasing first keeps
+            // the lock-acquisition order simple (no nested locks
+            // between segment_manager and the managed directory).
+            release_sort_cursor_pending(&segment_updater, segment_entry.meta());
             segment_updater.segment_manager.add_segment(segment_entry);
             segment_updater.consider_merge_options();
             Ok(())
@@ -448,6 +554,10 @@ impl SegmentUpdater {
         self.schedule_task(move || {
             let segment_entries = segment_updater.purge_deletes(opstamp)?;
             segment_updater.segment_manager.commit(segment_entries);
+            // `save_metas` calls `store_meta`, which also mirrors the
+            // updated `IndexMeta` into the index-level soft-meta slot —
+            // so readers see the freshly-persisted segment set without a
+            // separate publication step.
             segment_updater.save_metas(opstamp, payload)?;
             let _ = garbage_collect_files(segment_updater.clone());
             segment_updater.consider_merge_options();
@@ -455,8 +565,82 @@ impl SegmentUpdater {
         })
     }
 
+    /// Refresh-only commit: publishes recently-flushed segments to readers
+    /// **without** fsync'ing `meta.json` or running garbage collection.
+    ///
+    /// Maps to ES `refresh` semantics (NRT visibility). Steps performed:
+    /// 1. `purge_deletes(opstamp)` — apply any pending deletes (cheap when no deletes are queued,
+    ///    the common refresh-timer case).
+    /// 2. `segment_manager.commit(...)` — atomic in-memory swap promoting uncommitted segment
+    ///    entries to the committed list.
+    /// 3. Update `active_index_meta` so subsequent calls to `Index::searchable_segment_metas()`
+    ///    (and therefore `IndexReader::reload()`) observe the new segment set.
+    /// 4. `consider_merge_options()` — maybe schedule a merge.
+    ///
+    /// **Skipped** vs. `schedule_commit`:
+    /// - `save_metas()` (no `meta.json` write, no fsync, no `sync_directory()`).
+    /// - `garbage_collect_files()` (no listing, no unlinks).
+    ///
+    /// Durability contract: callers that need crash-recovery durability
+    /// must arrange for a separate `commit()` (a.k.a. `flush()`) on a
+    /// slower cadence; FerroSearch ferro-index pairs this with its own
+    /// translog so a crash between soft-commits replays cleanly.
+    pub(crate) fn schedule_soft_commit(
+        &self,
+        opstamp: Opstamp,
+        payload: Option<String>,
+    ) -> FutureResult<Opstamp> {
+        let segment_updater: SegmentUpdater = self.clone();
+        self.schedule_task(move || {
+            let segment_entries = segment_updater.purge_deletes(opstamp)?;
+            segment_updater.segment_manager.commit(segment_entries);
+            // Build an IndexMeta in-memory (NO fsync, NO directory write)
+            // and publish it via the shared soft-meta slot so that
+            // `Index::searchable_segment_metas()` picks it up on the
+            // next `reload()`.
+            segment_updater.publish_soft_meta(opstamp, payload)?;
+            segment_updater.consider_merge_options();
+            Ok(opstamp)
+        })
+    }
+
+    /// Build an `IndexMeta` from current in-memory committed-segments
+    /// state and publish it via the active-meta slot (which also mirrors
+    /// to the index-level soft-meta slot consulted by readers). Does NOT
+    /// touch disk.
+    fn publish_soft_meta(
+        &self,
+        opstamp: Opstamp,
+        commit_message: Option<String>,
+    ) -> crate::Result<()> {
+        if !self.is_alive() {
+            return Ok(());
+        }
+        let index = &self.index;
+        let mut committed_segment_metas = self.segment_manager.committed_segment_metas();
+        committed_segment_metas
+            .sort_by_key(|segment_meta| std::cmp::Reverse(segment_meta.max_doc()));
+        let index_meta = IndexMeta {
+            index_settings: index.settings().clone(),
+            segments: committed_segment_metas,
+            schema: index.schema(),
+            opstamp,
+            payload: commit_message,
+        };
+        // `store_meta` updates `active_index_meta` AND mirrors into
+        // `index.soft_meta` so subsequent `IndexReader::reload()` calls
+        // pick up the new segment set without a `meta.json` read.
+        self.store_meta(&index_meta);
+        Ok(())
+    }
+
     fn store_meta(&self, index_meta: &IndexMeta) {
         *self.active_index_meta.write().unwrap() = Arc::new(index_meta.clone());
+        // Mirror into the index-level soft-meta slot so that
+        // `Index::searchable_segment_metas()` / `IndexReader::reload()`
+        // observe up-to-date segment lists across hard commits, soft
+        // commits AND post-merge meta updates uniformly.
+        self.index.store_soft_meta(index_meta.clone());
     }
 
     fn load_meta(&self) -> Arc<IndexMeta> {
@@ -657,6 +841,15 @@ impl SegmentUpdater {
                     }
                 }
                 let previous_metas = segment_updater.load_meta();
+                // FerroSearch Wave 15 Phase H-6: release pending marks
+                // on the merged segment's cursor files before the
+                // segment manager publishes the new SegmentMeta.
+                // After `segment_manager.end_merge` the merged segment
+                // is in the committed list, so `list_files` covers
+                // these paths going forward.
+                if let Some(after_entry) = after_merge_segment_entry.as_ref() {
+                    release_sort_cursor_pending(&segment_updater, after_entry.meta());
+                }
                 let segments_status = segment_updater
                     .segment_manager
                     .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)?;
@@ -1013,6 +1206,222 @@ mod tests {
         let segment_metas = segments[0].meta();
         assert_eq!(segment_metas.num_deleted_docs(), 0);
         assert_eq!(segment_metas.num_docs(), 1);
+
+        Ok(())
+    }
+
+    /// FerroSearch Wave 15 Phase H-1 regression test: when an index
+    /// configures `IndexSettings::sort_by_field`, both the in-place
+    /// `merge` path and the `merge_filtered_segments` path must rebuild
+    /// the auxiliary `SortCursorIndex` for the merged output segment.
+    /// Without the rebuild, the Phase E dispatch gate falls back to the
+    /// legacy `SortByStaticFastValue` path on every post-force-merge
+    /// query and the http_logs `*-after-force-merge-1-seg` benchmarks
+    /// silently regress to ES-faster.
+    #[test]
+    fn test_merge_filtered_segments_rebuilds_sort_cursor() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField, Order};
+
+        let value_field;
+        let first_index = {
+            let mut schema_builder = Schema::builder();
+            value_field = schema_builder.add_i64_field("value", FAST);
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .settings(IndexSettings {
+                    sort_by_field: Some(IndexSortByField {
+                        field: "value".to_string(),
+                        order: Order::Desc,
+                    }),
+                    ..Default::default()
+                })
+                .create_in_ram()?;
+            let mut writer = index.writer_for_tests()?;
+            writer.add_document(doc!(value_field=>40i64))?;
+            writer.add_document(doc!(value_field=>10i64))?;
+            writer.commit()?;
+            index
+        };
+
+        let second_index = {
+            let mut schema_builder = Schema::builder();
+            schema_builder.add_i64_field("value", FAST);
+            let index = Index::builder()
+                .schema(schema_builder.build())
+                .settings(IndexSettings {
+                    sort_by_field: Some(IndexSortByField {
+                        field: "value".to_string(),
+                        order: Order::Desc,
+                    }),
+                    ..Default::default()
+                })
+                .create_in_ram()?;
+            let mut writer = index.writer_for_tests()?;
+            let v = index.schema().get_field("value")?;
+            writer.add_document(doc!(v=>30i64))?;
+            writer.add_document(doc!(v=>20i64))?;
+            writer.commit()?;
+            index
+        };
+
+        let mut segments: Vec<Segment> = Vec::new();
+        segments.extend(first_index.searchable_segments()?);
+        segments.extend(second_index.searchable_segments()?);
+
+        let target_settings = first_index.settings().clone();
+        let non_filter = segments.iter().map(|_| None).collect::<Vec<_>>();
+
+        let merged_index = merge_filtered_segments(
+            &segments,
+            target_settings,
+            non_filter,
+            RamDirectory::default(),
+        )?;
+
+        // Single merged segment must advertise the sort cursor for the
+        // configured sort field, walk all 4 docs in Desc order.
+        let merged_segments = merged_index.searchable_segments()?;
+        assert_eq!(merged_segments.len(), 1);
+        let merged_meta = merged_segments[0].meta();
+        let advertised: Vec<&str> = merged_meta
+            .sort_cursor_fields()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            advertised,
+            vec!["value"],
+            "merged segment must advertise the rebuilt sort cursor"
+        );
+
+        let reader = merged_index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let seg = searcher.segment_reader(0);
+        let cursor = seg
+            .sort_cursor("value")
+            .expect("rebuilt sort cursor must be readable");
+        assert_eq!(cursor.order(), Order::Desc);
+        assert_eq!(cursor.len(), 4);
+
+        // Verify the cursor walks docs in Desc value order. The values
+        // are {40, 10, 30, 20} from the two input segments; merged DocId
+        // assignment is not stable across runs, so we assert via the
+        // value column rather than DocId equality.
+        let column = seg.fast_fields().i64("value")?;
+        let mut values: Vec<i64> = Vec::new();
+        for doc in cursor.iter() {
+            values.push(column.first(doc).expect("value present"));
+        }
+        assert_eq!(values, vec![40, 30, 20, 10], "cursor walks Desc by value");
+
+        Ok(())
+    }
+
+    /// **FerroSearch Wave 18-2 regression test** (2026-05-11). For an
+    /// index that configures `IndexSettings::sort_by_fields` (Wave 18-1
+    /// multi-field) — `sort_by_field` is `None` and only
+    /// `sort_by_fields` carries the sort order — the merge hook must
+    /// still rebuild the cursor on the merged segment, advertise it
+    /// in `SegmentMeta::sort_cursor_fields`, and the resulting cursor
+    /// file must internally record ALL configured fields (not just
+    /// the primary). Without this fix every background merge +
+    /// force-merge leaves the merged segment with empty
+    /// `sort_cursor_fields`, and the Phase E v2 multi-field dispatch
+    /// declines for the whole shard.  Caught by the Phase G 5M-doc
+    /// EC2 bench (2026-05-11).
+    #[test]
+    fn test_merge_rebuilds_multi_field_sort_cursor_wave_18_2() -> crate::Result<()> {
+        use crate::index::{IndexSettings, IndexSortByField, Order, SortCursorAny};
+
+        let ts_field;
+        let id_field;
+        let mut schema_builder = Schema::builder();
+        ts_field = schema_builder.add_i64_field("ts", FAST);
+        id_field = schema_builder.add_i64_field("id", FAST);
+        let schema = schema_builder.build();
+
+        let index = Index::builder()
+            .schema(schema.clone())
+            .settings(IndexSettings {
+                // Wave 18-1 multi-field: sort_by_fields set, sort_by_field None.
+                sort_by_fields: Some(vec![
+                    IndexSortByField {
+                        field: "ts".to_string(),
+                        order: Order::Desc,
+                    },
+                    IndexSortByField {
+                        field: "id".to_string(),
+                        order: Order::Asc,
+                    },
+                ]),
+                ..Default::default()
+            })
+            .create_in_ram()?;
+
+        // Two commits → at least 2 segments → in-place merge fires.
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter = index.writer_for_tests()?;
+            writer.add_document(doc!(ts_field=>100i64, id_field=>3i64))?;
+            writer.add_document(doc!(ts_field=>100i64, id_field=>1i64))?;
+            writer.add_document(doc!(ts_field=>50i64, id_field=>2i64))?;
+            writer.commit()?;
+        }
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter = index.writer_for_tests()?;
+            writer.add_document(doc!(ts_field=>200i64, id_field=>5i64))?;
+            writer.add_document(doc!(ts_field=>200i64, id_field=>4i64))?;
+            writer.commit()?;
+        }
+
+        // Force a single-segment merge to exercise the merge hook.
+        {
+            let mut writer: crate::indexer::index_writer::IndexWriter = index.writer_for_tests()?;
+            let segment_ids = index.searchable_segment_ids()?;
+            assert!(
+                segment_ids.len() >= 2,
+                "test fixture should have at least 2 pre-merge segments, got {}",
+                segment_ids.len()
+            );
+            writer.merge(&segment_ids).wait()?;
+            writer.wait_merging_operations()?;
+        }
+
+        // The merged segment must advertise the cursor.
+        let merged_segments = index.searchable_segments()?;
+        assert_eq!(merged_segments.len(), 1, "expected 1 merged segment");
+        let merged_meta = merged_segments[0].meta();
+        let advertised: Vec<&str> = merged_meta
+            .sort_cursor_fields()
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            advertised,
+            vec!["ts"],
+            "merged segment must advertise the v2 cursor under its primary field name"
+        );
+
+        // The cursor file must exist and parse as v2 with BOTH fields.
+        let segment = index.segment(merged_meta.clone());
+        let slice = segment.open_sort_cursor_read("ts")?;
+        let any = SortCursorAny::open(slice)?;
+        let cursor = match any {
+            SortCursorAny::V2(c) => c,
+            SortCursorAny::V1(_) => panic!(
+                "Wave 18-2 regression: merge hook wrote a v1 cursor when multi-field config is set"
+            ),
+        };
+        let fields: Vec<(&str, Order)> = cursor
+            .fields()
+            .iter()
+            .map(|(n, o, _)| (n.as_str(), *o))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![("ts", Order::Desc), ("id", Order::Asc)],
+            "v2 cursor must record both configured fields with their orders"
+        );
 
         Ok(())
     }

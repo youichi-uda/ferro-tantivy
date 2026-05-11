@@ -120,6 +120,16 @@ where
         );
     }
 
+    /// Hot block path for the no-score (sort-only) flow.  Forwards the block
+    /// to the segment computer, which can override
+    /// [`SegmentSortKeyComputer::compute_block_sort_keys_and_collect`] for
+    /// a batch read (e.g. `Column::first_vals`).
+    #[inline]
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.segment_sort_key_computer
+            .compute_block_sort_keys_and_collect(docs, &mut self.topn_computer);
+    }
+
     fn harvest(self) -> Self::Fruit {
         let segment_ord = self.segment_ord;
         let segment_hits: Vec<(TSegmentSortKeyComputer::SortKey, DocAddress)> = self

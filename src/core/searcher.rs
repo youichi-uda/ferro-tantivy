@@ -482,6 +482,28 @@ impl Searcher {
     ///
     /// This can be used to adjust the statistics used in computing BM25
     /// scores.
+    ///
+    /// ## Wave 11 #A: 1-segment auto-bypass of multi-thread executor
+    ///
+    /// When `self.segment_readers().len() == 1`, dispatching the single
+    /// segment task through a `ThreadPool` executor is pure overhead — the
+    /// FerroSearch microbench
+    /// (`vendor/tantivy-local/benches/multithread_executor.rs`) measures
+    /// `1-seg/50k: 1.92 µs (single) → 3.43 µs (4-thread pool)`, ~1.8× slower
+    /// for the trivial case.
+    ///
+    /// Wave 10 verify EC2 (`dd-pack/rally-bench-fullmode-2026-05-08-postwave10`)
+    /// confirmed this regression on force-merged http_logs (1 segment per
+    /// shard) where Wave 9 wins flipped back: `desc_sort_timestamp_can_match`
+    /// FS 1.23× → ES 3.11×, `sort_status_desc` FS 2.40× → ES 9.64×.
+    ///
+    /// The fix: detect `segment_readers().len() == 1` at query time and use
+    /// `Executor::SingleThread` regardless of the index-level configured
+    /// executor. The check is a single comparison on a `Vec` length the
+    /// searcher already owns — zero extra work. Multi-segment indexes
+    /// continue to use the configured executor as before, so operators can
+    /// still opt in to per-shard parallelism for large multi-segment
+    /// workloads via `FERRO_SEARCH_EXECUTOR_THREADS`.
     pub fn search_with_statistics_provider<C: Collector>(
         &self,
         query: &dyn Query,
@@ -493,8 +515,23 @@ impl Searcher {
         } else {
             EnableScoring::disabled_from_searcher(self)
         };
-        let executor = self.inner.index.search_executor();
-        self.search_with_executor(query, collector, executor, enabled_scoring)
+        // Wave 11 #A: single-segment auto-bypass.
+        // Tantivy's `Executor::ThreadPool::map` for a 1-element iterator
+        // pays ~1.5-4 µs of dispatch overhead (rayon scope spawn +
+        // crossbeam channel hop) for zero parallelism gain. With
+        // force-merged 1-shard-per-segment indexes this overhead dominates
+        // sort/can_match query latency. Bypass to SingleThread when there
+        // is exactly one segment task to dispatch.
+        //
+        // `Executor::SingleThread` is a zero-sized unit variant — owning it
+        // in a local is free, and `&Executor` borrows from the local for
+        // the duration of the call.
+        let configured = self.inner.index.search_executor();
+        if self.inner.segment_readers.len() == 1 && matches!(configured, Executor::ThreadPool(_)) {
+            let bypass = Executor::SingleThread;
+            return self.search_with_executor(query, collector, &bypass, enabled_scoring);
+        }
+        self.search_with_executor(query, collector, configured, enabled_scoring)
     }
 
     /// Same as [`search(...)`](Searcher::search) but multithreaded.
@@ -539,14 +576,91 @@ impl Searcher {
 
     /// Batch retrieval of combined `_id` + `_source` as raw bytes.
     ///
-    /// Returns a stub (`vec![None; addrs.len()]`). FerroSearch has fallback
-    /// logic that uses separate SSTable + DocStore paths when this returns
-    /// all-`None`.
+    /// Wave 14 #B: extracts both fields in a single block-grouped DocStore
+    /// pass — eliminates the SSTable scan for `_id` (which sorts term ords
+    /// across all docs and pays an O(N log N) up front) and avoids two
+    /// passes over each doc body. For 1000-doc scroll pages this saves
+    /// roughly half the per-page doc-retrieval cost.
+    ///
+    /// Returns one entry per input address in the same order. Each entry is
+    /// `Some((id, source))` when both fields were found in the doc body,
+    /// or `None` when the doc could not be read or did not contain both
+    /// fields. Callers should treat `None` as a signal to fall back to the
+    /// separate-fields path (SSTable + per-field DocStore).
     pub fn batch_get_id_and_source(
         &self,
         addrs: &[DocAddress],
+        id_field: Option<crate::schema::Field>,
+        source_field: Option<crate::schema::Field>,
     ) -> Vec<Option<(String, OwnedBytes)>> {
-        vec![None; addrs.len()]
+        if addrs.is_empty() {
+            return Vec::new();
+        }
+        let (Some(id_f), Some(src_f)) = (id_field, source_field) else {
+            // Caller did not supply both field IDs — return all-None so
+            // the fallback path (SSTable _id + per-field DocStore _source)
+            // takes over without changing semantics.
+            return vec![None; addrs.len()];
+        };
+
+        let num_segments = self.inner.store_readers.len();
+
+        // Single-segment fast path (post-forcemerge / single-shard tests).
+        if num_segments == 1 {
+            let store_reader = &self.inner.store_readers[0];
+            let mut indexed: Vec<(usize, crate::DocId)> = addrs
+                .iter()
+                .enumerate()
+                .map(|(i, a)| (i, a.doc_id))
+                .collect();
+            indexed.sort_unstable_by_key(|(_, doc_id)| *doc_id);
+            let doc_ids: Vec<crate::DocId> = indexed.iter().map(|(_, d)| *d).collect();
+            let (mut id_batch, mut src_batch) =
+                store_reader.batch_get_two_fields_owned_bytes_grouped(&doc_ids, id_f, src_f);
+            let mut results: Vec<Option<(String, OwnedBytes)>> = vec![None; addrs.len()];
+            for (i, &(orig_idx, _)) in indexed.iter().enumerate() {
+                let id_bytes = id_batch[i].take();
+                let src_bytes = src_batch[i].take();
+                if let (Some(id), Some(src)) = (id_bytes, src_bytes) {
+                    if let Ok(id_str) = std::str::from_utf8(&id) {
+                        results[orig_idx] = Some((id_str.to_string(), src));
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Multi-segment: sort by (segment_ord, doc_id) and group by segment.
+        let mut indexed: Vec<(usize, DocAddress)> =
+            addrs.iter().enumerate().map(|(i, a)| (i, *a)).collect();
+        indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
+
+        let mut results: Vec<Option<(String, OwnedBytes)>> = vec![None; addrs.len()];
+
+        let mut seg_start = 0;
+        while seg_start < indexed.len() {
+            let seg_ord = indexed[seg_start].1.segment_ord;
+            let mut seg_end = seg_start + 1;
+            while seg_end < indexed.len() && indexed[seg_end].1.segment_ord == seg_ord {
+                seg_end += 1;
+            }
+            let group = &indexed[seg_start..seg_end];
+            let doc_ids: Vec<crate::DocId> = group.iter().map(|(_, a)| a.doc_id).collect();
+            let store_reader = &self.inner.store_readers[seg_ord as usize];
+            let (mut id_batch, mut src_batch) =
+                store_reader.batch_get_two_fields_owned_bytes_grouped(&doc_ids, id_f, src_f);
+            for (i, &(orig_idx, _)) in group.iter().enumerate() {
+                let id_bytes = id_batch[i].take();
+                let src_bytes = src_batch[i].take();
+                if let (Some(id), Some(src)) = (id_bytes, src_bytes) {
+                    if let Ok(id_str) = std::str::from_utf8(&id) {
+                        results[orig_idx] = Some((id_str.to_string(), src));
+                    }
+                }
+            }
+            seg_start = seg_end;
+        }
+        results
     }
 }
 

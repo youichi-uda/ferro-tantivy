@@ -1,8 +1,9 @@
 mod order;
+pub mod simd_top_k;
 mod sort_by_bytes;
 mod sort_by_erased_type;
 mod sort_by_score;
-mod sort_by_static_fast_value;
+pub(crate) mod sort_by_static_fast_value;
 mod sort_by_static_fast_value_with_cursor;
 mod sort_by_string;
 mod sort_key_computer;
@@ -452,6 +453,100 @@ pub(crate) mod tests {
             prop_assert_eq!(
                 expected_docs,
                 top_n_results
+            );
+        }
+    }
+
+    /// Wave 14: large-segment string sort exercises both
+    ///   - the term-ordinal warm cache (segment ≥ 1024 docs and ≤ 256 K), and
+    ///   - the SIMD top-K threshold filter on contiguous 64-doc blocks
+    ///     (`compute_block_sort_keys_and_collect` warm-cache path).
+    ///
+    /// We build a single large segment so the entire sort goes through the
+    /// `for_each_no_score` block path with the warm cache populated.  The
+    /// reference sort is the plain `sort_hits` over the full doc set.  Run
+    /// with both Asc and Desc to cover `simd_filter_block_lt_u64` and
+    /// `simd_filter_block_gt_u64`.
+    #[test]
+    fn test_order_by_string_warm_cache_simd_path() {
+        for &order in &[Order::Desc, Order::Asc] {
+            // Low-cardinality (status-like): 5 distinct terms, 5,000 docs.
+            // After top_n=10 the heap fills with all-max (Desc) or all-min
+            // (Asc) — the SIMD path's `mask == 0` early-termination should
+            // skip the bulk of the docs.
+            let n_docs = 5_000usize;
+            let codes = ["aaa", "bbb", "ccc", "ddd", "eee"];
+            let mut schema_builder = Schema::builder();
+            let f = schema_builder.add_text_field("city", TEXT | FAST);
+            let schema = schema_builder.build();
+            let index = Index::create_in_ram(schema);
+            let mut writer = index.writer_for_tests().unwrap();
+            for i in 0..n_docs {
+                let term = codes[i % codes.len()];
+                writer.add_document(doc!(f => term)).unwrap();
+            }
+            writer.commit().unwrap();
+
+            let searcher = index.reader().unwrap().searcher();
+            let limit = 10usize;
+            let top_n = searcher
+                .search(
+                    &AllQuery,
+                    &TopDocs::with_limit(limit).order_by_string_fast_field("city", order),
+                )
+                .unwrap();
+            assert_eq!(top_n.len(), limit, "size=10 → 10 hits");
+
+            // All top 10 must be the lex-extreme code (Desc → "eee", Asc → "aaa").
+            let extreme = if order.is_asc() { "aaa" } else { "eee" };
+            for (val_opt, _doc) in &top_n {
+                assert_eq!(
+                    val_opt.as_deref(),
+                    Some(extreme),
+                    "warm-cache SIMD path: all top hits must be the extreme code (order={:?})",
+                    order
+                );
+            }
+
+            // High-cardinality stress: 2,000 unique terms, single segment,
+            // stable lex order so we can predict the top-10 of Desc/Asc.
+            let n_unique = 2_000usize;
+            let mut schema_builder = Schema::builder();
+            let f = schema_builder.add_text_field("city", TEXT | FAST);
+            let schema = schema_builder.build();
+            let index2 = Index::create_in_ram(schema);
+            let mut writer2 = index2.writer_for_tests().unwrap();
+            for i in 0..n_unique {
+                // Pad numerically so lex order matches numeric.
+                let term = format!("{i:08}");
+                writer2.add_document(doc!(f => term.as_str())).unwrap();
+            }
+            writer2.commit().unwrap();
+
+            let searcher2 = index2.reader().unwrap().searcher();
+            let top_n2 = searcher2
+                .search(
+                    &AllQuery,
+                    &TopDocs::with_limit(limit).order_by_string_fast_field("city", order),
+                )
+                .unwrap();
+            assert_eq!(top_n2.len(), limit);
+            let want: Vec<String> = if order.is_asc() {
+                (0..limit).map(|i| format!("{i:08}")).collect()
+            } else {
+                (n_unique - limit..n_unique)
+                    .rev()
+                    .map(|i| format!("{i:08}"))
+                    .collect()
+            };
+            let got: Vec<String> = top_n2
+                .iter()
+                .map(|(v, _)| v.clone().unwrap_or_default())
+                .collect();
+            assert_eq!(
+                got, want,
+                "warm-cache SIMD high-cardinality must match plain lex top-10 (order={:?})",
+                order
             );
         }
     }

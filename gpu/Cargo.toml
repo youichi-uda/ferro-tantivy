@@ -19,6 +19,20 @@ tantivy-bitpacker = { version = "0.10", path = "../bitpacker" }
 wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
 
+# CUDA Tensor Core fast path (NVIDIA-only).
+# Runtime-loaded (`dynamic-loading`) so the crate still builds and runs on
+# hosts without CUDA installed; the path is gated by the
+# `cuda-tensor-core` feature and is off by default.
+# See `docs/ADR-001-cuda-backend.md` for the rationale.
+cudarc = { version = "0.19", default-features = false, features = [
+    "cuda-12040",
+    "driver",
+    "cublaslt",
+    "nvrtc",
+    "dynamic-loading",
+    "std",
+], optional = true }
+
 # Utilities
 log = "0.4.16"
 serde = { version = "1.0", features = ["derive"] }
@@ -34,8 +48,24 @@ rand = "0.9"
 name = "gpu_bench"
 harness = false
 
+[[bench]]
+name = "binary_distance"
+harness = false
+
+[[bench]]
+name = "hnsw_binary"
+harness = false
+
+[[bench]]
+name = "bitmap_op"
+harness = false
+
 [features]
 default = ["wgpu-backend"]
 wgpu-backend = ["wgpu", "pollster"]
 # CPU-only fallback for testing / environments without GPU
 cpu-fallback = []
+# NVIDIA CUDA Tensor Core fast path for binary Hamming distance.
+# Off by default — opt-in for NVIDIA deployments. See
+# `docs/ADR-001-cuda-backend.md`.
+cuda-tensor-core = ["dep:cudarc"]

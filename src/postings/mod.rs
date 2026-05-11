@@ -13,6 +13,14 @@ mod per_field_postings_writer;
 mod postings;
 mod postings_writer;
 mod recorder;
+/// Roaring Bitmap posting list format — Phase 2 C-3 alternate
+/// posting body. **Off by default**: the segment writer keeps emitting
+/// [`compression`]-style BitPacker4x bodies until the C-4 dispatch
+/// threshold lands. The module is wired in here so downstream
+/// integration (Wave 6) can call into `roaring::PostingFormat`,
+/// `roaring::RoaringEncoder`, and `roaring::RoaringDecoder` without
+/// needing visibility tweaks.
+pub mod roaring;
 mod segment_postings;
 /// Serializer module for the inverted index
 pub mod serializer;
@@ -38,6 +46,25 @@ pub(crate) enum FreqReadingOption {
     NoFreq,
     SkipFreq,
     ReadFreq,
+}
+
+/// Sniff the posting body format without committing to a parse.
+///
+/// Phase 2 C-3 introduced [`roaring::PostingFormat`] as an alternate
+/// to the legacy block-wise BitPacker4x format. Existing segments
+/// have **no** format tag in their body — they are read as
+/// [`roaring::PostingFormat::BitPacker4x`] by default. New segments
+/// **may** prepend the [`roaring::MAGIC`] = `b"ROAR"` header to opt
+/// into the Roaring path; this helper checks for that magic and
+/// reports the format that should be selected for parsing.
+///
+/// This is the *scaffolding entry point* for the Wave-6 (Phase 2 C-4)
+/// dispatch wire-up. Today, the production read path always selects
+/// `BitPacker4x` — see the module-level docs of [`roaring`] for the
+/// honest scope statement.
+#[must_use]
+pub fn detect_posting_format(body: &[u8]) -> roaring::PostingFormat {
+    roaring::PostingFormatDispatch::detect(body)
 }
 
 #[cfg(test)]

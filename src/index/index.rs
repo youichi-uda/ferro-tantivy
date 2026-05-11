@@ -3,7 +3,10 @@ use std::fmt;
 #[cfg(feature = "mmap")]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::available_parallelism;
+
+use arc_swap::ArcSwapOption;
 
 use super::segment::Segment;
 use super::segment_reader::merge_field_meta_data;
@@ -232,6 +235,9 @@ impl IndexBuilder {
     }
 
     fn validate(&self) -> crate::Result<()> {
+        // Wave 18-1: enforce sort_by_field / sort_by_fields mutual exclusion
+        // and the multi-field cap at index-create time.
+        self.index_settings.validate_sort_settings()?;
         if let Some(_schema) = self.schema.as_ref() {
             Ok(())
         } else {
@@ -272,6 +278,14 @@ pub struct Index {
     tokenizers: TokenizerManager,
     fast_field_tokenizers: TokenizerManager,
     inventory: SegmentMetaInventory,
+    /// Soft (in-memory) view of the index meta. Populated by
+    /// `IndexWriter::soft_commit()` to expose newly-flushed segments to
+    /// readers without paying the meta.json fsync + GC cost. When `Some`,
+    /// `searchable_segment_metas()` consults this in-memory snapshot
+    /// instead of reading `meta.json` from disk. A subsequent full
+    /// `commit()` updates this slot to the persisted meta so readers
+    /// stay consistent with the on-disk manifest.
+    soft_meta: Arc<ArcSwapOption<IndexMeta>>,
 }
 
 impl Index {
@@ -391,7 +405,36 @@ impl Index {
             fast_field_tokenizers: TokenizerManager::default(),
             executor: Executor::single_thread(),
             inventory,
+            soft_meta: Arc::new(ArcSwapOption::empty()),
         }
+    }
+
+    /// Internal handle to the in-memory soft-meta slot.
+    ///
+    /// Populated by `IndexWriter::soft_commit()` (cheap refresh-only
+    /// publish) and by `IndexWriter::commit()` (full flush), consulted by
+    /// `searchable_segment_metas()` so that `IndexReader::reload()` can
+    /// pick up newly-flushed segments without performing a meta.json
+    /// fsync / read.
+    #[doc(hidden)]
+    pub fn soft_meta_handle(&self) -> Arc<ArcSwapOption<IndexMeta>> {
+        self.soft_meta.clone()
+    }
+
+    /// Replace the in-memory soft-meta snapshot. Called by the segment
+    /// updater after a soft-commit (refresh-only, no fsync) or after a
+    /// full commit (so readers stay aligned with the persisted manifest).
+    #[doc(hidden)]
+    pub fn store_soft_meta(&self, meta: IndexMeta) {
+        self.soft_meta.store(Some(Arc::new(meta)));
+    }
+
+    /// Clear the in-memory soft-meta snapshot, forcing the next
+    /// `searchable_segment_metas()` to fall back to the on-disk
+    /// `meta.json`. Used by tests and by recovery paths.
+    #[doc(hidden)]
+    pub fn clear_soft_meta(&self) {
+        self.soft_meta.store(None);
     }
 
     /// Setter for the tokenizer manager.
@@ -673,6 +716,55 @@ impl Index {
         Ok(())
     }
 
+    /// Rewrites `meta.json` on disk with new `IndexSettings` while
+    /// preserving the current segment list, opstamp, schema, and
+    /// payload.
+    ///
+    /// **FerroSearch extension (Wave 18 follow-up).** This exists to
+    /// support in-place migration of the `index.sort.*` shape — e.g.
+    /// upgrading an existing single-field `IndexSettings::sort_by_field`
+    /// (v1 cursor) deployment to the v2 multi-field
+    /// `IndexSettings::sort_by_fields` shape that Wave 18-1〜18-6 builds
+    /// on, so future segments committed after the migration also build
+    /// v2 cursors instead of relying on Wave 18-2's mix dispatcher
+    /// fallback path for them.
+    ///
+    /// Mirrors [`Self::rewrite_schema_on_disk`]: the call only
+    /// rewrites `meta.json` atomically.  The in-memory `Index`'s
+    /// settings cache is unchanged — re-open the directory with
+    /// [`Index::open`] (or update via [`Self::settings_mut`]) to
+    /// observe the new settings.
+    ///
+    /// The caller is responsible for:
+    ///   - Validating `new_settings` against [`IndexSettings::validate_sort_settings`]
+    ///     (`sort_by_field` and `sort_by_fields` are mutually exclusive at tantivy's invariant
+    ///     boundary; new fields beyond the cap are rejected at write time downstream).
+    ///   - Backfilling any per-segment auxiliary data the new settings imply.  In particular,
+    ///     switching from `sort_by_field` to `sort_by_fields` does NOT retroactively create v2
+    ///     cursor files on existing segments — operators must pair this call with
+    ///     `IndexWriter::backfill_sort_cursor_v2` so the existing segments advertise the new cursor
+    ///     shape.
+    ///   - Draining / committing any in-flight writes and dropping the existing `IndexWriter`
+    ///     before calling, then re-opening the `Index` so subsequent writers use the new settings.
+    ///     This method does not acquire the writer lock.
+    ///
+    /// After a successful call + re-open, the segment-finalize hook
+    /// in `build_and_write_sort_cursors` (see `src/index/sort_cursor.rs`)
+    /// reads the new `sort_by_fields` and starts emitting v2 cursors
+    /// on every subsequent commit.
+    pub fn rewrite_settings_on_disk(&self, new_settings: IndexSettings) -> crate::Result<()> {
+        let current = self.load_metas()?;
+        let new_meta = IndexMeta {
+            index_settings: new_settings,
+            segments: current.segments,
+            schema: current.schema,
+            opstamp: current.opstamp,
+            payload: current.payload,
+        };
+        save_metas(&new_meta, self.directory())?;
+        Ok(())
+    }
+
     /// Returns the list of segments that are searchable
     pub fn searchable_segments(&self) -> crate::Result<Vec<Segment>> {
         Ok(self
@@ -707,7 +799,18 @@ impl Index {
 
     /// Reads the meta.json and returns the list of
     /// `SegmentMeta` from the last commit.
+    ///
+    /// When a soft-commit has populated the in-memory soft-meta slot,
+    /// the in-memory snapshot takes precedence over the on-disk
+    /// `meta.json`. This is what makes `IndexWriter::soft_commit()`
+    /// cheap: readers can see new segments via `reload()` without the
+    /// soft-commit having to fsync `meta.json`. After a full
+    /// `IndexWriter::commit()` or `flush()`, the soft-meta is refreshed
+    /// to match the on-disk manifest, so readers remain consistent.
     pub fn searchable_segment_metas(&self) -> crate::Result<Vec<SegmentMeta>> {
+        if let Some(soft) = self.soft_meta.load_full() {
+            return Ok(soft.segments.clone());
+        }
         Ok(self.load_metas()?.segments)
     }
 

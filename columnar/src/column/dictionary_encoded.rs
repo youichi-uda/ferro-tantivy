@@ -66,6 +66,43 @@ impl BytesColumn {
     pub fn dictionary(&self) -> &Dictionary<VoidSSTable> {
         self.dictionary.as_ref()
     }
+
+    /// Returns the (min, max) raw byte terms recorded in this column's
+    /// dictionary, or `None` if the column has no terms.
+    ///
+    /// The dictionary stores terms in sorted byte order, so min == term at
+    /// ordinal `0` and max == term at ordinal `num_terms - 1`. Cost is two
+    /// SSTable seeks (O(log n) on the block index, no full scan).
+    ///
+    /// Used by query-plan-time `can_match` shortcuts: when the query carries
+    /// a range/term filter on this field and the requested range is disjoint
+    /// from `[min, max]`, the segment cannot contribute and the search may
+    /// skip it entirely.
+    ///
+    /// Note: returned bounds are an over-approximation of *surviving* docs —
+    /// deleted docs' terms remain in the dictionary until merge. This is
+    /// safe for shortcut decisions (false positives — running search on a
+    /// segment that turns out to have nothing — are correct, just slower;
+    /// false negatives — wrongly skipping — would corrupt results, but the
+    /// dictionary upper-bounds the actual range so this never happens).
+    pub fn min_max_bytes(&self) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let n = self.dictionary.num_terms();
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut min_buf = Vec::new();
+        if !self.dictionary.ord_to_term(0, &mut min_buf)? {
+            return Ok(None);
+        }
+        if n == 1 {
+            return Ok(Some((min_buf.clone(), min_buf)));
+        }
+        let mut max_buf = Vec::new();
+        if !self.dictionary.ord_to_term((n - 1) as u64, &mut max_buf)? {
+            return Ok(None);
+        }
+        Ok(Some((min_buf, max_buf)))
+    }
 }
 
 #[derive(Clone)]
@@ -90,6 +127,30 @@ impl StrColumn {
 
     pub fn dictionary(&self) -> &Dictionary<VoidSSTable> {
         self.0.dictionary.as_ref()
+    }
+
+    /// Returns the (min, max) UTF-8 string terms recorded in this column's
+    /// dictionary, or `None` if the column has no terms or any term is not
+    /// valid UTF-8 (callers should fall back to `BytesColumn::min_max_bytes`).
+    ///
+    /// See `BytesColumn::min_max_bytes` for the can_match shortcut semantics.
+    pub fn min_max_str(&self) -> io::Result<Option<(String, String)>> {
+        let Some((min_b, max_b)) = self.0.min_max_bytes()? else {
+            return Ok(None);
+        };
+        let min_s = String::from_utf8(min_b).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("min term not utf-8: {e}"),
+            )
+        })?;
+        let max_s = String::from_utf8(max_b).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("max term not utf-8: {e}"),
+            )
+        })?;
+        Ok(Some((min_s, max_s)))
     }
 
     /// Fills the buffer

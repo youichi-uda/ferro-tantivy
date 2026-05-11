@@ -45,6 +45,33 @@ pub trait SegmentSortKeyComputer: 'static {
         top_n_computer.push(sort_key, doc);
     }
 
+    /// Computes sort keys for an entire block of documents and pushes each into the
+    /// TopN computer.
+    ///
+    /// Implementors that can read sort values in batch (e.g. `Column::first_vals`,
+    /// which decodes a block of bit-packed values together) should override this
+    /// method.  The default implementation simply loops over the docs and falls
+    /// back to [`Self::compute_sort_key_and_collect`].
+    ///
+    /// Used by the no-score code path inside `default_collect_segment_impl`,
+    /// where the query iterator hands the collector a block of `DocId`s rather
+    /// than one at a time.  This is the equivalent of Lucene's `LeafBucketCollector`
+    /// block-mode iteration for sort, where `NumericComparator` reads
+    /// `LongValuesSource#advanceExact` once per block.
+    ///
+    /// This method must produce output equivalent to looping
+    /// [`Self::compute_sort_key_and_collect`] over `docs` with `score = 0.0`.
+    #[inline]
+    fn compute_block_sort_keys_and_collect<C: Comparator<Self::SegmentSortKey>>(
+        &mut self,
+        docs: &[DocId],
+        top_n_computer: &mut TopNComputer<Self::SegmentSortKey, DocId, C>,
+    ) {
+        for doc in docs {
+            self.compute_sort_key_and_collect(*doc, 0.0, top_n_computer);
+        }
+    }
+
     /// A SegmentSortKeyComputer maps to a SegmentSortKey, but it can also decide on
     /// its ordering.
     ///

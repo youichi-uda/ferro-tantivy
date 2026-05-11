@@ -104,6 +104,28 @@ pub use self::top_collector::ComparableDoc;
 mod top_score_collector;
 pub use self::top_score_collector::{TopDocs, TopNComputer};
 
+/// FerroSearch Wave 15 Phase B — early-terminating top-K via auxiliary
+/// sort cursor.
+pub mod early_term_sort_by_cursor;
+pub use self::early_term_sort_by_cursor::{
+    EarlyTermSortByCursorCollector, EarlyTermSortByCursorSegmentCollector,
+};
+
+/// FerroSearch Wave 18-1 — multi-field early-terminating top-K via
+/// auxiliary v2 sort cursor.
+pub mod early_term_sort_by_cursor_multi;
+pub use self::early_term_sort_by_cursor_multi::{
+    CursorSortVal, EarlyTermSortByCursorCollectorMulti, EarlyTermSortByCursorMultiSegmentCollector,
+};
+
+/// Wave 18-2 — per-segment cursor mix dispatch wrapper.  See module
+/// docs for the rationale (best-effort v2 cursor walk during a
+/// rolling Wave 17-2 backfill).
+pub mod early_term_or_fallback_collector_multi;
+pub use self::early_term_or_fallback_collector_multi::{
+    EarlyTermOrFallbackCollectorMulti, FallbackSegmentCollector, FieldReader, MixSegmentCollector,
+};
+
 mod sort_key_top_collector;
 pub use self::sort_key::{SegmentSortKeyComputer, SortByStaticFastValue, SortKeyComputer};
 mod facet_collector;

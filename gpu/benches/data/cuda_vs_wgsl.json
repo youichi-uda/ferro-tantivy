@@ -1,0 +1,12 @@
+{
+  "backend": "Vulkan",
+  "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "go_threshold_speedup": 3.0,
+  "results": [
+    {"shape": "dim=768  N=10000   Q=8", "num_queries": 8, "num_vecs": 10000, "dim_bits": 768, "wgsl_ns": 1912451, "cuda_ns": 291515, "speedup": 6.5604, "byte_equal": true},
+    {"shape": "dim=768  N=10000   Q=64", "num_queries": 64, "num_vecs": 10000, "dim_bits": 768, "wgsl_ns": 2248943, "cuda_ns": 483716, "speedup": 4.6493, "byte_equal": true},
+    {"shape": "dim=768  N=100000  Q=8", "num_queries": 8, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 5309107, "cuda_ns": 2375749, "speedup": 2.2347, "byte_equal": true},
+    {"shape": "dim=768  N=100000  Q=64", "num_queries": 64, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 23803401, "cuda_ns": 4147252, "speedup": 5.7396, "byte_equal": true},
+    {"shape": "dim=768  N=1000000 Q=64", "num_queries": 64, "num_vecs": 1000000, "dim_bits": 768, "wgsl_ns": 200117184, "cuda_ns": 81379758, "speedup": 2.4591, "byte_equal": true}
+  ]
+}

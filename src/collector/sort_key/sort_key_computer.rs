@@ -141,6 +141,18 @@ pub trait SortKeyComputer: Sync {
         false
     }
 
+    /// Wave 22 `can_match_shortcut`: when the implementor can prove from
+    /// segment-level metadata alone that no document in the segment will
+    /// pass its predicate (cursor / range / filter), it returns `true`
+    /// and the default `collect_segment_top_k` short-circuits without
+    /// building the per-segment computer or running the per-doc loop.
+    ///
+    /// Wrappers like `(TSortKeyComputer, Order)` must forward this to
+    /// the inner computer so the gate isn't bypassed by composition.
+    fn should_skip_segment(&self, _segment_reader: &SegmentReader) -> bool {
+        false
+    }
+
     /// Sorting by score has a overriding implementation for BM25 scores, using Block-WAND.
     fn collect_segment_top_k(
         &self,
@@ -149,6 +161,9 @@ pub trait SortKeyComputer: Sync {
         reader: &crate::SegmentReader,
         segment_ord: u32,
     ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
+        if self.should_skip_segment(reader) {
+            return Ok(Vec::new());
+        }
         let with_scoring = self.requires_scoring();
         let segment_sort_key_computer = self.segment_sort_key_computer(reader)?;
         let topn_computer = TopNComputer::new_with_comparator(k, self.comparator());
@@ -202,6 +217,14 @@ where
     /// and the score fed in the segment sort key computer could take any value.
     fn requires_scoring(&self) -> bool {
         self.0.requires_scoring() || self.1.requires_scoring()
+    }
+
+    /// Wave 22: forward the can_match_shortcut probe to the head sort key.
+    /// The tail is a tie-breaker — if the head proves no doc passes its
+    /// predicate, the segment is unreachable regardless of how the tail
+    /// would have re-ranked.
+    fn should_skip_segment(&self, segment_reader: &SegmentReader) -> bool {
+        self.0.should_skip_segment(segment_reader)
     }
 }
 

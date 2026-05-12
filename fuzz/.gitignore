@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# cargo-fuzz generated artefacts.
+target/
+artifacts/
+coverage/
+Cargo.lock
+
+# libfuzzer-generated corpus entries are NOT committed by default —
+# they regenerate on every run and can grow to tens of MB. The only
+# entries we keep in git are permanent regression seeds (panics /
+# OOMs that a past fuzz run surfaced and a commit has since fixed),
+# named `regression-<topic>-<YYYY-MM-DD>` so future runs re-check
+# the exact triggering input.
+#
+# We exclude `corpus/*/*` (subpath level) rather than `corpus/`
+# (directory level) because git's gitignore can't re-include files
+# inside an already-excluded directory.
+corpus/*/*
+!corpus/*/regression-*

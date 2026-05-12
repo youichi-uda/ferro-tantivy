@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+#
+# Wave Z-7 #6 #4 — multi-tier CHT (Compressed Hot Tier) fuzz harness.
+#
+# This crate is intentionally **not** a member of the parent tantivy
+# workspace — cargo-fuzz requires nightly-only compiler flags that would
+# taint the stable workspace build. Always invoke via:
+#   cd fuzz && cargo +nightly fuzz <cmd>
+#
+# Two targets ship here:
+#   1. `cht_v1_concurrent_churn`  — host CHT (v1), always built (no CUDA
+#      dependency).
+#   2. `cht_v3_multichunk_invariants` — VRAM Bitcomp-compressed CHT (v3),
+#      gated behind the `cuda-bitmap-kernel` feature so non-CUDA hosts
+#      can still compile + run the v1 target.
+#
+# See `README.md` for the 24h soak protocol and the systemd-user unit
+# template for nightly CI runs on the KVM runner.
+[package]
+name = "tantivy-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0 OR MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Path-dep on the local tantivy fork. We enable `gpu` + `ferro-compress`
+# unconditionally because the v1 host `cht` module is `#[cfg(all(feature
+# = "gpu", feature = "ferro-compress"))]` — even the host-RAM CHT lives
+# behind these two flags.
+#
+# The v3 (CUDA) path requires `cuda-bitmap-kernel`; that's controlled by
+# *this crate's* `cuda-bitmap-kernel` feature so non-CUDA hosts can build
+# the v1 target without dragging in the NVIDIA toolchain.
+tantivy = { path = "..", default-features = false, features = [
+    "mmap",
+    "stopwords",
+    "lz4-compression",
+    "columnar-zstd-compression",
+    "stemmer",
+    "gpu",
+    "ferro-compress",
+] }
+
+[features]
+default = []
+# Enable the v3 (VRAM Bitcomp-compressed) fuzz target. Requires NVIDIA
+# CUDA toolchain at build time (cudart + cuda driver libs) and an
+# accessible GPU at runtime.
+cuda-bitmap-kernel = ["tantivy/cuda-bitmap-kernel"]
+
+# Always-built v1 host target. Linked under `libfuzzer-sys`. No CUDA
+# dependency.
+[[bin]]
+name = "cht_v1_concurrent_churn"
+path = "fuzz_targets/cht_v1_concurrent_churn.rs"
+test = false
+doc = false
+bench = false
+
+# CUDA-gated v3 target. The `required-features` line means
+# `cargo +nightly fuzz build cht_v3_multichunk_invariants` works only
+# when `--features cuda-bitmap-kernel` is also passed; on a non-CUDA
+# host, the build silently no-ops, leaving the v1 target available.
+[[bin]]
+name = "cht_v3_multichunk_invariants"
+path = "fuzz_targets/cht_v3_multichunk_invariants.rs"
+test = false
+doc = false
+bench = false
+required-features = ["cuda-bitmap-kernel"]
+
+# Prevent surprise inclusion in the parent tantivy workspace. Cargo
+# treats an empty `[workspace]` key as "I am my own workspace root".
+[workspace]
+
+[profile.release]
+debug = 1

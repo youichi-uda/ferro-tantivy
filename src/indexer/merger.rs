@@ -668,9 +668,15 @@ impl IndexMerger {
         fieldnorm_readers: FieldNormReaders,
         doc_id_mapping: &SegmentDocIdMapping,
     ) -> crate::Result<()> {
+        // Per-field timing — Task #2 deeper drill-down. 10M run
+        // (2026-05-12, dd-pack merger-write-phase-split) confirmed
+        // `write_postings` is 83% of total forcemerge time. Splitting
+        // by field reveals which schema component (terms dict + posting
+        // lists) carries the FS/ES 2.4× ratio.
         for (field, field_entry) in self.schema.fields() {
             let fieldnorm_reader = fieldnorm_readers.get_field(field)?;
             if field_entry.is_indexed() {
+                let t_field = std::time::Instant::now();
                 self.write_postings_for_field(
                     field,
                     field_entry.field_type(),
@@ -678,6 +684,13 @@ impl IndexMerger {
                     fieldnorm_reader,
                     doc_id_mapping,
                 )?;
+                let field_ms = t_field.elapsed().as_millis();
+                log::info!(
+                    target: "postings_field",
+                    "postings_field name={:?} type={:?} ms={field_ms}",
+                    field_entry.name(),
+                    field_entry.field_type().value_type(),
+                );
             }
         }
         Ok(())
@@ -749,6 +762,13 @@ impl IndexMerger {
     /// # Returns
     /// The number of documents in the resulting segment.
     pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
+        // Per-phase timing — Task #2 follow-up. Phase G v6/10M/50M (2026-05-12)
+        // confirmed `merger.write` is 96% of FS forcemerge time and FS/ES
+        // ratio is a stable 2.27-2.40× across 3 corpus sizes — meaning the
+        // gap is architectural inside one of the 5 sub-phases below.
+        // Operators capture this via the `merger_write_phase` log target
+        // (default RUST_LOG=info catches it via tracing-log bridge).
+        let t_mapping = std::time::Instant::now();
         // Wave 15 Phase H-2: when the merger was constructed with a
         // sort_by_field hint, build a sort-order doc-id mapping so the
         // merged segment's physical doc layout matches the index sort.
@@ -768,11 +788,15 @@ impl IndexMerger {
             }
             None => self.get_doc_id_from_concatenated_data()?,
         };
+        let mapping_ms = t_mapping.elapsed().as_millis();
         debug!("write-fieldnorms");
+        let t_fieldnorms = std::time::Instant::now();
         if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
             self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping)?;
         }
+        let fieldnorms_ms = t_fieldnorms.elapsed().as_millis();
         debug!("write-postings");
+        let t_postings = std::time::Instant::now();
         let fieldnorm_data = serializer
             .segment()
             .open_read(SegmentComponent::FieldNorms)?;
@@ -782,14 +806,29 @@ impl IndexMerger {
             fieldnorm_readers,
             &doc_id_mapping,
         )?;
+        let postings_ms = t_postings.elapsed().as_millis();
 
         debug!("write-storagefields");
+        let t_store = std::time::Instant::now();
         self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
+        let store_ms = t_store.elapsed().as_millis();
         debug!("write-fastfields");
+        let t_fast = std::time::Instant::now();
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
+        let fast_ms = t_fast.elapsed().as_millis();
 
         debug!("close-serializer");
+        let t_close = std::time::Instant::now();
         serializer.close()?;
+        let close_ms = t_close.elapsed().as_millis();
+
+        log::info!(
+            target: "merger_write_phase",
+            "merger_write_phase num_docs={} mapping_ms={mapping_ms} \
+             fieldnorms_ms={fieldnorms_ms} postings_ms={postings_ms} \
+             store_ms={store_ms} fast_ms={fast_ms} close_ms={close_ms}",
+            self.max_doc
+        );
         Ok(self.max_doc)
     }
 }

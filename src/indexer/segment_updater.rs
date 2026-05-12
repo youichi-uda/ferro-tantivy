@@ -159,7 +159,17 @@ fn merge(
     // ... we just serialize this index merger in our new segment to merge the segments.
     let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
 
+    // Per-phase timing for forcemerge root-cause investigation. Phase G v6
+    // (2026-05-12) reported FS 35.4s vs ES 14.7s; isolating
+    // `merger.write` (postings + store + fast-fields + fieldnorms) from
+    // the FS-specific `build_and_write_sort_cursors` rebuild lets the
+    // next EC2 bench attribute the gap. Operators that wire up a log
+    // bridge (`tracing-log::LogTracer::init()` or `env_logger`) see this
+    // at INFO via the `merge_phase` target; otherwise it costs only the
+    // two `Instant::now()` calls.
+    let t_merger_write = std::time::Instant::now();
     let num_docs = merger.write(segment_serializer)?;
+    let merger_write_ms = t_merger_write.elapsed().as_millis();
 
     let merged_segment_id = merged_segment.id();
 
@@ -190,6 +200,7 @@ fn merge(
     // `sort_by_fields` is set, so just widening the gate is enough.
     let needs_cursor_rebuild = effective_settings.sort_by_field.is_some()
         || effective_settings.sort_by_fields.is_some();
+    let t_cursor_build = std::time::Instant::now();
     if needs_cursor_rebuild && num_docs > 0 {
         let mut merged_with_max = merged_segment.clone().with_max_doc(num_docs);
         let cursor_fields = crate::index::build_and_write_sort_cursors(&mut merged_with_max)?;
@@ -197,6 +208,12 @@ fn merge(
             segment_meta = segment_meta.with_sort_cursor_fields(cursor_fields);
         }
     }
+    let cursor_build_ms = t_cursor_build.elapsed().as_millis();
+    log::info!(
+        target: "merge_phase",
+        "merge_phase num_docs={num_docs} merger_write_ms={merger_write_ms} \
+         cursor_build_ms={cursor_build_ms} cursor_rebuild={needs_cursor_rebuild}"
+    );
     Ok(Some(SegmentEntry::new(segment_meta, delete_cursor, None)))
 }
 

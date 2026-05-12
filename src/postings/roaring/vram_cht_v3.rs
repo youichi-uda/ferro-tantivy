@@ -615,23 +615,24 @@ impl VramCompressedCht {
     /// container→bitmap walk + `cudaMalloc d_uncompressed_temp` +
     /// H→D staging copy, and directly feeds the v2 device pointer
     /// into the Bitcomp `compress_one` call. Wave Z-6 #5 validates
-    /// the savings on local KVM + RTX 4070 Ti SUPER 16 GiB via
-    /// `examples/promote_v2_to_v3_dense_bench.rs` (CSV +
-    /// p50/p95/p99 + counter-delta evidence packaged in
-    /// `dd-pack/cht-wave-z6-multichunk-bench-2026-05-12/`):
-    /// - `bspread_5k_buckets`   (3 chunks, ~40 MiB uncompressed):
-    ///   legacy p50 = 21.95 ms → promote p50 = 9.98 ms → savings
-    ///   **+11.97 ms (+54.5%)**.
-    /// - `bspread_10k_buckets`  (5 chunks, ~80 MiB uncompressed):
-    ///   legacy p50 = 43.25 ms → promote p50 = 20.32 ms → savings
-    ///   **+22.93 ms (+53.0%)**.
-    /// - `bspread_30k_buckets` (15 chunks, ~240 MiB uncompressed):
-    ///   local legacy p50 = ~129 ms (partial, 53 samples) before VRAM
-    ///   fragmentation OOM on the 16 GiB consumer card; extrapolating
-    ///   the stable ~53% savings ratio gives projected savings of
-    ///   **~70 ms** at 30K buckets, in the same envelope as the
-    ///   original `~60 ms` recon estimate. AWS L40S 48 GiB g6e.xlarge
-    ///   bench is the next step to lock the 30K-bucket number.
+    /// the savings via `examples/promote_v2_to_v3_dense_bench.rs`
+    /// on two GPUs (AWS L40S 48 GiB g6e.xlarge + local RTX 4070 Ti
+    /// SUPER 16 GiB), evidence packaged in
+    /// `dd-pack/cht-wave-z6-multichunk-bench-2026-05-12/`:
+    ///
+    /// | cohort | chunks | L40S savings p50 | local savings p50 |
+    /// |---|---|---|---|
+    /// | `bspread_5k_buckets`   |  3 | **+25.04 ms (+65.7%)** | +11.97 ms (+54.5%) |
+    /// | `bspread_10k_buckets`  |  5 | **+49.51 ms (+64.8%)** | +22.93 ms (+53.0%) |
+    /// | `bspread_30k_buckets`  | 15 | **+154.86 ms (+66.3%)** | partial (VRAM frag OOM) |
+    ///
+    /// The `~60 ms savings on dense terms (10K+ buckets)` recon
+    /// estimate is **validated and exceeded**: 10K buckets measures
+    /// +49.51 ms (83% of recon) and 30K buckets measures +154.86 ms
+    /// (2.6× recon). The savings ratio stays at ~65% across
+    /// multi-chunk cohorts on L40S (vs ~53% on the consumer card),
+    /// consistent with HBM3 device bandwidth amortising more
+    /// container-walk + H→D-copy work in the cross-tier path.
     ///
     /// ## Returns
     /// - `Ok(true)` on successful insertion (admission policy + LRU

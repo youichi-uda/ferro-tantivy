@@ -1,11 +1,13 @@
 use std::marker::PhantomData;
 
-use columnar::Column;
+use columnar::{Cardinality, Column};
 
+use crate::DocAddress;
 use crate::collector::sort_key::Comparator;
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::sort_key::sort_by_static_fast_value::warm_first_values;
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
+use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
+use crate::collector::{SegmentCollector, SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::{DocId, Order, Score, SegmentReader};
 
@@ -36,6 +38,40 @@ impl<T: FastValue> SortByStaticFastValueWithCursor<T> {
     }
 }
 
+impl<T: FastValue> SortByStaticFastValueWithCursor<T> {
+    /// Wave 22 `can_match_shortcut`: probe `[min, max]` of the segment's
+    /// fast-field column and decide whether **no** doc in this segment can
+    /// pass the cursor predicate.  Returns `true` when the entire segment
+    /// can be safely skipped.
+    ///
+    /// Safety invariants:
+    /// - Only `Cardinality::Full` segments are eligible.  Existing semantics
+    ///   pass `None`-valued docs through the cursor filter (they "sort last
+    ///   naturally"), so skipping an `Optional`/`Multivalued` segment whose
+    ///   value range falls outside the cursor would silently drop those
+    ///   `None` docs from the top-K.
+    /// - Column `min_value`/`max_value` bound the actual column contents
+    ///   (including deletions left in the index until merge), so the gate
+    ///   is always *conservative* (it never skips a segment that has an
+    ///   alive doc passing the cursor — at worst it fails to skip).
+    /// - `MonotonicallyMappableToU64` preserves ordering, so `cursor_u64`
+    ///   and `column.min/max_value()` are directly comparable.
+    #[inline]
+    fn segment_can_be_skipped(&self, sort_column: &Column<u64>) -> bool {
+        if !matches!(sort_column.get_cardinality(), Cardinality::Full) {
+            return false;
+        }
+        let min_v = sort_column.values.min_value();
+        let max_v = sort_column.values.max_value();
+        match self.order {
+            // Asc keeps strictly `> cursor`.  All values `<= cursor` ⇒ skip.
+            Order::Asc => max_v <= self.cursor_u64,
+            // Desc keeps strictly `< cursor`.  All values `>= cursor` ⇒ skip.
+            Order::Desc => min_v >= self.cursor_u64,
+        }
+    }
+}
+
 impl<T: FastValue> SortKeyComputer for SortByStaticFastValueWithCursor<T> {
     type Child = SortByFastValueWithCursorSegmentComputer<T>;
     type SortKey = Option<T>;
@@ -59,6 +95,48 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValueWithCursor<T> {
             )));
         }
         Ok(())
+    }
+
+    /// Wave 22 — override the default `collect_segment_top_k` so the
+    /// can_match_shortcut gate runs **before** the per-segment warm cache
+    /// is populated.  When the gate fires, the entire warm-cache build
+    /// (an O(num_docs) `get_range` scan) plus the doc-iteration loop are
+    /// short-circuited, returning an empty fruit identical to what the
+    /// full path would have produced (every doc would have failed the
+    /// cursor predicate).  The gate itself is O(1): the column codec's
+    /// stats carry `min_value`/`max_value` directly.
+    fn collect_segment_top_k(
+        &self,
+        k: usize,
+        weight: &dyn crate::query::Weight,
+        reader: &SegmentReader,
+        segment_ord: u32,
+    ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
+        // Cheap probe: load only codec metadata (min/max stats).  When the
+        // field doesn't exist we fall through so the default path can
+        // surface `FastFieldNotAvailableError` with consistent semantics.
+        if let Some((sort_column, _)) = reader.fast_fields().u64_lenient(&self.field)? {
+            if self.segment_can_be_skipped(&sort_column) {
+                return Ok(Vec::new());
+            }
+        }
+        // Default path — mirror `SortKeyComputer::collect_segment_top_k`
+        // since we can't `super::default()` an overridden trait fn.
+        let with_scoring = self.requires_scoring();
+        let segment_sort_key_computer = self.segment_sort_key_computer(reader)?;
+        let topn_computer = TopNComputer::new_with_comparator(k, self.comparator());
+        let mut segment_top_key_collector = TopBySortKeySegmentCollector {
+            topn_computer,
+            segment_ord,
+            segment_sort_key_computer,
+        };
+        crate::collector::default_collect_segment_impl(
+            &mut segment_top_key_collector,
+            weight,
+            reader,
+            with_scoring,
+        )?;
+        Ok(segment_top_key_collector.harvest())
     }
 
     fn segment_sort_key_computer(
@@ -298,5 +376,233 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueWithCursorSegmentCo
 
     fn convert_segment_sort_key(&self, sort_key: Self::SegmentSortKey) -> Self::SortKey {
         sort_key.map(T::from_u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wave 22 `can_match_shortcut` end-to-end tests via the public
+    //! `order_by_fast_field_with_cursor` API.  The gate is transparent —
+    //! these tests assert results are byte-equivalent to what the un-gated
+    //! per-doc filter would produce.
+
+    use crate::Order;
+    use crate::collector::TopDocs;
+    use crate::query::AllQuery;
+    use crate::schema::{FAST, Schema};
+    use crate::{DocAddress, Index, doc};
+
+    fn build_altitude_index(values: &[i64]) -> crate::Result<Index> {
+        let mut schema_builder = Schema::builder();
+        let altitude = schema_builder.add_i64_field("altitude", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests()?;
+        for &v in values {
+            writer.add_document(doc!(altitude => v))?;
+        }
+        writer.commit()?;
+        Ok(index)
+    }
+
+    #[test]
+    fn wave22_skip_asc_cursor_above_max() -> crate::Result<()> {
+        // Asc + cursor strictly > all values → no doc passes → gate fires.
+        let index = build_altitude_index(&[10, 20, 30, 40, 50])?;
+        let searcher = index.reader()?.searcher();
+        let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_fast_field_with_cursor::<i64>("altitude", Order::Asc, 100_i64),
+        )?;
+        assert!(top.is_empty(), "expected gate skip, got {top:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn wave22_skip_desc_cursor_below_min() -> crate::Result<()> {
+        // Desc + cursor strictly < all values → no doc passes → gate fires.
+        let index = build_altitude_index(&[10, 20, 30, 40, 50])?;
+        let searcher = index.reader()?.searcher();
+        let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_fast_field_with_cursor::<i64>("altitude", Order::Desc, 5_i64),
+        )?;
+        assert!(top.is_empty(), "expected gate skip, got {top:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn wave22_no_skip_asc_cursor_within_range() -> crate::Result<()> {
+        // Asc + cursor inside range → gate must not fire; filter returns
+        // only strictly-greater values.
+        let index = build_altitude_index(&[10, 20, 30, 40, 50])?;
+        let searcher = index.reader()?.searcher();
+        let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_fast_field_with_cursor::<i64>("altitude", Order::Asc, 25_i64),
+        )?;
+        assert_eq!(top.len(), 3);
+        let vals: Vec<i64> = top.iter().filter_map(|(v, _)| *v).collect();
+        assert_eq!(vals, vec![30, 40, 50]);
+        Ok(())
+    }
+
+    #[test]
+    fn wave22_no_skip_desc_cursor_within_range() -> crate::Result<()> {
+        // Desc + cursor inside range → only strictly-less values.
+        let index = build_altitude_index(&[10, 20, 30, 40, 50])?;
+        let searcher = index.reader()?.searcher();
+        let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_fast_field_with_cursor::<i64>("altitude", Order::Desc, 35_i64),
+        )?;
+        assert_eq!(top.len(), 3);
+        let vals: Vec<i64> = top.iter().filter_map(|(v, _)| *v).collect();
+        // Desc order: 30, 20, 10
+        assert_eq!(vals, vec![30, 20, 10]);
+        Ok(())
+    }
+
+    #[test]
+    fn wave22_boundary_asc_cursor_at_max() -> crate::Result<()> {
+        // Asc + cursor == max → all values <= cursor → strictly-greater
+        // is empty → gate fires (max_v <= cursor_u64). Verify still
+        // produces empty result.
+        let index = build_altitude_index(&[10, 20, 30, 40, 50])?;
+        let searcher = index.reader()?.searcher();
+        let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_fast_field_with_cursor::<i64>("altitude", Order::Asc, 50_i64),
+        )?;
+        assert!(top.is_empty(), "asc max==cursor must drop all docs");
+        Ok(())
+    }
+
+    #[test]
+    fn wave22_boundary_desc_cursor_at_min() -> crate::Result<()> {
+        // Desc + cursor == min → all values >= cursor → strictly-less
+        // is empty → gate fires (min_v >= cursor_u64).
+        let index = build_altitude_index(&[10, 20, 30, 40, 50])?;
+        let searcher = index.reader()?.searcher();
+        let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_fast_field_with_cursor::<i64>("altitude", Order::Desc, 10_i64),
+        )?;
+        assert!(top.is_empty(), "desc min==cursor must drop all docs");
+        Ok(())
+    }
+
+    /// Wave 22 perf signal: measure the gate's impact on a workload that
+    /// would otherwise warm the dense u64 cache for every segment. Two
+    /// segments with N=100k docs each; cursor=2N so seg0 is fully gated
+    /// out and seg1 returns everything (large heap fill). Marked `#[ignore]`
+    /// — run with `cargo test --release wave22_skip_bench -- --ignored
+    /// --nocapture`. Numbers depend on box; gate should remove the seg0
+    /// scan entirely.
+    #[test]
+    #[ignore]
+    fn wave22_skip_bench() -> crate::Result<()> {
+        use std::time::Instant;
+        let mut schema_builder = Schema::builder();
+        let altitude = schema_builder.add_i64_field("altitude", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests()?;
+        const N: i64 = 100_000;
+        for v in 0..N {
+            writer.add_document(doc!(altitude => v))?;
+        }
+        writer.commit()?;
+        for v in N..(2 * N) {
+            writer.add_document(doc!(altitude => v))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
+        let gated_collector = TopDocs::with_limit(10)
+            .order_by_fast_field_with_cursor::<i64>("altitude", Order::Asc, N);
+        let ungated_collector = TopDocs::with_limit(10)
+            .order_by_fast_field_with_cursor::<i64>("altitude", Order::Asc, -1_i64);
+        let warmups = 5usize;
+        let trials = 10usize;
+        for _ in 0..warmups {
+            let _ = searcher.search(&AllQuery, &gated_collector)?;
+            let _ = searcher.search(&AllQuery, &ungated_collector)?;
+        }
+        let mut best_gated_ns: u128 = u128::MAX;
+        for _ in 0..trials {
+            let t0 = Instant::now();
+            let res = searcher.search(&AllQuery, &gated_collector)?;
+            std::hint::black_box(res);
+            best_gated_ns = best_gated_ns.min(t0.elapsed().as_nanos());
+        }
+        let mut best_ungated_ns: u128 = u128::MAX;
+        for _ in 0..trials {
+            let t0 = Instant::now();
+            let res = searcher.search(&AllQuery, &ungated_collector)?;
+            std::hint::black_box(res);
+            best_ungated_ns = best_ungated_ns.min(t0.elapsed().as_nanos());
+        }
+        let speedup = best_ungated_ns as f64 / best_gated_ns as f64;
+        println!(
+            "wave22_skip_bench: 2× {N}-doc segs, top-10 asc:\n  cursor=-1 (no gate, both segs full): {:>8} µs\n  cursor= N (seg0 gated):             {:>8} µs\n  speedup: {:.2}×",
+            best_ungated_ns / 1_000,
+            best_gated_ns / 1_000,
+            speedup
+        );
+        // Sanity: gated returns exactly 10 docs (all from the upper segment).
+        let res: Vec<(Option<i64>, _)> = searcher.search(&AllQuery, &gated_collector)?;
+        assert_eq!(res.len(), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn wave22_multi_segment_partial_skip() -> crate::Result<()> {
+        // Two segments: seg0 = [10..=50], seg1 = [1000..=1050].
+        // Asc cursor=100 → seg0 gate fires (max=50 <= 100), seg1 passes
+        // (per-doc filter returns all > 100 = all 51 docs in seg1).
+        let mut schema_builder = Schema::builder();
+        let altitude = schema_builder.add_i64_field("altitude", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests()?;
+        for v in 10i64..=50 {
+            writer.add_document(doc!(altitude => v))?;
+        }
+        writer.commit()?;
+        for v in 1000i64..=1050 {
+            writer.add_document(doc!(altitude => v))?;
+        }
+        writer.commit()?;
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        assert_eq!(searcher.segment_readers().len(), 2);
+        let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(10)
+                .order_by_fast_field_with_cursor::<i64>("altitude", Order::Asc, 100_i64),
+        )?;
+        // Top-10 asc with cursor=100: smallest 10 of the high-values
+        // segment (1000..=1009). All hits must come from the same segment
+        // — tantivy's segment_ord assignment isn't commit-order so we
+        // don't pin which seg_ord the high-values segment has; we just
+        // assert all hits share the same one.
+        assert_eq!(top.len(), 10);
+        let vals: Vec<i64> = top.iter().filter_map(|(v, _)| *v).collect();
+        assert_eq!(vals, (1000i64..=1009).collect::<Vec<_>>());
+        let seg_ord = top[0].1.segment_ord;
+        for (_, addr) in &top {
+            assert_eq!(
+                addr.segment_ord, seg_ord,
+                "all hits must come from the same (un-gated) segment",
+            );
+        }
+        Ok(())
     }
 }

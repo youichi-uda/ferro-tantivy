@@ -117,10 +117,19 @@ impl Searcher {
         indexed.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
 
         // Fetch in sorted order, placing results back at original indices.
+        // Use `get` rather than indexing — a caller may hand us a stale
+        // `DocAddress` whose `segment_ord` was valid at hit-collection
+        // time but no longer maps to a `store_reader` after a concurrent
+        // segment merge dropped that ordinal. Returning `None` for the
+        // gone segment matches the documented "documents that fail to
+        // deserialize are returned as `None`" contract and avoids
+        // panicking the consumer (observed under ferrosearch's
+        // multi-shard tests on the self-hosted CI runner).
         let mut results: Vec<Option<D>> = (0..doc_addresses.len()).map(|_| None).collect();
         for (orig_idx, addr) in indexed {
-            let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
-            results[orig_idx] = store_reader.get::<D>(addr.doc_id).ok();
+            if let Some(store_reader) = self.inner.store_readers.get(addr.segment_ord as usize) {
+                results[orig_idx] = store_reader.get::<D>(addr.doc_id).ok();
+            }
         }
         results
     }
@@ -199,12 +208,17 @@ impl Searcher {
                 seg_end += 1;
             }
             let group = &indexed[seg_start..seg_end];
-            let doc_ids: Vec<crate::DocId> = group.iter().map(|(_, a)| a.doc_id).collect();
-            let store_reader = &self.inner.store_readers[seg_ord as usize];
-            let mut batch =
-                store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
-            for (i, &(orig_idx, _)) in group.iter().enumerate() {
-                results[orig_idx] = batch[i].take();
+            // Same staleness guard as `docs_batch`: an ordinal that no
+            // longer maps to a store_reader (concurrent merge dropped
+            // it) yields `None` for the whole group instead of
+            // panicking on the OOB index.
+            if let Some(store_reader) = self.inner.store_readers.get(seg_ord as usize) {
+                let doc_ids: Vec<crate::DocId> = group.iter().map(|(_, a)| a.doc_id).collect();
+                let mut batch =
+                    store_reader.batch_get_field_owned_bytes_grouped(&doc_ids, target_field);
+                for (i, &(orig_idx, _)) in group.iter().enumerate() {
+                    results[orig_idx] = batch[i].take();
+                }
             }
             seg_start = seg_end;
         }
@@ -289,11 +303,13 @@ impl Searcher {
         docstore_fallback.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
         for (orig_idx, addr) in docstore_fallback {
             if let Some(field) = stored_field {
-                let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
-                results[orig_idx] = store_reader
-                    .get_field_bytes(addr.doc_id, field)
-                    .ok()
-                    .flatten();
+                if let Some(store_reader) = self.inner.store_readers.get(addr.segment_ord as usize)
+                {
+                    results[orig_idx] = store_reader
+                        .get_field_bytes(addr.doc_id, field)
+                        .ok()
+                        .flatten();
+                }
             }
         }
 
@@ -372,9 +388,11 @@ impl Searcher {
         docstore_fallback.sort_unstable_by_key(|(_, a)| (a.segment_ord, a.doc_id));
         for (orig_idx, addr) in docstore_fallback {
             if let Some(field) = stored_field {
-                let store_reader = &self.inner.store_readers[addr.segment_ord as usize];
-                if let Ok(Some(bytes)) = store_reader.get_field_bytes(addr.doc_id, field) {
-                    results[orig_idx] = String::from_utf8(bytes).ok();
+                if let Some(store_reader) = self.inner.store_readers.get(addr.segment_ord as usize)
+                {
+                    if let Ok(Some(bytes)) = store_reader.get_field_bytes(addr.doc_id, field) {
+                        results[orig_idx] = String::from_utf8(bytes).ok();
+                    }
                 }
             }
         }

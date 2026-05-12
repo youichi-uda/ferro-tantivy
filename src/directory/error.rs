@@ -152,7 +152,7 @@ impl fmt::Debug for Incompatibility {
 #[derive(Debug, Clone, Error)]
 pub enum OpenReadError {
     /// The file does not exist.
-    #[error("Files does not exist: {0:?}")]
+    #[error("File does not exist: {0:?}")]
     FileDoesNotExist(PathBuf),
     /// Any kind of io::Error.
     #[error(

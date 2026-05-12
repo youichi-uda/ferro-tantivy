@@ -2,12 +2,10 @@ use std::marker::PhantomData;
 
 use columnar::{Cardinality, Column};
 
-use crate::DocAddress;
 use crate::collector::sort_key::Comparator;
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::sort_key::sort_by_static_fast_value::warm_first_values;
-use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
-use crate::collector::{SegmentCollector, SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
+use crate::collector::{SegmentSortKeyComputer, SortKeyComputer, TopNComputer};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
 use crate::{DocId, Order, Score, SegmentReader};
 
@@ -97,46 +95,21 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValueWithCursor<T> {
         Ok(())
     }
 
-    /// Wave 22 — override the default `collect_segment_top_k` so the
-    /// can_match_shortcut gate runs **before** the per-segment warm cache
-    /// is populated.  When the gate fires, the entire warm-cache build
-    /// (an O(num_docs) `get_range` scan) plus the doc-iteration loop are
-    /// short-circuited, returning an empty fruit identical to what the
-    /// full path would have produced (every doc would have failed the
-    /// cursor predicate).  The gate itself is O(1): the column codec's
-    /// stats carry `min_value`/`max_value` directly.
-    fn collect_segment_top_k(
-        &self,
-        k: usize,
-        weight: &dyn crate::query::Weight,
-        reader: &SegmentReader,
-        segment_ord: u32,
-    ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
-        // Cheap probe: load only codec metadata (min/max stats).  When the
-        // field doesn't exist we fall through so the default path can
-        // surface `FastFieldNotAvailableError` with consistent semantics.
-        if let Some((sort_column, _)) = reader.fast_fields().u64_lenient(&self.field)? {
-            if self.segment_can_be_skipped(&sort_column) {
-                return Ok(Vec::new());
-            }
+    /// Wave 22 — route the can_match_shortcut gate through
+    /// `should_skip_segment` so it survives the `(_, Order)` wrapper that
+    /// `order_by_fast_field_with_cursor` constructs. The default trait
+    /// `collect_segment_top_k` short-circuits when this returns `true`,
+    /// avoiding both the per-segment warm cache (`O(num_docs)` get_range
+    /// scan) and the per-doc iteration loop. The probe itself is `O(1)`:
+    /// the column codec's stats carry `min_value`/`max_value` directly.
+    fn should_skip_segment(&self, segment_reader: &SegmentReader) -> bool {
+        // Cheap probe: load only codec metadata. Treat any lookup failure
+        // as "do not skip" — the default path then surfaces the proper
+        // `FastFieldNotAvailableError` via `segment_sort_key_computer`.
+        match segment_reader.fast_fields().u64_lenient(&self.field) {
+            Ok(Some((sort_column, _))) => self.segment_can_be_skipped(&sort_column),
+            _ => false,
         }
-        // Default path — mirror `SortKeyComputer::collect_segment_top_k`
-        // since we can't `super::default()` an overridden trait fn.
-        let with_scoring = self.requires_scoring();
-        let segment_sort_key_computer = self.segment_sort_key_computer(reader)?;
-        let topn_computer = TopNComputer::new_with_comparator(k, self.comparator());
-        let mut segment_top_key_collector = TopBySortKeySegmentCollector {
-            topn_computer,
-            segment_ord,
-            segment_sort_key_computer,
-        };
-        crate::collector::default_collect_segment_impl(
-            &mut segment_top_key_collector,
-            weight,
-            reader,
-            with_scoring,
-        )?;
-        Ok(segment_top_key_collector.harvest())
     }
 
     fn segment_sort_key_computer(

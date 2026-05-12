@@ -441,6 +441,12 @@ where
             comparator: self.comparator(),
         })
     }
+
+    /// Wave 22: forward can_match_shortcut so cursor-driven inner sorts
+    /// keep their gate alive through the ordered-comparator wrapper.
+    fn should_skip_segment(&self, segment_reader: &crate::SegmentReader) -> bool {
+        self.0.should_skip_segment(segment_reader)
+    }
 }
 
 impl<TSortKeyComputer> SortKeyComputer for (TSortKeyComputer, Order)
@@ -478,6 +484,13 @@ where
             segment_sort_key_computer: child,
             comparator: self.comparator(),
         })
+    }
+
+    /// Wave 22: same forward as the `(_, ComparatorEnum)` wrapper above.
+    /// `order_by_fast_field_with_cursor` lands here, so this is the
+    /// load-bearing forward for `SortByStaticFastValueWithCursor`.
+    fn should_skip_segment(&self, segment_reader: &crate::SegmentReader) -> bool {
+        self.0.should_skip_segment(segment_reader)
     }
 }
 

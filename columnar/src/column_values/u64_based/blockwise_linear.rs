@@ -42,6 +42,24 @@ fn compute_num_blocks(num_vals: u32) -> u32 {
     num_vals.div_ceil(BLOCK_SIZE)
 }
 
+/// True when `indexes` is strictly +1 monotonic. O(N), short-circuits on
+/// first non-sequential pair. Cheap enough to gate the SIMD get_range path
+/// in get_vals.
+#[inline]
+fn is_sequential(indexes: &[u32]) -> bool {
+    let mut iter = indexes.iter().copied();
+    let Some(mut prev) = iter.next() else {
+        return true;
+    };
+    for cur in iter {
+        if cur != prev + 1 {
+            return false;
+        }
+        prev = cur;
+    }
+    true
+}
+
 pub struct BlockwiseLinearEstimator {
     block: Vec<u64>,
     values_num_bytes: u64,
@@ -280,6 +298,100 @@ impl ColumnValues for BlockwiseLinearReader {
         }
     }
 
+    /// Wave 21 Phase 2: block-aware batch lookup for arbitrary indexes.
+    ///
+    /// - Sequential indexes → delegate to get_range (full SIMD path).
+    /// - Few indexes (≤ `RUN_THRESHOLD`) → walk per-block runs so block
+    ///   state (line, bit_unpacker, block bytes) is loaded once per run.
+    ///   This is the harvest path: per segment we have size=10-ish docs
+    ///   that often cluster in a handful of blocks.
+    /// - Many random indexes spread across blocks → fall back to the
+    ///   default scalar 4-wide unroll. Per-block-run overhead doesn't pay
+    ///   when avg run length is ~1 (synthetic 10K random over 1M-row
+    ///   column measured 0.72× regression before adding this guard).
+    ///
+    /// The default ColumnValues::get_vals impl is a scalar 4-wide unroll
+    /// over get_val, which re-derefs Arc<[Block]> + self.data per call —
+    /// measurably the dominant cost on full-corpus sort harvest
+    /// (Wave 20.1 profile).
+    fn get_vals(&self, indexes: &[u32], output: &mut [u64]) {
+        assert_eq!(indexes.len(), output.len());
+        if output.is_empty() {
+            return;
+        }
+        if indexes.len() > 1 && is_sequential(indexes) {
+            self.get_range(indexes[0] as u64, output);
+            return;
+        }
+        // Heuristic: only run the per-block-run path when the input is
+        // small enough that the typical harvest pattern (few near-neighbour
+        // doc_ids per segment) dominates. Larger random workloads use the
+        // scalar unroll which the compiler keeps very tight.
+        const RUN_THRESHOLD: usize = 64;
+        if indexes.len() > RUN_THRESHOLD {
+            let chunks = output.chunks_exact_mut(4).zip(indexes.chunks_exact(4));
+            for (out_x4, idx_x4) in chunks {
+                out_x4[0] = self.get_val(idx_x4[0]);
+                out_x4[1] = self.get_val(idx_x4[1]);
+                out_x4[2] = self.get_val(idx_x4[2]);
+                out_x4[3] = self.get_val(idx_x4[3]);
+            }
+            let remainder = output
+                .chunks_exact_mut(4)
+                .into_remainder()
+                .iter_mut()
+                .zip(indexes.chunks_exact(4).remainder());
+            for (out, idx) in remainder {
+                *out = self.get_val(*idx);
+            }
+            return;
+        }
+        let min_value = self.stats.min_value;
+        let gcd = self.stats.gcd.get();
+        let mut i = 0usize;
+        while i < indexes.len() {
+            let block_id = (indexes[i] / BLOCK_SIZE) as usize;
+            let block = &self.blocks[block_id];
+            let block_bytes = &self.data[block.data_start_offset..];
+            let line = block.line;
+            let block_min = (block_id as u32) * BLOCK_SIZE;
+            let block_max_excl = block_min + BLOCK_SIZE;
+            // Process a run of indexes that fall in this block.
+            let run_start = i;
+            while i < indexes.len()
+                && indexes[i] >= block_min
+                && indexes[i] < block_max_excl
+            {
+                i += 1;
+            }
+            // The run is indexes[run_start..i]. Always non-empty (at least
+            // the first element by construction).
+            for j in run_start..i {
+                let pos = indexes[j] - block_min;
+                let interp = line.eval(pos);
+                let diff = block.bit_unpacker.get(pos, block_bytes);
+                output[j] = min_value
+                    .wrapping_add(gcd.wrapping_mul(interp.wrapping_add(diff)));
+            }
+        }
+    }
+
+    /// Default impl loops scalar get_val; route through get_vals so callers
+    /// of Column::first_vals on full single-valued columns benefit from the
+    /// block-aware path. The Some-wrap is unconditional for Full columns,
+    /// matching the default impl's behaviour.
+    fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<u64>]) {
+        assert_eq!(indexes.len(), output.len());
+        if output.is_empty() {
+            return;
+        }
+        let mut tmp: Vec<u64> = vec![0u64; indexes.len()];
+        self.get_vals(indexes, &mut tmp);
+        for (out, v) in output.iter_mut().zip(tmp) {
+            *out = Some(v);
+        }
+    }
+
     #[inline(always)]
     fn min_value(&self) -> u64 {
         self.stats.min_value
@@ -476,6 +588,254 @@ mod tests {
                 "get_range mismatch at idx {i}"
             );
         }
+    }
+
+    #[test]
+    fn test_blockwise_linear_get_vals_sequential_matches_get_range() {
+        let mut rng = 0xDEAD_BEEFu64;
+        let values: Vec<u64> = (0..1500u64)
+            .map(|i| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let residual = (rng % 4096) as u64;
+                1_000u64.wrapping_add(i.wrapping_mul(7)).wrapping_add(residual)
+            })
+            .collect();
+        let reader = load_blockwise_linear_reader(&values);
+
+        // Sequential indexes that cross multiple blocks → should hit fast path.
+        let indexes: Vec<u32> = (300u32..1400u32).collect();
+        let mut batch = vec![0u64; indexes.len()];
+        reader.get_vals(&indexes, &mut batch);
+
+        let expected: Vec<u64> = indexes.iter().map(|&i| reader.get_val(i)).collect();
+        assert_eq!(batch, expected, "sequential get_vals must match per-doc get_val");
+    }
+
+    #[test]
+    fn test_blockwise_linear_get_vals_random_matches_get_val() {
+        let mut rng = 0xCAFE_F00Du64;
+        let values: Vec<u64> = (0..2000u64)
+            .map(|i| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let residual = (rng % 256) as u64;
+                500u64.wrapping_add(i.wrapping_mul(3)).wrapping_add(residual)
+            })
+            .collect();
+        let reader = load_blockwise_linear_reader(&values);
+
+        // Random indexes — mix in-block and cross-block, including duplicates.
+        let mut indexes: Vec<u32> = Vec::with_capacity(200);
+        let mut s = 0xC0DEu64;
+        for _ in 0..200 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            indexes.push((s % 2000) as u32);
+        }
+        let mut batch = vec![0u64; indexes.len()];
+        reader.get_vals(&indexes, &mut batch);
+
+        let expected: Vec<u64> = indexes.iter().map(|&i| reader.get_val(i)).collect();
+        assert_eq!(batch, expected, "random get_vals must match per-doc get_val");
+    }
+
+    #[test]
+    fn test_blockwise_linear_get_vals_opt_full_column() {
+        let values: Vec<u64> = (0..700u64).map(|i| 42u64 + i).collect();
+        let reader = load_blockwise_linear_reader(&values);
+        let indexes: Vec<u32> = vec![0, 100, 511, 512, 513, 699];
+        let mut batch: Vec<Option<u64>> = vec![None; indexes.len()];
+        reader.get_vals_opt(&indexes, &mut batch);
+        for (i, &idx) in indexes.iter().enumerate() {
+            assert_eq!(batch[i], Some(reader.get_val(idx)));
+        }
+    }
+
+    #[test]
+    fn test_blockwise_linear_get_vals_empty_and_single() {
+        let values: Vec<u64> = (0..1000u64).collect();
+        let reader = load_blockwise_linear_reader(&values);
+
+        // Empty
+        let indexes: Vec<u32> = Vec::new();
+        let mut batch: Vec<u64> = Vec::new();
+        reader.get_vals(&indexes, &mut batch);
+        assert!(batch.is_empty());
+
+        // Single
+        let indexes = vec![777u32];
+        let mut batch = vec![0u64; 1];
+        reader.get_vals(&indexes, &mut batch);
+        assert_eq!(batch[0], reader.get_val(777));
+    }
+
+    #[test]
+    fn test_blockwise_linear_get_vals_wide_bit_width() {
+        let mut rng = rand::random::<u64>();
+        let values: Vec<u64> = (0..1500u64)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng
+            })
+            .collect();
+        let reader = load_blockwise_linear_reader(&values);
+
+        // Sequential — exercises scalar fallback under sequential path
+        // (delegates to get_range which has its own wide-bit-width path).
+        let indexes: Vec<u32> = (0u32..1500u32).collect();
+        let mut batch = vec![0u64; 1500];
+        reader.get_vals(&indexes, &mut batch);
+        let expected: Vec<u64> = (0..1500u32).map(|i| reader.get_val(i)).collect();
+        assert_eq!(batch, expected, "wide-bit-width sequential get_vals must match");
+
+        // Random — exercises the per-block-run path directly.
+        let mut idx_rng = 0xF00Du64;
+        let mut indexes: Vec<u32> = Vec::with_capacity(150);
+        for _ in 0..150 {
+            idx_rng = idx_rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            indexes.push((idx_rng % 1500) as u32);
+        }
+        let mut batch = vec![0u64; 150];
+        reader.get_vals(&indexes, &mut batch);
+        let expected: Vec<u64> = indexes.iter().map(|&i| reader.get_val(i)).collect();
+        assert_eq!(batch, expected, "wide-bit-width random get_vals must match");
+    }
+
+    /// Wave 21 Phase 2 micro-bench: compare default scalar 4-wide unroll
+    /// (via ColumnValues::get_vals default) vs our block-aware override
+    /// on both sequential and random index sets. Marked `#[ignore]` —
+    /// run with `cargo test --release blockwise_linear_get_vals_bench
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn blockwise_linear_get_vals_bench() {
+        use std::time::Instant;
+        const N: u64 = 1_000_000;
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let values: Vec<u64> = (0..N)
+            .map(|i| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let residual = rng % 4096;
+                1_000_000_000u64.wrapping_add(i.wrapping_mul(17)).wrapping_add(residual)
+            })
+            .collect();
+        let reader = load_blockwise_linear_reader(&values);
+        const QUERY_N: usize = 10_000;
+        let mut idx_rng = 0xDEADBEEFu64;
+        let random_idx: Vec<u32> = (0..QUERY_N)
+            .map(|_| {
+                idx_rng = idx_rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (idx_rng % N) as u32
+            })
+            .collect();
+        let sequential_idx: Vec<u32> = (0u32..QUERY_N as u32).collect();
+        let warmups = 3usize;
+        let trials = 5usize;
+
+        // Baseline: scalar 4-wide unroll via per-doc get_val loop.
+        for _ in 0..warmups {
+            let mut sum: u64 = 0;
+            for &i in &random_idx {
+                sum = sum.wrapping_add(reader.get_val(i));
+            }
+            std::hint::black_box(sum);
+        }
+        let mut scalar_random_ns: u128 = u128::MAX;
+        for _ in 0..trials {
+            let t0 = Instant::now();
+            let mut sum: u64 = 0;
+            for &i in &random_idx {
+                sum = sum.wrapping_add(reader.get_val(i));
+            }
+            std::hint::black_box(sum);
+            scalar_random_ns = scalar_random_ns.min(t0.elapsed().as_nanos());
+        }
+
+        // Block-aware: random get_vals.
+        let mut buf = vec![0u64; QUERY_N];
+        for _ in 0..warmups {
+            reader.get_vals(&random_idx, &mut buf);
+            std::hint::black_box(&buf);
+        }
+        let mut vals_random_ns: u128 = u128::MAX;
+        for _ in 0..trials {
+            let t0 = Instant::now();
+            reader.get_vals(&random_idx, &mut buf);
+            std::hint::black_box(&buf);
+            vals_random_ns = vals_random_ns.min(t0.elapsed().as_nanos());
+        }
+
+        // Block-aware: sequential get_vals (should hit get_range fast path).
+        for _ in 0..warmups {
+            reader.get_vals(&sequential_idx, &mut buf);
+            std::hint::black_box(&buf);
+        }
+        let mut vals_seq_ns: u128 = u128::MAX;
+        for _ in 0..trials {
+            let t0 = Instant::now();
+            reader.get_vals(&sequential_idx, &mut buf);
+            std::hint::black_box(&buf);
+            vals_seq_ns = vals_seq_ns.min(t0.elapsed().as_nanos());
+        }
+
+        // Harvest-scale: 10 doc_ids clustered in the same block (mimics
+        // size=10 sort scan where heap candidates share a segment range).
+        const HARVEST_N: usize = 10;
+        let cluster_base: u32 = 123_456;
+        let mut harvest_rng = 0xBADC0FFEu64;
+        let harvest_idx: Vec<u32> = (0..HARVEST_N)
+            .map(|_| {
+                harvest_rng = harvest_rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                cluster_base + (harvest_rng % 256) as u32
+            })
+            .collect();
+        let mut harvest_buf = vec![0u64; HARVEST_N];
+        for _ in 0..warmups {
+            for (out, &i) in harvest_buf.iter_mut().zip(harvest_idx.iter()) {
+                *out = reader.get_val(i);
+            }
+            std::hint::black_box(&harvest_buf);
+        }
+        let mut scalar_harvest_ns: u128 = u128::MAX;
+        for _ in 0..trials * 1000 {
+            let t0 = Instant::now();
+            for (out, &i) in harvest_buf.iter_mut().zip(harvest_idx.iter()) {
+                *out = reader.get_val(i);
+            }
+            std::hint::black_box(&harvest_buf);
+            scalar_harvest_ns = scalar_harvest_ns.min(t0.elapsed().as_nanos());
+        }
+        for _ in 0..warmups {
+            reader.get_vals(&harvest_idx, &mut harvest_buf);
+            std::hint::black_box(&harvest_buf);
+        }
+        let mut block_harvest_ns: u128 = u128::MAX;
+        for _ in 0..trials * 1000 {
+            let t0 = Instant::now();
+            reader.get_vals(&harvest_idx, &mut harvest_buf);
+            std::hint::black_box(&harvest_buf);
+            block_harvest_ns = block_harvest_ns.min(t0.elapsed().as_nanos());
+        }
+        let harvest_speedup = scalar_harvest_ns as f64 / block_harvest_ns as f64;
+
+        let random_speedup = scalar_random_ns as f64 / vals_random_ns as f64;
+        let seq_speedup = scalar_random_ns as f64 / vals_seq_ns as f64;
+        println!(
+            "BlockwiseLinear get_vals bench ({QUERY_N} lookups):\n  scalar  random:   {scalar_random_ns:>10} ns\n  block   random:   {vals_random_ns:>10} ns  ({random_speedup:.2}x vs scalar)\n  block   sequential:{vals_seq_ns:>10} ns  ({seq_speedup:.2}x vs scalar)\n\nHarvest-scale ({HARVEST_N} clustered lookups):\n  scalar:           {scalar_harvest_ns:>10} ns\n  block:            {block_harvest_ns:>10} ns  ({harvest_speedup:.2}x vs scalar)"
+        );
+
+        // Sanity: outputs must match scalar loop.
+        let mut scalar_buf = vec![0u64; QUERY_N];
+        for (out, &i) in scalar_buf.iter_mut().zip(random_idx.iter()) {
+            *out = reader.get_val(i);
+        }
+        let mut block_buf = vec![0u64; QUERY_N];
+        reader.get_vals(&random_idx, &mut block_buf);
+        assert_eq!(scalar_buf, block_buf, "block-random get_vals must match scalar");
     }
 
     #[test]

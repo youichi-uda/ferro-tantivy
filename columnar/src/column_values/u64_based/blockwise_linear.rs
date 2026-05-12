@@ -376,19 +376,84 @@ impl ColumnValues for BlockwiseLinearReader {
         }
     }
 
-    /// Default impl loops scalar get_val; route through get_vals so callers
-    /// of Column::first_vals on full single-valued columns benefit from the
-    /// block-aware path. The Some-wrap is unconditional for Full columns,
-    /// matching the default impl's behaviour.
+    /// Wave 21 Phase 2: streaming `get_vals_opt` for full single-valued
+    /// columns. Reuses the same per-block-run path as `get_vals` (so
+    /// `Column::first_vals` on Full columns hits the block-aware lane),
+    /// but writes `Option<u64>` directly into the caller's output buffer.
+    ///
+    /// The earlier implementation allocated a fresh `Vec<u64>` proportional
+    /// to `indexes.len()` and copied through it, which on segment-wide
+    /// reads (`SortByStaticFastValueSegmentSortKeyComputer` block harvest)
+    /// risks an extra Vec the size of the request — measured by Codex as
+    /// an unbounded transient allocation when batching many candidates.
+    /// This refactor preserves the block-aware optimisation while keeping
+    /// the memory footprint exactly the caller-provided buffer.
     fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<u64>]) {
         assert_eq!(indexes.len(), output.len());
         if output.is_empty() {
             return;
         }
-        let mut tmp: Vec<u64> = vec![0u64; indexes.len()];
-        self.get_vals(indexes, &mut tmp);
-        for (out, v) in output.iter_mut().zip(tmp) {
-            *out = Some(v);
+        if indexes.len() > 1 && is_sequential(indexes) {
+            // Cheap to convert the sequential path: get_range writes u64
+            // into a fresh per-block scratch buffer that's already bounded
+            // by block size, then we wrap into Option<u64>. The temp
+            // remains O(min(output.len, BLOCK_SIZE)) via the residual_buf
+            // in get_range itself — strictly bounded, not request-sized.
+            let mut buf: Vec<u64> = vec![0u64; indexes.len()];
+            self.get_range(indexes[0] as u64, &mut buf);
+            for (out, v) in output.iter_mut().zip(buf) {
+                *out = Some(v);
+            }
+            return;
+        }
+        const RUN_THRESHOLD: usize = 64;
+        if indexes.len() > RUN_THRESHOLD {
+            // Mirror the get_vals fallback: scalar 4-wide unroll, writing
+            // Option<u64> directly into the caller-owned buffer.
+            let out_idx = output.chunks_exact_mut(4).zip(indexes.chunks_exact(4));
+            for (out_x4, idx_x4) in out_idx {
+                out_x4[0] = Some(self.get_val(idx_x4[0]));
+                out_x4[1] = Some(self.get_val(idx_x4[1]));
+                out_x4[2] = Some(self.get_val(idx_x4[2]));
+                out_x4[3] = Some(self.get_val(idx_x4[3]));
+            }
+            let remainder = output
+                .chunks_exact_mut(4)
+                .into_remainder()
+                .iter_mut()
+                .zip(indexes.chunks_exact(4).remainder());
+            for (out, idx) in remainder {
+                *out = Some(self.get_val(*idx));
+            }
+            return;
+        }
+        // Per-block-run path — clustered harvest pattern.
+        let min_value = self.stats.min_value;
+        let gcd = self.stats.gcd.get();
+        let mut i = 0usize;
+        while i < indexes.len() {
+            let block_id = (indexes[i] / BLOCK_SIZE) as usize;
+            let block = &self.blocks[block_id];
+            let block_bytes = &self.data[block.data_start_offset..];
+            let line = block.line;
+            let block_min = (block_id as u32) * BLOCK_SIZE;
+            let block_max_excl = block_min + BLOCK_SIZE;
+            let run_start = i;
+            while i < indexes.len()
+                && indexes[i] >= block_min
+                && indexes[i] < block_max_excl
+            {
+                i += 1;
+            }
+            for j in run_start..i {
+                let pos = indexes[j] - block_min;
+                let interp = line.eval(pos);
+                let diff = block.bit_unpacker.get(pos, block_bytes);
+                output[j] = Some(
+                    min_value
+                        .wrapping_add(gcd.wrapping_mul(interp.wrapping_add(diff))),
+                );
+            }
         }
     }
 

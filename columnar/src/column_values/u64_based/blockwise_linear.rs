@@ -220,6 +220,66 @@ impl ColumnValues for BlockwiseLinearReader {
                 .wrapping_mul(interpoled_val.wrapping_add(bitpacked_diff))
     }
 
+    fn get_range(&self, start: u64, output: &mut [u64]) {
+        if output.is_empty() {
+            return;
+        }
+        let start_u32 = start as u32;
+        let end_u32 = start_u32 + output.len() as u32;
+        let min_value = self.stats.min_value;
+        let gcd = self.stats.gcd.get();
+        let mut idx = start_u32;
+        let mut out_cursor: usize = 0;
+        let mut residual_buf: Vec<u32> = Vec::new();
+        while idx < end_u32 {
+            let block_id = (idx / BLOCK_SIZE) as usize;
+            let block = &self.blocks[block_id];
+            let block_start = (block_id as u32) * BLOCK_SIZE;
+            let segment_end = (block_start + BLOCK_SIZE).min(end_u32);
+            let segment_len = (segment_end - idx) as usize;
+            let block_bytes = &self.data[block.data_start_offset..];
+            let line = block.line;
+            let bit_width = block.bit_unpacker.bit_width();
+            let idx_within_block = idx - block_start;
+            let out_slice = &mut output[out_cursor..out_cursor + segment_len];
+            if bit_width == 0 {
+                for (i, out) in out_slice.iter_mut().enumerate() {
+                    let pos = idx_within_block + i as u32;
+                    let interp = line.eval(pos);
+                    *out = min_value.wrapping_add(gcd.wrapping_mul(interp));
+                }
+            } else if bit_width <= 32 {
+                residual_buf.clear();
+                residual_buf.resize(segment_len, 0u32);
+                block.bit_unpacker.get_batch_u32s(
+                    idx_within_block,
+                    block_bytes,
+                    &mut residual_buf,
+                );
+                for (i, (out, &res)) in
+                    out_slice.iter_mut().zip(residual_buf.iter()).enumerate()
+                {
+                    let pos = idx_within_block + i as u32;
+                    let interp = line.eval(pos);
+                    *out = min_value.wrapping_add(
+                        gcd.wrapping_mul(interp.wrapping_add(res as u64)),
+                    );
+                }
+            } else {
+                for (i, out) in out_slice.iter_mut().enumerate() {
+                    let pos = idx_within_block + i as u32;
+                    let interp = line.eval(pos);
+                    let diff = block.bit_unpacker.get(pos, block_bytes);
+                    *out = min_value.wrapping_add(
+                        gcd.wrapping_mul(interp.wrapping_add(diff)),
+                    );
+                }
+            }
+            out_cursor += segment_len;
+            idx = segment_end;
+        }
+    }
+
     #[inline(always)]
     fn min_value(&self) -> u64 {
         self.stats.min_value
@@ -280,5 +340,159 @@ mod tests {
             data.reverse();
             create_and_validate::<BlockwiseLinearCodec>(&data, "rand");
         }
+    }
+
+    fn load_blockwise_linear_reader(values: &[u64]) -> BlockwiseLinearReader {
+        use crate::column_values::u64_based::stats_collector::StatsCollector;
+        let mut stats_collector = StatsCollector::default();
+        let mut codec_estimator = BlockwiseLinearEstimator::default();
+        for &v in values {
+            stats_collector.collect(v);
+            codec_estimator.collect(v);
+        }
+        codec_estimator.finalize();
+        let stats = stats_collector.stats();
+        let mut buffer = Vec::new();
+        codec_estimator
+            .serialize(&stats, &mut values.iter().copied(), &mut buffer)
+            .unwrap();
+        BlockwiseLinearCodec::load(OwnedBytes::new(buffer)).unwrap()
+    }
+
+    #[test]
+    fn test_blockwise_linear_get_range_matches_get_val_multi_block() {
+        // Force multiple blocks: 1500 values spans 3 blocks (each BLOCK_SIZE=512).
+        let mut rng = rand::random::<u64>();
+        let values: Vec<u64> = (0..1500u64)
+            .map(|i| {
+                // mix of linear trend + small residual so bit_width stays small (≤32 path)
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let residual = (rng % 4096) as u64;
+                1_000_000_000u64.wrapping_add(i.wrapping_mul(17)).wrapping_add(residual)
+            })
+            .collect();
+        let reader = load_blockwise_linear_reader(&values);
+
+        let scalar: Vec<u64> = (0..1500u32).map(|i| reader.get_val(i)).collect();
+
+        // Full range
+        let mut batch = vec![0u64; 1500];
+        reader.get_range(0, &mut batch);
+        assert_eq!(scalar, batch, "full-range mismatch");
+
+        // Cross-block range
+        let mut batch = vec![0u64; 600];
+        reader.get_range(400, &mut batch); // 400..1000 spans blocks 0+1
+        assert_eq!(&scalar[400..1000], &batch[..], "cross-block 0->1 mismatch");
+
+        // Within last partial block
+        let mut batch = vec![0u64; 100];
+        reader.get_range(1024, &mut batch); // 1024..1124, fully in block 2
+        assert_eq!(&scalar[1024..1124], &batch[..], "last-block mismatch");
+
+        // Single value via get_range
+        let mut batch = vec![0u64; 1];
+        reader.get_range(777, &mut batch);
+        assert_eq!(scalar[777], batch[0], "single-value get_range mismatch");
+
+        // Empty
+        let mut batch: Vec<u64> = Vec::new();
+        reader.get_range(0, &mut batch);
+    }
+
+    #[test]
+    fn test_blockwise_linear_get_range_bit_width_zero() {
+        // All-identical block → bit_width 0 path.
+        let values: Vec<u64> = vec![42u64; 1500];
+        let reader = load_blockwise_linear_reader(&values);
+
+        let mut batch = vec![0u64; 1500];
+        reader.get_range(0, &mut batch);
+        for &v in &batch {
+            assert_eq!(v, 42, "constant-block path should yield input");
+        }
+    }
+
+    /// Wave 21 Phase 1 micro-bench: compare scalar `get_val` loop vs block-aware
+    /// `get_range` on a 1 M-doc BlockwiseLinear column. Marked `#[ignore]`
+    /// because it is a perf signal, not a correctness assertion — run with
+    /// `cargo test --release blockwise_linear_get_range_bench -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn blockwise_linear_get_range_bench() {
+        use std::time::Instant;
+        const N: u64 = 1_000_000;
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let values: Vec<u64> = (0..N)
+            .map(|i| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let residual = rng % 4096;
+                1_000_000_000u64.wrapping_add(i.wrapping_mul(17)).wrapping_add(residual)
+            })
+            .collect();
+        let reader = load_blockwise_linear_reader(&values);
+        let warmups = 3usize;
+        let trials = 5usize;
+        for _ in 0..warmups {
+            let mut sum: u64 = 0;
+            for i in 0..N as u32 {
+                sum = sum.wrapping_add(reader.get_val(i));
+            }
+            std::hint::black_box(sum);
+        }
+        let mut scalar_ns: u128 = u128::MAX;
+        for _ in 0..trials {
+            let t0 = Instant::now();
+            let mut sum: u64 = 0;
+            for i in 0..N as u32 {
+                sum = sum.wrapping_add(reader.get_val(i));
+            }
+            std::hint::black_box(sum);
+            scalar_ns = scalar_ns.min(t0.elapsed().as_nanos());
+        }
+        let mut buf: Vec<u64> = vec![0u64; N as usize];
+        for _ in 0..warmups {
+            reader.get_range(0, &mut buf);
+            std::hint::black_box(&buf);
+        }
+        let mut range_ns: u128 = u128::MAX;
+        for _ in 0..trials {
+            let t0 = Instant::now();
+            reader.get_range(0, &mut buf);
+            std::hint::black_box(&buf);
+            range_ns = range_ns.min(t0.elapsed().as_nanos());
+        }
+        let speedup = scalar_ns as f64 / range_ns as f64;
+        println!(
+            "BlockwiseLinear get_val-loop = {} ns, get_range = {} ns, speedup = {:.2}x",
+            scalar_ns, range_ns, speedup
+        );
+        // Sanity: get_range must produce same output as scalar loop.
+        for i in 0..N as u32 {
+            assert_eq!(
+                buf[i as usize],
+                reader.get_val(i),
+                "get_range mismatch at idx {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_blockwise_linear_get_range_wide_bit_width() {
+        // Force bit_width > 32 by using values with wide random residuals.
+        let mut rng = rand::random::<u64>();
+        let values: Vec<u64> = (0..1500u64)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                rng
+            })
+            .collect();
+        let reader = load_blockwise_linear_reader(&values);
+
+        let scalar: Vec<u64> = (0..1500u32).map(|i| reader.get_val(i)).collect();
+        let mut batch = vec![0u64; 1500];
+        reader.get_range(0, &mut batch);
+        assert_eq!(scalar, batch, "wide-bit-width scalar fallback must match");
     }
 }

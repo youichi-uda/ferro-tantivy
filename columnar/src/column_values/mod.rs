@@ -201,6 +201,17 @@ impl<T: Copy + PartialOrd + Debug + 'static> ColumnValues<T> for Arc<dyn ColumnV
         self.as_ref().get_val(idx)
     }
 
+    /// Wave 21 Phase 2 fix-up: forward `get_vals` through the Arc wrapper.
+    /// Without this, `ColumnBlockAccessor::fetch_block` and any other
+    /// caller that reaches `ColumnValues` only through `Column.values`
+    /// (an `Arc<dyn ColumnValues<T>>`) hits the trait default — a scalar
+    /// 4-wide unroll over `get_val` — instead of the underlying codec's
+    /// block-aware override (e.g. `BlockwiseLinearReader::get_vals`).
+    #[inline(always)]
+    fn get_vals(&self, indexes: &[u32], output: &mut [T]) {
+        self.as_ref().get_vals(indexes, output)
+    }
+
     #[inline(always)]
     fn get_vals_opt(&self, indexes: &[u32], output: &mut [Option<T>]) {
         self.as_ref().get_vals_opt(indexes, output)

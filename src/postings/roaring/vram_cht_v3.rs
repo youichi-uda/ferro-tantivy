@@ -72,7 +72,7 @@
 
 #![cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,6 +83,7 @@ use ferro_compress::nvcomp_sys::cuda::{
 };
 use ferro_compress::{BitcompDataType, BitcompDeviceCodec, Error as FcError};
 
+use crate::index::SegmentId;
 use crate::postings::roaring::cht::ChtKey;
 use crate::postings::roaring::encoder::RoaringPostings;
 use crate::postings::roaring::shared_bitmap_payload::SharedBitmapPayload;
@@ -836,6 +837,53 @@ impl VramCompressedCht {
         self.evictions.store(0, Ordering::Relaxed);
         self.promotions.store(0, Ordering::Relaxed);
         self.cross_tier_promotions.store(0, Ordering::Relaxed);
+    }
+
+    /// Evict all entries whose [`ChtKey::segment_id`] is in
+    /// `segment_ids`. Returns the count of entries evicted.
+    ///
+    /// Wave Z-7 #2 — fine-grained eviction surface for the ILM hook
+    /// (`ferro-ilm`) on phase transitions (`delete` / `cold` /
+    /// `frozen`). Releases VRAM owned by segments of indices
+    /// transitioning out of the Hot tier without touching the Hot
+    /// indices' working set. Cheaper than [`Self::reset`] which would
+    /// wipe the whole cache.
+    ///
+    /// Each evicted [`Arc<VramCompressedTermEntry>`] drops on removal;
+    /// its `Drop` iterates the per-chunk `DeviceChunkSlice` vec and
+    /// calls `cudaFree` per chunk. No leak.
+    ///
+    /// Stats: bumps `evictions` by the returned count; decrements
+    /// `current_bytes` (= compressed bytes total) by the sum of
+    /// evicted entries' `compressed_bytes()`, and
+    /// `uncompressed_bytes_total` by their uncompressed footprint.
+    /// `inserts` is unchanged (eviction is not insertion).
+    pub fn evict_by_segments(&self, segment_ids: &[SegmentId]) -> u64 {
+        if segment_ids.is_empty() {
+            return 0;
+        }
+        let segment_set: HashSet<SegmentId> = segment_ids.iter().copied().collect();
+        let mut inner = self.inner.lock().expect("VramCompressedCht mutex poisoned");
+        let keys_to_evict: Vec<ChtKey> = inner
+            .map
+            .keys()
+            .filter(|k| segment_set.contains(&k.segment_id))
+            .cloned()
+            .collect();
+        let count = keys_to_evict.len() as u64;
+        for key in keys_to_evict {
+            if let Some((evicted_value, _)) = inner.map.remove(&key) {
+                inner.current_bytes = inner
+                    .current_bytes
+                    .saturating_sub(evicted_value.compressed_bytes() as u64);
+                inner.uncompressed_bytes_total = inner
+                    .uncompressed_bytes_total
+                    .saturating_sub(evicted_value.uncompressed_bytes as u64);
+            }
+        }
+        drop(inner);
+        self.evictions.fetch_add(count, Ordering::Relaxed);
+        count
     }
 
     /// Budget configured at construction.
@@ -2748,5 +2796,101 @@ mod tests {
             byte_prefix += chunk.uncompressed_bytes;
         }
         assert_eq!(byte_prefix, entry.uncompressed_bytes());
+    }
+
+    // ============================================================
+    // Wave Z-7 #2 — `evict_by_segments` API tests
+    // ============================================================
+
+    #[test]
+    fn evict_by_segments_drops_only_matching_entries() {
+        // Wave Z-7 #2 acceptance: passing two of three segment IDs to
+        // `evict_by_segments` evicts exactly those two entries; the
+        // third (whose segment was not in the input slice) survives.
+        if !cuda_available() {
+            return;
+        }
+        let cht = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let key_a = dummy_key(0xa1a1, 100);
+        let key_b = dummy_key(0xa1a2, 101);
+        let key_c = dummy_key(0xa1a3, 102);
+        cht.insert(key_a.clone(), &small_roaring()).unwrap();
+        cht.insert(key_b.clone(), &small_roaring()).unwrap();
+        cht.insert(key_c.clone(), &small_roaring()).unwrap();
+        assert_eq!(cht.stats().entries, 3);
+
+        let evicted = cht.evict_by_segments(&[
+            key_a.segment_id.clone(),
+            key_c.segment_id.clone(),
+        ]);
+        assert_eq!(evicted, 2);
+        assert_eq!(cht.stats().entries, 1);
+        assert!(cht.get(&key_a).is_none());
+        assert!(cht.get(&key_b).is_some());
+        assert!(cht.get(&key_c).is_none());
+        assert_eq!(cht.stats().evictions, 2);
+    }
+
+    #[test]
+    fn evict_by_segments_bytes_total_decrements() {
+        // Wave Z-7 #2 stats invariant: `current_bytes` and
+        // `uncompressed_bytes_total` must decrement by exactly the
+        // evicted entry's footprint; `inserts` must NOT change
+        // (eviction is not insertion).
+        if !cuda_available() {
+            return;
+        }
+        let cht = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let key_a = dummy_key(0xb1b1, 200);
+        let key_b = dummy_key(0xb1b2, 201);
+        cht.insert(key_a.clone(), &small_roaring()).unwrap();
+        cht.insert(key_b.clone(), &small_roaring()).unwrap();
+
+        let entry_a = cht.get(&key_a).expect("hit");
+        let entry_a_compressed = entry_a.compressed_bytes() as u64;
+        let entry_a_uncompressed = entry_a.uncompressed_bytes() as u64;
+        drop(entry_a);
+        let before = cht.stats();
+
+        let evicted = cht.evict_by_segments(&[key_a.segment_id.clone()]);
+        assert_eq!(evicted, 1);
+        let after = cht.stats();
+        assert_eq!(after.entries, 1);
+        assert_eq!(
+            after.current_bytes,
+            before.current_bytes.saturating_sub(entry_a_compressed)
+        );
+        assert_eq!(
+            after.uncompressed_bytes_total,
+            before
+                .uncompressed_bytes_total
+                .saturating_sub(entry_a_uncompressed)
+        );
+        assert_eq!(after.evictions, before.evictions + 1);
+        assert_eq!(after.inserts, before.inserts, "inserts unchanged by evict");
+    }
+
+    #[test]
+    fn evict_by_segments_empty_input_no_op() {
+        // Wave Z-7 #2 zero-element fast path: calling with `&[]`
+        // returns 0 and touches neither the map nor the stats
+        // counters (avoids a mutex acquisition + alloc on the
+        // common ILM-no-Hot-transitions case).
+        if !cuda_available() {
+            return;
+        }
+        let cht = VramCompressedCht::with_budget(64 * 1024 * 1024).unwrap();
+        let key = dummy_key(0xc1c1, 300);
+        cht.insert(key.clone(), &small_roaring()).unwrap();
+        let before = cht.stats();
+
+        let evicted = cht.evict_by_segments(&[]);
+        assert_eq!(evicted, 0);
+        let after = cht.stats();
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.current_bytes, before.current_bytes);
+        assert_eq!(after.uncompressed_bytes_total, before.uncompressed_bytes_total);
+        assert_eq!(after.evictions, before.evictions);
+        assert!(cht.get(&key).is_some(), "untouched entry must still hit");
     }
 }

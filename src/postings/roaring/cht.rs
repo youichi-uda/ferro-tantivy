@@ -65,7 +65,7 @@
 
 #![cfg(all(feature = "gpu", feature = "ferro-compress"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -331,6 +331,46 @@ impl Cht {
         self.misses.store(0, Ordering::Relaxed);
         self.inserts.store(0, Ordering::Relaxed);
         self.evictions.store(0, Ordering::Relaxed);
+    }
+
+    /// Evict all entries whose [`ChtKey::segment_id`] is in
+    /// `segment_ids`. Returns the count of entries evicted.
+    ///
+    /// Wave Z-7 #2 — fine-grained eviction surface for the ILM hook
+    /// (`ferro-ilm`) on phase transitions (`delete` / `cold` /
+    /// `frozen`). Releases host memory for segments of indices
+    /// transitioning out of the Hot tier without touching the Hot
+    /// indices' working set. Cheaper than [`Self::reset`] which would
+    /// wipe the whole cache.
+    ///
+    /// Each evicted [`Arc<RoaringPostings>`] drops on removal — pure
+    /// host memory, no device resources.
+    ///
+    /// Stats: bumps `evictions` by the returned count; decrements
+    /// `current_bytes` by the sum of evicted entries' estimated
+    /// sizes. `inserts` is unchanged (eviction is not insertion).
+    pub fn evict_by_segments(&self, segment_ids: &[SegmentId]) -> u64 {
+        if segment_ids.is_empty() {
+            return 0;
+        }
+        let segment_set: HashSet<SegmentId> = segment_ids.iter().copied().collect();
+        let mut inner = self.inner.lock().expect("CHT mutex poisoned");
+        let keys_to_evict: Vec<ChtKey> = inner
+            .map
+            .keys()
+            .filter(|k| segment_set.contains(&k.segment_id))
+            .cloned()
+            .collect();
+        let count = keys_to_evict.len() as u64;
+        for key in keys_to_evict {
+            if let Some((evicted_value, _)) = inner.map.remove(&key) {
+                let evicted_bytes = estimated_bytes(&evicted_value) as u64;
+                inner.current_bytes = inner.current_bytes.saturating_sub(evicted_bytes);
+            }
+        }
+        drop(inner);
+        self.evictions.fetch_add(count, Ordering::Relaxed);
+        count
     }
 
     // ========================================================
@@ -822,5 +862,81 @@ mod tests {
             second_attempt.is_none(),
             "second global_with_budget call must return None — budget is fixed at first init"
         );
+    }
+
+    // ============================================================
+    // Wave Z-7 #2 — `evict_by_segments` API tests
+    // ============================================================
+
+    #[test]
+    fn evict_by_segments_drops_only_matching_entries() {
+        // Wave Z-7 #2 acceptance: passing two of three segment IDs to
+        // `evict_by_segments` evicts exactly those two entries; the
+        // third (whose segment was not in the input slice) survives.
+        let cht = Cht::with_budget(64 * 1024 * 1024);
+        let key_a = dummy_key(0xa1a1, 100);
+        let key_b = dummy_key(0xa1a2, 101);
+        let key_c = dummy_key(0xa1a3, 102);
+        cht.insert(key_a.clone(), Arc::new(small_postings()));
+        cht.insert(key_b.clone(), Arc::new(small_postings()));
+        cht.insert(key_c.clone(), Arc::new(small_postings()));
+        assert_eq!(cht.stats().entries, 3);
+
+        let evicted = cht.evict_by_segments(&[
+            key_a.segment_id.clone(),
+            key_c.segment_id.clone(),
+        ]);
+        assert_eq!(evicted, 2);
+        assert_eq!(cht.stats().entries, 1);
+        assert!(cht.get(&key_a).is_none());
+        assert!(cht.get(&key_b).is_some());
+        assert!(cht.get(&key_c).is_none());
+        assert_eq!(cht.stats().evictions, 2);
+    }
+
+    #[test]
+    fn evict_by_segments_bytes_total_decrements() {
+        // Wave Z-7 #2 stats invariant: `current_bytes` decrements by
+        // exactly the evicted entry's estimated footprint; `inserts`
+        // is unchanged (eviction is not insertion).
+        let cht = Cht::with_budget(64 * 1024 * 1024);
+        let key_a = dummy_key(0xb1b1, 200);
+        let key_b = dummy_key(0xb1b2, 201);
+        let postings_a = Arc::new(small_postings());
+        let postings_b = Arc::new(small_postings());
+        let entry_a_bytes = estimated_bytes(&postings_a) as u64;
+        cht.insert(key_a.clone(), postings_a);
+        cht.insert(key_b.clone(), postings_b);
+        let before = cht.stats();
+
+        let evicted = cht.evict_by_segments(&[key_a.segment_id.clone()]);
+        assert_eq!(evicted, 1);
+        let after = cht.stats();
+        assert_eq!(after.entries, 1);
+        assert_eq!(
+            after.current_bytes,
+            before.current_bytes.saturating_sub(entry_a_bytes)
+        );
+        assert_eq!(after.evictions, before.evictions + 1);
+        assert_eq!(after.inserts, before.inserts, "inserts unchanged by evict");
+    }
+
+    #[test]
+    fn evict_by_segments_empty_input_no_op() {
+        // Wave Z-7 #2 zero-element fast path: calling with `&[]`
+        // returns 0 and touches neither the map nor the stats
+        // counters.
+        let cht = Cht::with_budget(64 * 1024 * 1024);
+        let key = dummy_key(0xc1c1, 300);
+        cht.insert(key.clone(), Arc::new(small_postings()));
+        let before = cht.stats();
+
+        let evicted = cht.evict_by_segments(&[]);
+        assert_eq!(evicted, 0);
+        let after = cht.stats();
+        assert_eq!(after.entries, before.entries);
+        assert_eq!(after.current_bytes, before.current_bytes);
+        assert_eq!(after.evictions, before.evictions);
+        assert!(cht.get(&key).is_some(), "untouched entry must still hit");
     }
 }

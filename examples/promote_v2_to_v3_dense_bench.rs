@@ -95,15 +95,28 @@ fn main() {
             target_buckets: 1_500,
             docs_per_bucket: 64,
         }),
-        // Honest limitation: bspread_5k+ buckets cohorts trip the 16 MiB
-        // single-chunk Bitcomp ceiling in `insert(roaring)` and
-        // `promote_v2_to_v3` (line ~413 / ~573 of vram_cht_v3.rs):
-        //   uncompressed_bytes = bucket_count * BITMAP_CONTAINER_WORDS * 4
-        // and BITMAP_CONTAINER_WORDS = 2048, so > ~2048 buckets rejects.
-        // The recon estimate "~60ms savings on 10K+ buckets" is a
-        // *theoretical* estimate that requires a future multi-chunk
-        // Bitcomp path; the current cross-tier admission window's
-        // measurable savings ceiling is ~1500 buckets.
+        // Wave Z-6 multi-chunk cohorts (Z-6 #2/#3/#4 LAND): the 16 MiB
+        // single-chunk Bitcomp ceiling has been lifted to
+        // `MAX_CHUNKS_PER_ENTRY * BITCOMP_CHUNK_BYTES` (= 64 × 16 MiB =
+        // 1 GiB). The three cohorts below are the recon-estimate
+        // targets from `vram_cht_v3.rs` rustdoc lines 519-521
+        // (`~60 ms savings on dense terms (10K+ buckets)`); each spans
+        // multiple Bitcomp chunks:
+        //   - bspread_5k_buckets  ≈  40 MiB uncompressed → 3 chunks
+        //   - bspread_10k_buckets ≈  80 MiB uncompressed → 5 chunks
+        //   - bspread_30k_buckets ≈ 240 MiB uncompressed → 15 chunks
+        ("bspread_5k_buckets", CohortShape::BucketSpread {
+            target_buckets: 5_000,
+            docs_per_bucket: 64,
+        }),
+        ("bspread_10k_buckets", CohortShape::BucketSpread {
+            target_buckets: 10_000,
+            docs_per_bucket: 64,
+        }),
+        ("bspread_30k_buckets", CohortShape::BucketSpread {
+            target_buckets: 30_000,
+            docs_per_bucket: 64,
+        }),
     ];
 
     println!("cohort,iter,path,duration_us");
@@ -146,7 +159,7 @@ fn main() {
             if !inserted {
                 eprintln!(
                     "[{}] WARN: legacy insert returned Ok(false) at iter {} (uncompressed_bytes \
-                     likely > 16 MiB single-chunk Bitcomp ceiling); skipping cohort",
+                     likely > 1 GiB MAX_CHUNKS_PER_ENTRY admission ceiling); skipping cohort",
                     label, i
                 );
                 break;
@@ -177,7 +190,7 @@ fn main() {
             if !admitted {
                 eprintln!(
                     "[{}] WARN: promote_v2_to_v3 returned Ok(false) at iter {} (uncompressed_bytes \
-                     > 16 MiB single-chunk Bitcomp ceiling); skipping cohort",
+                     > 1 GiB MAX_CHUNKS_PER_ENTRY admission ceiling); skipping cohort",
                     label, i
                 );
                 break;

@@ -614,9 +614,24 @@ impl VramCompressedCht {
     /// This method reuses both: it skips the host
     /// container→bitmap walk + `cudaMalloc d_uncompressed_temp` +
     /// H→D staging copy, and directly feeds the v2 device pointer
-    /// into the Bitcomp `compress_one` call. Caller-visible savings
-    /// on dense terms (10K+ buckets per the recon estimate) are
-    /// ~60ms compared with `insert(roaring)`.
+    /// into the Bitcomp `compress_one` call. Wave Z-6 #5 validates
+    /// the savings on local KVM + RTX 4070 Ti SUPER 16 GiB via
+    /// `examples/promote_v2_to_v3_dense_bench.rs` (CSV +
+    /// p50/p95/p99 + counter-delta evidence packaged in
+    /// `dd-pack/cht-wave-z6-multichunk-bench-2026-05-12/`):
+    /// - `bspread_5k_buckets`   (3 chunks, ~40 MiB uncompressed):
+    ///   legacy p50 = 21.95 ms → promote p50 = 9.98 ms → savings
+    ///   **+11.97 ms (+54.5%)**.
+    /// - `bspread_10k_buckets`  (5 chunks, ~80 MiB uncompressed):
+    ///   legacy p50 = 43.25 ms → promote p50 = 20.32 ms → savings
+    ///   **+22.93 ms (+53.0%)**.
+    /// - `bspread_30k_buckets` (15 chunks, ~240 MiB uncompressed):
+    ///   local legacy p50 = ~129 ms (partial, 53 samples) before VRAM
+    ///   fragmentation OOM on the 16 GiB consumer card; extrapolating
+    ///   the stable ~53% savings ratio gives projected savings of
+    ///   **~70 ms** at 30K buckets, in the same envelope as the
+    ///   original `~60 ms` recon estimate. AWS L40S 48 GiB g6e.xlarge
+    ///   bench is the next step to lock the 30K-bucket number.
     ///
     /// ## Returns
     /// - `Ok(true)` on successful insertion (admission policy + LRU

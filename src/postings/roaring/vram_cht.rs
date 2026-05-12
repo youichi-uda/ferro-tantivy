@@ -641,6 +641,62 @@ impl VramCht {
         &self,
         path: &std::path::Path,
     ) -> Result<u64, super::persist::DumpError> {
+        self.dump_by_segments_internal(None, path)
+    }
+
+    /// Wave Z-7 #6 #6 — dump only the entries whose
+    /// [`ChtKey::segment_id`] is in `segment_ids` to `path`. Symmetric
+    /// with [`Self::evict_by_segments`] — the same membership filter
+    /// applied during eviction is now applied during persist, so the
+    /// resulting file is a per-segment-set slice of the v2 VRAM
+    /// uncompressed cache.
+    ///
+    /// Production use case (`bins/ferrosearch/src/main.rs`
+    /// `--cht-dump-on-shutdown` SIGTERM sweep): iterate every open
+    /// index, collect that index's `searchable_segments()` into a
+    /// `Vec<SegmentId>`, write `<data_path>/<index>/cht_v2.bin`
+    /// containing exactly that index's uncompressed-VRAM entries.
+    /// Matches the v1 + v3 per-index dump shapes; together v1 + v2 +
+    /// v3 per-index dumps cover all three tiers symmetrically.
+    ///
+    /// File format is byte-identical to [`Self::dump_to_path`]: same
+    /// MAGIC_V2 header, same per-entry wire layout (bucket_count +
+    /// bucket_index pairs + uncompressed_bytes + raw bitmap bytes).
+    /// An `Self::dump_by_segments(<all segments>)` call produces a
+    /// byte-equivalent file to `Self::dump_to_path`.
+    ///
+    /// Empty `segment_ids` writes a zero-entry MAGIC_V2 header (so
+    /// the file always exists with a valid magic + trailer after a
+    /// successful call — `load_from_path` round-trips it as a no-op).
+    /// The atomic write protocol still runs even for the empty case
+    /// so a partially-written file from a crashed prior dump is
+    /// replaced cleanly.
+    ///
+    /// Returns the number of entries written.
+    pub fn dump_by_segments(
+        &self,
+        segment_ids: &[SegmentId],
+        path: &std::path::Path,
+    ) -> Result<u64, super::persist::DumpError> {
+        // Build the same `HashSet<SegmentId>` membership pattern Z-7
+        // #2's `evict_by_segments` uses, so the writer side of the
+        // pair is filtering-symmetric with the eviction side.
+        let segment_set: HashSet<SegmentId> = segment_ids.iter().copied().collect();
+        self.dump_by_segments_internal(Some(&segment_set), path)
+    }
+
+    /// Internal helper unifying `dump_to_path` (no filter) and
+    /// `dump_by_segments` (`HashSet` filter). When `filter` is
+    /// `None`, every entry is included; when `Some`, only entries
+    /// whose `ChtKey::segment_id` is in the set are emitted. The
+    /// wire format is identical regardless — calling
+    /// `dump_by_segments` with the full segment set produces a
+    /// byte-equivalent file to `dump_to_path`.
+    fn dump_by_segments_internal(
+        &self,
+        filter: Option<&HashSet<SegmentId>>,
+        path: &std::path::Path,
+    ) -> Result<u64, super::persist::DumpError> {
         use super::persist::{
             finalise_atomic_write, open_tmp_writer, write_chtkey, write_file_header,
             write_file_trailer, DumpError, MAGIC_V2,
@@ -655,6 +711,10 @@ impl VramCht {
             inner
                 .map
                 .iter()
+                .filter(|(k, _)| match filter {
+                    None => true,
+                    Some(set) => set.contains(&k.segment_id),
+                })
                 .map(|(k, (v, _))| (k.clone(), Arc::clone(v)))
                 .collect()
         };
@@ -1479,5 +1539,131 @@ mod tests {
         assert_eq!(after.current_bytes, before.current_bytes);
         assert_eq!(after.evictions, before.evictions);
         assert!(cht.get(&key).is_some(), "untouched entry must still hit");
+    }
+
+    // ============================================================
+    // Wave Z-7 #6 #6 — `dump_by_segments` API tests (v2 VRAM uncomp)
+    // ============================================================
+
+    #[test]
+    fn dump_by_segments_writes_only_matching_entries() {
+        // Wave Z-7 #6 #6 acceptance (v2): insert 4 entries (segments
+        // a/b/c/d), call `dump_by_segments(&[a, c])`, load back into
+        // a fresh cache instance, assert only entries for a + c are
+        // present. Mirrors the v1 + v3 dump_by_segments tests.
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v2_filtered.bin");
+
+        let src = VramCht::with_budget(128 * 1024 * 1024);
+        let key_a = dummy_key(0xa1, 0x0001);
+        let key_b = dummy_key(0xa2, 0x0002);
+        let key_c = dummy_key(0xa3, 0x0003);
+        let key_d = dummy_key(0xa4, 0x0004);
+        src.insert(key_a.clone(), &small_roaring()).unwrap();
+        src.insert(key_b.clone(), &dense_roaring(0)).unwrap();
+        src.insert(key_c.clone(), &small_roaring()).unwrap();
+        src.insert(key_d.clone(), &dense_roaring(1)).unwrap();
+        assert_eq!(src.stats().entries, 4);
+
+        // Dump only a + c.
+        let n_dumped = src
+            .dump_by_segments(
+                &[key_a.segment_id.clone(), key_c.segment_id.clone()],
+                &path,
+            )
+            .unwrap();
+        assert_eq!(n_dumped, 2);
+        assert!(path.exists(), "dump file must exist after dump");
+
+        // Source cache must NOT be touched by a dump (vs evict).
+        assert_eq!(src.stats().entries, 4, "dump must not mutate source");
+
+        // Load into a fresh cache and confirm membership.
+        let dst = VramCht::with_budget(128 * 1024 * 1024);
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, 2);
+        assert!(dst.get(&key_a).is_some(), "a included in filter must load");
+        assert!(dst.get(&key_b).is_none(), "b excluded must NOT load");
+        assert!(dst.get(&key_c).is_some(), "c included in filter must load");
+        assert!(dst.get(&key_d).is_none(), "d excluded must NOT load");
+    }
+
+    #[test]
+    fn dump_by_segments_byte_invariant_with_oracle() {
+        // Wave Z-7 #6 #6 oracle test (v2): calling `dump_by_segments`
+        // with ALL segments from the cache must produce a
+        // byte-equivalent file to `dump_to_path` (which dumps
+        // everything). Pins the filter logic.
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let oracle_path = dir.path().join("cht_v2_oracle.bin");
+        let filtered_path = dir.path().join("cht_v2_filtered_all.bin");
+
+        let src = VramCht::with_budget(128 * 1024 * 1024);
+        let key_a = dummy_key(0xb1, 0x1001);
+        let key_b = dummy_key(0xb2, 0x1002);
+        let key_c = dummy_key(0xb3, 0x1003);
+        src.insert(key_a.clone(), &small_roaring()).unwrap();
+        src.insert(key_b.clone(), &dense_roaring(2)).unwrap();
+        src.insert(key_c.clone(), &small_roaring()).unwrap();
+
+        // Oracle: dump_to_path (no filter).
+        let n_oracle = src.dump_to_path(&oracle_path).unwrap();
+        // Filtered: dump_by_segments with the full segment set.
+        let n_filtered = src
+            .dump_by_segments(
+                &[
+                    key_a.segment_id.clone(),
+                    key_b.segment_id.clone(),
+                    key_c.segment_id.clone(),
+                ],
+                &filtered_path,
+            )
+            .unwrap();
+        assert_eq!(n_oracle, n_filtered);
+
+        // Both dump calls happen in the same process and observe the
+        // same internal HashMap iteration order, so the serialised
+        // entry sequence is identical and the resulting files are
+        // byte-equivalent. If a future refactor breaks this stability
+        // guarantee, this assertion fires.
+        let oracle_bytes = std::fs::read(&oracle_path).unwrap();
+        let filtered_bytes = std::fs::read(&filtered_path).unwrap();
+        assert_eq!(
+            oracle_bytes, filtered_bytes,
+            "dump_by_segments(all segments) must be byte-equivalent to dump_to_path"
+        );
+    }
+
+    #[test]
+    fn dump_by_segments_empty_input_writes_header_only() {
+        // Wave Z-7 #6 #6 empty-input behaviour (v2): calling with
+        // `&[]` writes a zero-entry MAGIC_V2 header (the file exists,
+        // is valid, and `load_from_path` round-trips it as a no-op).
+        if !cuda_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cht_v2_empty_filter.bin");
+
+        let src = VramCht::with_budget(64 * 1024 * 1024);
+        let key = dummy_key(0xcafe, 0x9000);
+        src.insert(key, &small_roaring()).unwrap();
+
+        let n_dumped = src.dump_by_segments(&[], &path).unwrap();
+        assert_eq!(n_dumped, 0, "empty filter writes zero entries");
+        assert!(path.exists(), "empty-filter dump still creates the file");
+
+        // Round-trip via load_from_path — must be a no-op (zero
+        // entries installed) without WrongMagic / TruncatedDump.
+        let dst = VramCht::with_budget(64 * 1024 * 1024);
+        let n_loaded = dst.load_from_path(&path).unwrap();
+        assert_eq!(n_loaded, 0);
+        assert_eq!(dst.stats().entries, 0);
     }
 }

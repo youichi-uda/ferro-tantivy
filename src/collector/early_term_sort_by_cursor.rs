@@ -91,6 +91,25 @@ pub struct EarlyTermSortByCursorCollector<T: FastValue> {
     /// cursor value itself is excluded — `search_after` semantics
     /// say the next page starts strictly after the supplied value.
     start_after: Option<T>,
+    /// **Wave 27 (port of Wave 21 multi-collector trick).** When the
+    /// caller knows the request semantically matches every live doc
+    /// (e.g. `match_all` body, AllQuery weight), the per-doc walk that
+    /// populates `matched_bitset` is pure waste — every bit will be 1.
+    /// Setting this flag tells `Collector::collect_segment` to skip
+    /// `default_collect_segment_impl` entirely and call `harvest`
+    /// directly with the bitset implicitly fully populated.
+    ///
+    /// This is the single missing piece that made auxiliary-cursor
+    /// queries 30× slower than the v2 multi path on Wave 26's
+    /// `sort-size-*` / `sort-status-*` 50M-doc bench
+    /// (`wave26-50m-bench-2026-05-13/cursor_dispatch_trace.plain.log`
+    /// shows 9.0-9.2 ms per segment on singular vs 0.02-0.36 ms on
+    /// multi — `assume_all_matched` is the entire reason for the gap).
+    ///
+    /// Conservative on segments with deletes: each segment re-checks
+    /// `reader.alive_bitset().is_none()` before applying the shortcut
+    /// (see `Collector::collect_segment` override).
+    assume_all_matched: bool,
     typ: PhantomData<T>,
 }
 
@@ -106,8 +125,20 @@ impl<T: FastValue> EarlyTermSortByCursorCollector<T> {
             order,
             limit,
             start_after: None,
+            assume_all_matched: false,
             typ: PhantomData,
         }
+    }
+
+    /// **Wave 27.** Opt into the all-matched shortcut. See the docstring
+    /// on [`Self::assume_all_matched`] for safety conditions: pass this
+    /// only when the request body is semantically `match_all`
+    /// (AllQuery, or a bool wrapper that reduces to AllQuery). Mirrors
+    /// the equivalent [`EarlyTermSortByCursorCollectorMulti::with_assume_all_matched`]
+    /// flag.
+    pub fn with_assume_all_matched(mut self) -> Self {
+        self.assume_all_matched = true;
+        self
     }
 
     /// Wave 16-1: enable `search_after` on the cursor walk.  After
@@ -221,9 +252,20 @@ impl<T: FastValue> Collector for EarlyTermSortByCursorCollector<T> {
                 start_after_u64: None,
                 order: self.order,
                 reverse_walk: false,
+                assume_all_matched: false,
                 typ: PhantomData,
             });
         }
+
+        // **Wave 27.** Promote the parent collector's hint to the per-
+        // segment state only when the segment has no deletes —
+        // `alive_bitset = Some(_)` means there are removed docs, so we
+        // must walk and let the standard per-doc gate skip them. The
+        // shortcut path in `collect_segment` will refuse to fire when
+        // this flag is `false` (or when the cursor is missing / limit
+        // is zero, both already handled above).
+        let assume_all_matched =
+            self.assume_all_matched && segment_reader.alive_bitset().is_none();
 
         let (column, _column_type) = segment_reader
             .fast_fields()
@@ -242,8 +284,40 @@ impl<T: FastValue> Collector for EarlyTermSortByCursorCollector<T> {
             start_after_u64: self.start_after.map(|v| v.to_u64()),
             order: self.order,
             reverse_walk,
+            assume_all_matched,
             typ: PhantomData,
         })
+    }
+
+    /// **Wave 27.** Skip `default_collect_segment_impl` entirely when
+    /// the segment-level state has `assume_all_matched`. Mirrors the
+    /// shortcut introduced in
+    /// [`EarlyTermSortByCursorCollectorMulti::collect_segment`] —
+    /// the audited closer of the auxiliary-cursor 30× perf gap
+    /// surfaced in Wave 26's 50M-doc bench (singular 9.0 ms/seg vs
+    /// multi 0.36 ms/seg). For non-`match_all` queries or segments
+    /// with deletes, falls through to the default path so per-doc
+    /// `collect` / `collect_block` populates `matched_bitset` and the
+    /// harvest filters cursor entries against it as before.
+    fn collect_segment(
+        &self,
+        weight: &dyn crate::query::Weight,
+        segment_ord: u32,
+        reader: &SegmentReader,
+    ) -> crate::Result<<Self::Child as SegmentCollector>::Fruit> {
+        let segment_collector = self.for_segment(segment_ord, reader)?;
+        if segment_collector.assume_all_matched {
+            return Ok(segment_collector.harvest());
+        }
+        let mut segment_collector = segment_collector;
+        let with_scoring = self.requires_scoring();
+        crate::collector::default_collect_segment_impl(
+            &mut segment_collector,
+            weight,
+            reader,
+            with_scoring,
+        )?;
+        Ok(segment_collector.harvest())
     }
 
     fn requires_scoring(&self) -> bool {
@@ -294,6 +368,15 @@ pub struct EarlyTermSortByCursorSegmentCollector<T: FastValue> {
     /// the query's order (e.g. asc query against a desc-sorted index).
     /// Equivalent to having an opposite-order cursor file on disk.
     reverse_walk: bool,
+    /// **Wave 27.** When `true`, harvest treats `matched_bitset` as
+    /// fully populated and skips the per-cursor-entry `contains` check.
+    /// Set by [`Collector::for_segment`] only when the parent
+    /// collector's `assume_all_matched` is on AND
+    /// `reader.alive_bitset().is_none()` (no deletes). The
+    /// `collect_segment` override is what actually skips
+    /// `default_collect_segment_impl`; this flag is the in-segment
+    /// pair that tells the harvest to behave as if every bit is set.
+    assume_all_matched: bool,
     typ: PhantomData<T>,
 }
 
@@ -344,8 +427,13 @@ impl<T: FastValue> SegmentCollector for EarlyTermSortByCursorSegmentCollector<T>
         } else {
             Box::new(cursor.iter())
         };
+        let skip_bitset_check = self.assume_all_matched;
         for doc in iter {
-            if !self.matched_bitset.contains(doc) {
+            // **Wave 27.** When `assume_all_matched` is on (set by
+            // `Collector::collect_segment` for the `match_all` /
+            // no-deletes fast path), the bitset is implicitly fully
+            // populated and the `contains` probe is pure waste.
+            if !skip_bitset_check && !self.matched_bitset.contains(doc) {
                 continue;
             }
             let val_u64 = column.first(doc);

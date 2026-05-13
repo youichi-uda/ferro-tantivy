@@ -19,7 +19,7 @@ use common::{BinarySerializable, DateTime};
 
 use crate::directory::{Directory, FileSlice};
 use crate::error::DataCorruption;
-use crate::index::Order;
+use crate::index::{IndexSortByField, Order};
 use crate::DocId;
 
 /// Magic prefix `"SCRI"` (Sort Cursor RaIl).
@@ -1091,6 +1091,18 @@ pub fn build_and_write_sort_cursors(
         return Ok(Vec::new());
     }
 
+    // **FerroSearch Wave 26.** Snapshot auxiliary cursor list up front so
+    // the primary-write branches below can append the auxiliary cursors
+    // to the returned `Vec<String>` (advertised as
+    // `SegmentMeta::sort_cursor_fields` and consumed by readers /
+    // `try_early_term_sort_cursor*`). Empty / `None` keeps the legacy
+    // single-cursor behaviour byte-identical for indices that did not
+    // opt in.
+    let aux_cursors: Vec<IndexSortByField> = settings
+        .auxiliary_sort_cursors
+        .clone()
+        .unwrap_or_default();
+
     // Wave 18-1: prefer multi-field (v2) when configured.
     if let Some(fields) = settings.sort_by_fields.as_ref() {
         if fields.is_empty() {
@@ -1126,12 +1138,37 @@ pub fn build_and_write_sort_cursors(
             segment_id_str,
             primary_field
         );
-        return Ok(vec![primary_field]);
+        let mut written = vec![primary_field];
+        // **Wave 26.** Build auxiliary single-field cursors after the
+        // multi-field primary. Each auxiliary cursor is its own
+        // `SortCursorIndex` keyed by the auxiliary field name, so the
+        // primary v2 cursor file is unaffected.
+        for aux in &aux_cursors {
+            if written.iter().any(|f| f == &aux.field) {
+                continue;
+            }
+            if build_and_write_sort_cursor_for(segment, &aux.field, aux.order)? {
+                written.push(aux.field.clone());
+            }
+        }
+        return Ok(written);
     }
 
     let sort_by = match settings.sort_by_field {
         Some(sb) => sb,
-        None => return Ok(Vec::new()),
+        None => {
+            // **Wave 26.** No primary sort configured, but auxiliary
+            // cursors may still be requested (the index relies entirely
+            // on per-field cursors for top-K dispatch). Build them and
+            // return.
+            let mut written: Vec<String> = Vec::with_capacity(aux_cursors.len());
+            for aux in &aux_cursors {
+                if build_and_write_sort_cursor_for(segment, &aux.field, aux.order)? {
+                    written.push(aux.field.clone());
+                }
+            }
+            return Ok(written);
+        }
     };
     let reader = crate::index::SegmentReader::open(segment)?;
     let cursor = build_sort_cursor_from_fast_fields(
@@ -1177,7 +1214,20 @@ pub fn build_and_write_sort_cursors(
         segment_id_str,
         sort_by.field
     );
-    Ok(vec![sort_by.field])
+    let primary_field = sort_by.field;
+    let mut written = vec![primary_field.clone()];
+    // **Wave 26.** Build auxiliary single-field cursors after the v1
+    // primary. Skips the primary field itself (deduplication) so callers
+    // that include the primary in their auxiliary list don't double-build.
+    for aux in &aux_cursors {
+        if aux.field == primary_field {
+            continue;
+        }
+        if build_and_write_sort_cursor_for(segment, &aux.field, aux.order)? {
+            written.push(aux.field.clone());
+        }
+    }
+    Ok(written)
 }
 
 /// Builds and persists the auxiliary sort cursor file for a single,

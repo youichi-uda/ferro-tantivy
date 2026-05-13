@@ -387,6 +387,35 @@ impl BlockSegmentPostings {
         }
     }
 
+    /// P0-A inline single-doc fast path constructor.
+    ///
+    /// Returns a `BlockSegmentPostings` whose iteration yields the single
+    /// document `doc_id` (no term frequencies, no positions) and then
+    /// terminates. Used by [`crate::InvertedIndexReader`] when the term was
+    /// serialised with the inline encoding (`doc_freq == 1`, empty
+    /// `TermInfo::postings_range`). The `record_option` is threaded through
+    /// the underlying [`SkipReader`] but the skip reader is never queried,
+    /// because `block_loaded` is set to `true` upfront and the block is
+    /// already populated via [`BlockDecoder::set_inline_doc`].
+    #[cfg(feature = "quickwit")]
+    pub(crate) fn with_inline_doc(
+        doc_id: DocId,
+        record_option: IndexRecordOption,
+    ) -> BlockSegmentPostings {
+        let mut doc_decoder = BlockDecoder::with_val(TERMINATED);
+        doc_decoder.set_inline_doc(doc_id);
+        BlockSegmentPostings {
+            doc_decoder,
+            block_loaded: true,
+            freq_decoder: BlockDecoder::with_val(1),
+            freq_reading_option: FreqReadingOption::NoFreq,
+            block_max_score_cache: None,
+            doc_freq: 1,
+            data: OwnedBytes::empty(),
+            skip_reader: SkipReader::new(OwnedBytes::empty(), 1, record_option),
+        }
+    }
+
     pub(crate) fn skip_reader(&self) -> &SkipReader {
         &self.skip_reader
     }

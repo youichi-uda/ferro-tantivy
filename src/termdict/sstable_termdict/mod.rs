@@ -64,9 +64,23 @@ impl ValueReader for TermInfoValueReader {
             let positions_num_bytes = VInt::deserialize_u64(&mut data)?;
             let postings_end = postings_start + postings_num_bytes as usize;
             let positions_end = positions_start + positions_num_bytes as usize;
+            // P0-A inline single-doc fast path: when the writer encoded an
+            // inline term (`doc_freq == 1`, `postings_range` empty) it
+            // emits an additional VInt carrying the inline `doc_id` after
+            // the regular per-term metadata. Detect and consume it so the
+            // cumulative `postings_start` accounting stays aligned for
+            // subsequent terms. The `postings_range` is rewritten to
+            // `doc_id..doc_id` (still empty, with `start` carrying the
+            // doc_id for the reader to extract).
+            let postings_range = if doc_freq == 1 && postings_num_bytes == 0 {
+                let inline_doc_id = VInt::deserialize_u64(&mut data)? as usize;
+                inline_doc_id..inline_doc_id
+            } else {
+                postings_start..postings_end
+            };
             let term_info = TermInfo {
                 doc_freq,
-                postings_range: postings_start..postings_end,
+                postings_range,
                 positions_range: positions_start..positions_end,
             };
             self.term_infos.push(term_info);
@@ -95,12 +109,30 @@ impl ValueWriter for TermInfoValueWriter {
         if self.term_infos.is_empty() {
             return;
         }
-        VInt(self.term_infos[0].postings_range.start as u64).serialize_into_vec(buffer);
+        // P0-A inline single-doc fast path: the leading `postings_range.start`
+        // anchors the cumulative offset for the block. Inline terms carry
+        // their `doc_id` in `postings_range.start` (with `len() == 0`), which
+        // would otherwise corrupt the cumulative chain. Use the first
+        // *non-inline* term's `postings_range.start` as the anchor; if the
+        // block is all-inline, anchor at zero (cumulative offset is never
+        // consulted because every `len()` is zero).
+        let anchor_postings_start = self
+            .term_infos
+            .iter()
+            .find(|ti| !(ti.doc_freq == 1 && ti.postings_range.is_empty()))
+            .map(|ti| ti.postings_range.start as u64)
+            .unwrap_or(0);
+        VInt(anchor_postings_start).serialize_into_vec(buffer);
         VInt(self.term_infos[0].positions_range.start as u64).serialize_into_vec(buffer);
         for term_info in &self.term_infos {
             VInt(term_info.doc_freq as u64).serialize_into_vec(buffer);
             VInt(term_info.postings_range.len() as u64).serialize_into_vec(buffer);
             VInt(term_info.positions_range.len() as u64).serialize_into_vec(buffer);
+            // For inline terms, append the doc_id as an extra VInt. The
+            // reader detects this by `doc_freq == 1 && postings_num_bytes == 0`.
+            if term_info.doc_freq == 1 && term_info.postings_range.is_empty() {
+                VInt(term_info.postings_range.start as u64).serialize_into_vec(buffer);
+            }
         }
     }
 

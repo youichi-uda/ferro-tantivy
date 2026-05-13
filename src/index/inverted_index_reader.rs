@@ -175,6 +175,20 @@ impl InvertedIndexReader {
         term_info: &TermInfo,
         block_postings: &mut BlockSegmentPostings,
     ) -> io::Result<()> {
+        // P0-A inline single-doc fast path: rebuilding the block postings
+        // state in place from an inline-encoded term cannot reuse
+        // `BlockSegmentPostings::reset` (which expects to read a real vint
+        // block out of `postings_data`). Replace the receiver with a fresh
+        // `with_inline_doc(..)` constructed value instead. Only active
+        // under the sstable-backed `quickwit` feature (see writer-side
+        // comment in `FieldSerializer::close_term`).
+        #[cfg(feature = "quickwit")]
+        if term_info.doc_freq == 1 && term_info.postings_range.is_empty() {
+            let doc_id = term_info.postings_range.start as u32;
+            *block_postings =
+                BlockSegmentPostings::with_inline_doc(doc_id, self.record_option);
+            return Ok(());
+        }
         let postings_slice = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());
@@ -206,6 +220,22 @@ impl InvertedIndexReader {
         term_info: &TermInfo,
         requested_option: IndexRecordOption,
     ) -> io::Result<BlockSegmentPostings> {
+        // P0-A inline single-doc fast path: the serializer encodes a
+        // `doc_freq == 1` term with no freq/positions by leaving the
+        // `postings_range` empty and storing the `doc_id` in its
+        // `start` field. Bypass the postings file read entirely. See
+        // `crates/tantivy/src/postings/serializer.rs::FieldSerializer::close_term`
+        // for the writer side. Only active under the sstable-backed
+        // `quickwit` feature; the default fst termdict cannot round-trip
+        // the inline marker.
+        #[cfg(feature = "quickwit")]
+        if term_info.doc_freq == 1 && term_info.postings_range.is_empty() {
+            let doc_id = term_info.postings_range.start as u32;
+            return Ok(BlockSegmentPostings::with_inline_doc(
+                doc_id,
+                self.record_option,
+            ));
+        }
         let postings_data = self
             .postings_file_slice
             .slice(term_info.postings_range.clone());

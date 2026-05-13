@@ -787,11 +787,20 @@ mod tests {
         let mut term = Term::from_field_json_path(json_field, "mykey", false);
         term.append_type_and_str("two tokens");
         let term_info = inv_index.get_term_info(&term).unwrap().unwrap();
+        // P0-A inline single-doc fast path (quickwit/sstable backend only):
+        // when `doc_freq == 1` with no term frequencies and no positions, the
+        // writer encodes the `doc_id` directly into `TermInfo.postings_range.start`
+        // and leaves the range empty. Under the default `fst_termdict` backend,
+        // the normal 1-byte vint encoding is retained (`0..1`).
+        #[cfg(feature = "quickwit")]
+        let expected_postings_range = 0..0;
+        #[cfg(not(feature = "quickwit"))]
+        let expected_postings_range = 0..1;
         assert_eq!(
             term_info,
             TermInfo {
                 doc_freq: 1,
-                postings_range: 0..1,
+                postings_range: expected_postings_range,
                 positions_range: 0..0
             }
         );

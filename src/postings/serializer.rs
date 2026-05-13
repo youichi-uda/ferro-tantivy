@@ -229,6 +229,38 @@ impl<'a, W: Write> FieldSerializer<'a, W> {
             return Ok(());
         };
 
+        // P0-A inline single-doc fast path: when doc_freq == 1 and neither
+        // term frequencies nor positions are tracked, encode the doc_id
+        // directly in `TermInfo.postings_range.start` and leave the range
+        // empty (len == 0) as the marker. The reader recognises this and
+        // bypasses the postings file lookup entirely. This halves the
+        // per-term cost on unique-per-doc keyword fields (UUID-like _id,
+        // request_id, session_id) which dominate forcemerge time on
+        // log/SIEM workloads.
+        //
+        // Only active under the `quickwit` feature because the encoding
+        // relies on the sstable termdict backend faithfully preserving
+        // `postings_range.start` for each term via an extra inline `VInt`
+        // (see `crates/tantivy/src/termdict/sstable_termdict/mod.rs`).
+        // The default `fst_termdict` backend uses bitpacked offset deltas
+        // and would underflow when fed an inline term whose
+        // `postings_range.start` is a small `DocId` instead of a file
+        // offset.
+        #[cfg(feature = "quickwit")]
+        if self.current_term_info.doc_freq == 1
+            && !self.postings_serializer.term_has_freq
+            && self.positions_serializer_opt.is_none()
+        {
+            let inline_doc_id = self.postings_serializer.first_block_doc_id() as usize;
+            self.current_term_info.postings_range.start = inline_doc_id;
+            self.current_term_info.postings_range.end = inline_doc_id;
+            self.postings_serializer.clear();
+            self.term_dictionary_builder
+                .insert_value(&self.current_term_info)?;
+            self.term_open = false;
+            return Ok(());
+        }
+
         self.postings_serializer
             .close_term(self.current_term_info.doc_freq, self.postings_write)?;
         self.current_term_info.postings_range.end = self.postings_offset();
@@ -483,5 +515,21 @@ impl PostingsSerializer {
     fn clear(&mut self) {
         self.block.clear();
         self.last_doc_id_encoded = 0;
+    }
+
+    /// P0-A inline single-doc fast path helper.
+    ///
+    /// Returns the `DocId` of the first (and, in the inline path, only)
+    /// document recorded via [`write_doc`](Self::write_doc) for the current
+    /// term. The caller is responsible for ensuring `doc_freq == 1` before
+    /// invoking this, and for following up with [`clear`](Self::clear) so
+    /// the postings file is not advanced.
+    #[cfg(feature = "quickwit")]
+    pub(super) fn first_block_doc_id(&self) -> DocId {
+        debug_assert_eq!(
+            self.block.len, 1,
+            "first_block_doc_id is only valid when exactly one doc has been written"
+        );
+        self.block.doc_ids[0]
     }
 }

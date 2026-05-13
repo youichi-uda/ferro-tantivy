@@ -165,6 +165,25 @@ impl BlockDecoder {
     pub fn output(&self, idx: usize) -> u32 {
         self.output[idx]
     }
+
+    /// P0-A inline single-doc fast path helper.
+    ///
+    /// Pre-populates the first slot with `doc_id` and sets `output_len = 1`.
+    /// The remaining slots must already be initialised to
+    /// [`crate::TERMINATED`] (via [`Self::with_val`]) so that
+    /// [`Self::seek_within_block`]'s branchless binary search continues to
+    /// terminate correctly past the single populated entry.
+    #[cfg(feature = "quickwit")]
+    #[inline]
+    pub(crate) fn set_inline_doc(&mut self, doc_id: u32) {
+        debug_assert_eq!(
+            self.output[1],
+            crate::TERMINATED,
+            "set_inline_doc requires the decoder to have been initialised with TERMINATED padding"
+        );
+        self.output[0] = doc_id;
+        self.output_len = 1;
+    }
 }
 
 pub trait VIntEncoder {

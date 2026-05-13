@@ -328,6 +328,27 @@ pub struct IndexSettings {
     /// Skipped at serialization when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort_by_fields: Option<Vec<IndexSortByField>>,
+
+    /// **FerroSearch Wave 26.** Auxiliary per-field sort cursors built
+    /// independently of [`Self::sort_by_field`] / [`Self::sort_by_fields`].
+    ///
+    /// Each entry produces a **separate** [`SortCursorIndex`] file keyed by
+    /// its own field name, sorted only by that field. This lets a single
+    /// segment serve top-K cursor-walk queries on multiple independent sort
+    /// fields (e.g. `index.sort.field=@timestamp` for time-series queries,
+    /// plus auxiliary cursors on `size` / `status` for the non-time-series
+    /// half of the workload), each terminating after K hits without scanning
+    /// the full segment.
+    ///
+    /// Each auxiliary cursor costs `O(N log N)` build time and `O(N)` disk
+    /// per segment (≈ 8 bytes/doc), so this is opt-in. The primary
+    /// `sort_by_field` / `sort_by_fields` (if set) still drives the physical
+    /// segment layout; auxiliary cursors are read-only permutation indices
+    /// over the same docs.
+    ///
+    /// Skipped at serialization when empty / `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auxiliary_sort_cursors: Option<Vec<IndexSortByField>>,
 }
 
 impl IndexSettings {
@@ -393,6 +414,7 @@ impl Default for IndexSettings {
             docstore_compress_dedicated_thread: true,
             sort_by_field: None,
             sort_by_fields: None,
+            auxiliary_sort_cursors: None,
         }
     }
 }
@@ -631,6 +653,7 @@ mod tests {
                 docstore_blocksize: 16_384,
                 sort_by_field: None,
                 sort_by_fields: None,
+                auxiliary_sort_cursors: None,
             }
         );
         {

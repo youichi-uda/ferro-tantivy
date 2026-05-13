@@ -305,7 +305,18 @@ impl TopDocs {
         TFastValue: FastValue,
         ComparatorEnum: Comparator<Option<TFastValue>>,
     {
-        self.order_by((SortByStaticFastValue::for_field(fast_field), order))
+        // Wave 24: opt the no-cursor sort-by-fast-field path into the
+        // cross-segment running top-K threshold. The atomic threshold
+        // is per-call (one fresh `Arc<AtomicU64>` per query) so it
+        // never bleeds between queries, and the optimization is a pure
+        // perf win — the trait default returns `false` from
+        // `should_skip_segment` when the column codec stats don't beat
+        // the gate, so workloads that wouldn't have benefited pay only
+        // one relaxed atomic load per segment.
+        let is_desc = matches!(order, Order::Desc);
+        let sort_key_computer =
+            SortByStaticFastValue::<TFastValue>::for_field(fast_field).with_running_threshold(is_desc);
+        self.order_by((sort_key_computer, order))
     }
 
     /// Like [`order_by_fast_field`](TopDocs::order_by_fast_field), but with a cursor value for

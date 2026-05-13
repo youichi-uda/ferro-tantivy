@@ -67,18 +67,26 @@ where
 
         let block_len = buffer.len() + self.block.len();
 
-        // P0-A ingest regression mitigation 2026-05-13: skip zstd
-        // compression on sstable block writes when the env var
-        // `P0A_SSTABLE_NO_ZSTD=1` is set. The hot path during high-
-        // cardinality keyword indexing is the *read* side
-        // (`BlockReader::read_block` → `Decompressor::new()` →
-        // `decompress_to_buffer`) called from background-merge term
-        // lookups (`TermQuery::specialized_weight` → `Bm25Weight::for_terms`
-        // → `Searcher::doc_freq` → `InvertedIndexReader::get_term_info`),
-        // and writing blocks uncompressed eliminates the corresponding
-        // decompression cost. Trade: larger on-disk sstable terms file.
-        let force_no_zstd = std::env::var_os("P0A_SSTABLE_NO_ZSTD").is_some();
-        if !force_no_zstd && cfg!(feature = "zstd-compression") && block_len > 2048 {
+        // P0-A ingest regression fix 2026-05-13: default to writing
+        // sstable blocks **uncompressed** because the dominant cost
+        // under the sstable termdict backend is the *read* side
+        // (`BlockReader::read_block` → zstd `decompress_to_buffer`)
+        // called from background-merge term lookups on
+        // unique-per-doc keyword fields. Empirically (local 1M-doc
+        // bench, `dd-pack/p0a-forcemerge-bench-2026-05-13/local_ab_2026_05_13.md`)
+        // writing uncompressed closes 70 % of the +5.6× ingest
+        // regression while *improving* the forcemerge gain further
+        // (-7.4× vs the legacy fst termdict baseline). Trade: larger
+        // on-disk sstable terms file (~3-5× depending on payload
+        // entropy). For Frozen-tier indices stored on S3 where bytes
+        // matter more than ingest latency, set
+        // `P0A_SSTABLE_ENABLE_ZSTD=1` to opt back into compression on
+        // a per-process basis. Per-shard dispatch (Hot/Warm
+        // uncompressed, Frozen compressed) is future work that
+        // requires threading a setting down through tantivy's
+        // IndexWriter API.
+        let enable_zstd = std::env::var_os("P0A_SSTABLE_ENABLE_ZSTD").is_some();
+        if enable_zstd && cfg!(feature = "zstd-compression") && block_len > 2048 {
             #[cfg(feature = "zstd-compression")]
             {
                 buffer.extend_from_slice(&self.block);

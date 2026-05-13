@@ -3,7 +3,23 @@ use std::ops::Range;
 
 use common::OwnedBytes;
 #[cfg(feature = "zstd-compression")]
+use std::cell::RefCell;
+#[cfg(feature = "zstd-compression")]
 use zstd::bulk::Decompressor;
+
+// P0-A ingest regression mitigation 2026-05-13: thread-local
+// `Decompressor` so the ZSTD_DCtx state buffer (~256 KB allocation
+// + zstd init work) is amortised across all `read_block` calls on
+// the same thread. Previously every call to `read_block` constructed
+// a fresh `Decompressor::new()`, which dominated the hot read path
+// during background-merge term lookups when the sstable termdict is
+// active (see `dd-pack/p0a-forcemerge-bench-2026-05-13/local_ab_2026_05_13.md`
+// "Root cause of sstable ingest regression — found via CPU profile").
+#[cfg(feature = "zstd-compression")]
+thread_local! {
+    static DECOMPRESSOR: RefCell<Option<Decompressor<'static>>> =
+        const { RefCell::new(None) };
+}
 
 pub struct BlockReader {
     buffer: Vec<u8>,
@@ -88,8 +104,20 @@ impl BlockReader {
                     let required_capacity =
                         Decompressor::upper_bound(&self.reader[..block_len]).unwrap_or(1024 * 1024);
                     self.buffer.reserve(required_capacity);
-                    Decompressor::new()?
-                        .decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
+                    // Reuse the thread-local Decompressor instead of
+                    // `Decompressor::new()` per block read. See
+                    // `DECOMPRESSOR` thread_local rustdoc for context.
+                    DECOMPRESSOR.with(|cell| -> io::Result<()> {
+                        let mut slot = cell.borrow_mut();
+                        if slot.is_none() {
+                            *slot = Some(Decompressor::new()?);
+                        }
+                        let decompressor =
+                            slot.as_mut().expect("decompressor was just initialised");
+                        decompressor
+                            .decompress_to_buffer(&self.reader[..block_len], &mut self.buffer)?;
+                        Ok(())
+                    })?;
 
                     self.reader.advance(block_len);
                 }

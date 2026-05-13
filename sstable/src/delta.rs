@@ -22,6 +22,16 @@ where
     // Only here to avoid allocations.
     stateless_buffer: Vec<u8>,
     block_len: usize,
+    // P0-A ingest regression isolation 2026-05-13: keep a single zstd
+    // `Compressor` instance across block flushes instead of allocating a
+    // fresh one (which initialises ZSTD_CCtx ≈ 256 KB) on every
+    // `flush_block` call. For high-cardinality keyword fields (1M unique
+    // UUID-like terms ⇒ ~4 000 block flushes per segment) the per-flush
+    // compressor init cost dominates sstable's serialise path and
+    // accounts for the bulk of the +5.6× ingest regression measured in
+    // `dd-pack/p0a-forcemerge-bench-2026-05-13/local_ab_2026_05_13.md`.
+    #[cfg(feature = "zstd-compression")]
+    zstd_compressor: Option<Compressor<'static>>,
 }
 
 impl<W, TValueWriter> DeltaWriter<W, TValueWriter>
@@ -36,6 +46,8 @@ where
             value_writer: TValueWriter::default(),
             stateless_buffer: Vec::new(),
             block_len: BLOCK_LEN,
+            #[cfg(feature = "zstd-compression")]
+            zstd_compressor: None,
         }
     }
 
@@ -55,7 +67,18 @@ where
 
         let block_len = buffer.len() + self.block.len();
 
-        if cfg!(feature = "zstd-compression") && block_len > 2048 {
+        // P0-A ingest regression mitigation 2026-05-13: skip zstd
+        // compression on sstable block writes when the env var
+        // `P0A_SSTABLE_NO_ZSTD=1` is set. The hot path during high-
+        // cardinality keyword indexing is the *read* side
+        // (`BlockReader::read_block` → `Decompressor::new()` →
+        // `decompress_to_buffer`) called from background-merge term
+        // lookups (`TermQuery::specialized_weight` → `Bm25Weight::for_terms`
+        // → `Searcher::doc_freq` → `InvertedIndexReader::get_term_info`),
+        // and writing blocks uncompressed eliminates the corresponding
+        // decompression cost. Trade: larger on-disk sstable terms file.
+        let force_no_zstd = std::env::var_os("P0A_SSTABLE_NO_ZSTD").is_some();
+        if !force_no_zstd && cfg!(feature = "zstd-compression") && block_len > 2048 {
             #[cfg(feature = "zstd-compression")]
             {
                 buffer.extend_from_slice(&self.block);
@@ -63,7 +86,19 @@ where
 
                 let max_len = zstd::zstd_safe::compress_bound(buffer.len());
                 self.block.reserve(max_len);
-                Compressor::new(3)?.compress_to_buffer(buffer, &mut self.block)?;
+                // Reuse the compressor across block flushes (initialised
+                // lazily on first use). See struct field rustdoc for the
+                // P0-A ingest regression context — each `Compressor::new`
+                // allocates ZSTD_CCtx (~256 KB) which dominated sstable
+                // build cost on high-cardinality keyword fields.
+                if self.zstd_compressor.is_none() {
+                    self.zstd_compressor = Some(Compressor::new(3)?);
+                }
+                let compressor = self
+                    .zstd_compressor
+                    .as_mut()
+                    .expect("zstd_compressor was just initialised");
+                compressor.compress_to_buffer(buffer, &mut self.block)?;
 
                 // verify compression had a positive impact
                 if self.block.len() < buffer.len() {

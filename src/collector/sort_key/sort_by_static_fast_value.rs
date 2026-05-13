@@ -559,6 +559,73 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
             *slot = None;
         }
         self.sort_column.first_vals(&docs[..n], &mut scratch[..n]);
+
+        // **Wave 25.** Block-level early prune for the streaming path.
+        // The Wave 14 SIMD filter only fires on the warm-cache path
+        // (segments ≤ `WARM_FIRST_VALS_MAX_DOCS` docs, contiguous block);
+        // larger segments fell through to the per-doc push above and paid
+        // the heap-maintenance cost on every block. After `first_vals`
+        // populated the scratch, an `O(BLOCK)` min/max scan + one
+        // comparison against the heap's K-th lets us drop the entire
+        // block when no doc in it can enter the top-K. This is the
+        // primary lever for the Wave 20.1 `sort-size-*` / `sort-status-*`
+        // defeats at 50M-doc scale, where each shard's segment is
+        // 10M docs (40× the warm-cache cap) and the running K-th
+        // tightens after the first ~1-2 blocks for low-cardinality
+        // categorical fields (`status`) or uniform-distribution numeric
+        // fields (`size`).
+        //
+        // Mirrors `should_skip_segment` semantics at block granularity:
+        // - Desc: block can be skipped if `block_max <= threshold`
+        //   (strict `>` entry into the heap means tie loses).
+        // - Asc: block can be skipped if `block_min >= threshold`.
+        //
+        // Cursor variant (`cursor_u64.is_some()`) is excluded — the
+        // cursor filter already provides a strict gate that the heap
+        // K-th cannot improve, and combining the two would require
+        // careful interaction analysis. Keep the cursor path on the
+        // existing per-doc loop.
+        if self.cursor_u64.is_none() && top_n_computer.threshold.is_some() {
+            if let Some(threshold) =
+                super::simd_top_k::unwrap_threshold(&top_n_computer.threshold)
+            {
+                let order =
+                    super::simd_top_k::detect_order(top_n_computer.comparator_ref());
+                if order != super::simd_top_k::DetectedOrder::Unknown {
+                    let mut block_min = u64::MAX;
+                    let mut block_max = u64::MIN;
+                    let mut any_non_null = false;
+                    for slot in scratch.iter().take(n) {
+                        if let Some(v) = slot {
+                            if *v < block_min {
+                                block_min = *v;
+                            }
+                            if *v > block_max {
+                                block_max = *v;
+                            }
+                            any_non_null = true;
+                        }
+                    }
+                    if any_non_null {
+                        let block_cant_contribute = match order {
+                            super::simd_top_k::DetectedOrder::Desc => block_max <= threshold,
+                            super::simd_top_k::DetectedOrder::Asc => block_min >= threshold,
+                            super::simd_top_k::DetectedOrder::Unknown => false,
+                        };
+                        if block_cant_contribute {
+                            if docs.len() > BLOCK {
+                                self.compute_block_sort_keys_and_collect(
+                                    &docs[BLOCK..],
+                                    top_n_computer,
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         for i in 0..n {
             let doc = docs[i];
             let sort_key = scratch[i];
@@ -738,6 +805,117 @@ mod tests {
             !sort.segment_can_be_skipped_by_threshold(&optional_col),
             "non-Full cardinality must never skip"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 25 — streaming-path block-level early prune end-to-end tests.
+    //
+    // The mechanism kicks in when (a) the segment skips the warm cache
+    // (num_docs < 1024 or > 256K — these tests pick 200 so the cap path
+    // is exercised), and (b) the TopNComputer's K-th threshold is set.
+    // Asserts results are byte-equivalent to the un-gated push and that
+    // edge cases (K ≥ num_docs, low-cardinality saturated columns) do
+    // not break correctness.
+    // -----------------------------------------------------------------
+    mod wave25_e2e {
+        use crate::Order;
+        use crate::collector::TopDocs;
+        use crate::query::AllQuery;
+        use crate::schema::{FAST, Schema};
+        use crate::{DocAddress, Index, doc};
+
+        fn build_numeric_index(values: &[i64]) -> crate::Result<Index> {
+            let mut schema_builder = Schema::builder();
+            let val = schema_builder.add_i64_field("val", FAST);
+            let schema = schema_builder.build();
+            let index = Index::create_in_ram(schema);
+            let mut writer = index.writer_for_tests()?;
+            for &v in values {
+                writer.add_document(doc!(val => v))?;
+            }
+            writer.commit()?;
+            Ok(index)
+        }
+
+        #[test]
+        fn wave25_streaming_block_skip_desc() -> crate::Result<()> {
+            // 200-doc segment forces the streaming path (warm cache only
+            // populates for [1024, WARM_FIRST_VALS_MAX_DOCS] docs). With
+            // ascending value-by-doc-id and K=5 desc, the heap's K-th
+            // tightens to ~195 within the first two blocks; block-level
+            // skip should fire on the remaining blocks. Result must be
+            // byte-identical to the un-gated push.
+            let values: Vec<i64> = (0..200).collect();
+            let index = build_numeric_index(&values)?;
+            let searcher = index.reader()?.searcher();
+            let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+                &AllQuery,
+                &TopDocs::with_limit(5).order_by_fast_field::<i64>("val", Order::Desc),
+            )?;
+            let vals: Vec<i64> = top.iter().filter_map(|(v, _)| *v).collect();
+            assert_eq!(vals, vec![199, 198, 197, 196, 195]);
+            Ok(())
+        }
+
+        #[test]
+        fn wave25_streaming_block_skip_asc() -> crate::Result<()> {
+            // Same as desc but asc: heap's K-th tightens to ~4 after a
+            // couple of blocks; subsequent blocks all have min >= 4 and
+            // should skip. Top-5 asc = [0, 1, 2, 3, 4].
+            let values: Vec<i64> = (0..200).collect();
+            let index = build_numeric_index(&values)?;
+            let searcher = index.reader()?.searcher();
+            let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+                &AllQuery,
+                &TopDocs::with_limit(5).order_by_fast_field::<i64>("val", Order::Asc),
+            )?;
+            let vals: Vec<i64> = top.iter().filter_map(|(v, _)| *v).collect();
+            assert_eq!(vals, vec![0, 1, 2, 3, 4]);
+            Ok(())
+        }
+
+        #[test]
+        fn wave25_low_cardinality_saturated_desc() -> crate::Result<()> {
+            // The `sort-status-*` defeat shape: 6 distinct values, the
+            // top value (500) dominates. With K=10 desc, the heap fills
+            // with `500`s in the first block (~22 docs of status=500 in
+            // a uniform 200-doc sample); from block 2 onwards, all
+            // blocks have max == 500 ≤ threshold = 500 → skip every
+            // block. Result correctness: top-10 must all be 500.
+            let mut values: Vec<i64> = Vec::new();
+            let statuses: [i64; 6] = [200, 301, 302, 304, 404, 500];
+            for i in 0..200 {
+                values.push(statuses[i % 6]);
+            }
+            let index = build_numeric_index(&values)?;
+            let searcher = index.reader()?.searcher();
+            let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+                &AllQuery,
+                &TopDocs::with_limit(10).order_by_fast_field::<i64>("val", Order::Desc),
+            )?;
+            assert_eq!(top.len(), 10);
+            for (v, _) in &top {
+                assert_eq!(*v, Some(500), "all top-10 must be the max value 500");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn wave25_k_exceeds_doc_count_no_skip() -> crate::Result<()> {
+            // K > num_docs: heap never fills, threshold stays `None`,
+            // block-skip predicate never fires (guarded by
+            // `top_n_computer.threshold.is_some()`). All 200 docs must
+            // come back.
+            let values: Vec<i64> = (0..200).collect();
+            let index = build_numeric_index(&values)?;
+            let searcher = index.reader()?.searcher();
+            let top: Vec<(Option<i64>, DocAddress)> = searcher.search(
+                &AllQuery,
+                &TopDocs::with_limit(500).order_by_fast_field::<i64>("val", Order::Desc),
+            )?;
+            assert_eq!(top.len(), 200);
+            Ok(())
+        }
     }
 
     #[test]

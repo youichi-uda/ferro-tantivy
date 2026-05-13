@@ -1,10 +1,17 @@
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use columnar::Column;
+use columnar::{Cardinality, Column};
 
 use crate::collector::sort_key::{Comparator, NaturalComparator};
-use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
+use crate::collector::sort_key_top_collector::TopBySortKeySegmentCollector;
+use crate::collector::{
+    default_collect_segment_impl, SegmentCollector as _, SegmentSortKeyComputer, SortKeyComputer,
+    TopNComputer,
+};
 use crate::fastfield::{FastFieldNotAvailableError, FastValue};
+use crate::DocAddress;
 use crate::{DocId, Score, SegmentReader};
 
 /// Sorts by a fast value (u64, i64, f64, bool).
@@ -45,6 +52,24 @@ pub struct SortByStaticFastValue<T: FastValue> {
     /// True = ascending sort (skip docs with value <= cursor),
     /// False = descending sort (skip docs with value >= cursor).
     cursor_is_asc: bool,
+    /// **Wave 24.** Cross-segment running top-K threshold (best-effort skip
+    /// gate). When set, [`SortKeyComputer::should_skip_segment`] compares
+    /// the column's `[min, max]` to the most-recent K-th value submitted by
+    /// any sibling segment and skips the entire segment when no doc can
+    /// possibly enter the global top-K. Each call to
+    /// [`Self::collect_segment_top_k`] tightens the threshold via an
+    /// atomic `fetch_max` (desc) / `fetch_min` (asc) so later segments see
+    /// the latest gate. Parallel segments race on initial load, so the
+    /// gate is *best-effort*: it never produces a wrong result (the
+    /// merge-fruits step always picks the global top-K), it only saves
+    /// work.
+    running_threshold: Option<Arc<AtomicU64>>,
+    /// Threshold direction. `true` = descending top-K (keep largest values,
+    /// threshold = current min of top-K, tightened via `fetch_max`).
+    /// `false` = ascending top-K (keep smallest values, threshold = current
+    /// max of top-K, tightened via `fetch_min`). Must match the [`Order`]
+    /// the caller will wrap this computer in.
+    threshold_is_desc: bool,
 }
 
 impl<T: FastValue> SortByStaticFastValue<T> {
@@ -55,6 +80,8 @@ impl<T: FastValue> SortByStaticFastValue<T> {
             typ: PhantomData,
             cursor_u64: None,
             cursor_is_asc: true,
+            running_threshold: None,
+            threshold_is_desc: false,
         }
     }
 
@@ -65,6 +92,105 @@ impl<T: FastValue> SortByStaticFastValue<T> {
         self.cursor_u64 = Some(cursor_value.to_u64());
         self.cursor_is_asc = is_asc;
         self
+    }
+
+    /// **Wave 24.** Enable cross-segment top-K skip via a shared atomic
+    /// threshold. `is_desc` MUST match the [`Order`] this computer will be
+    /// wrapped in by the collector (asc-order callers pass `false`,
+    /// desc-order pass `true`). Initial threshold is `u64::MIN` for desc
+    /// and `u64::MAX` for asc, so the first segment never skips itself.
+    ///
+    /// Returns `self` with `running_threshold = Some(Arc::new(...))`;
+    /// callers that clone or share the computer across segments inherit
+    /// the same atomic via `Arc::clone`.
+    pub fn with_running_threshold(mut self, is_desc: bool) -> Self {
+        let init = if is_desc { u64::MIN } else { u64::MAX };
+        self.running_threshold = Some(Arc::new(AtomicU64::new(init)));
+        self.threshold_is_desc = is_desc;
+        self
+    }
+
+    /// **Wave 24.** `[min, max]` probe identical to Wave 22's cursor
+    /// variant: returns `true` iff no doc in this segment can enter the
+    /// global top-K given the most-recent K-th value seen by sibling
+    /// segments. Conservative on cardinality (`Full` only — see
+    /// `SortByStaticFastValueWithCursor::segment_can_be_skipped` for the
+    /// invariants); falls through to the regular collection path
+    /// otherwise.
+    #[inline]
+    fn segment_can_be_skipped_by_threshold(&self, sort_column: &Column<u64>) -> bool {
+        let Some(thresh) = self.running_threshold.as_ref() else {
+            return false;
+        };
+        if !matches!(sort_column.get_cardinality(), Cardinality::Full) {
+            return false;
+        }
+        let min_v = sort_column.values.min_value();
+        let max_v = sort_column.values.max_value();
+        let threshold_value = thresh.load(Ordering::Relaxed);
+        if self.threshold_is_desc {
+            // Desc: top-K keeps largest. Threshold = current K-th (smallest
+            // in top-K seen so far). Entry requires strict `> threshold`,
+            // so a segment with `max <= threshold` cannot contribute.
+            max_v <= threshold_value
+        } else {
+            // Asc: top-K keeps smallest. Threshold = current K-th (largest
+            // in top-K seen so far). Entry requires strict `< threshold`,
+            // so a segment with `min >= threshold` cannot contribute.
+            min_v >= threshold_value
+        }
+    }
+
+    /// **Wave 24.** After a segment's top-K is materialized, tighten the
+    /// global threshold using this segment's K-th value (worst rank among
+    /// the K kept). `fetch_max` for desc and `fetch_min` for asc are both
+    /// monotone, so concurrent segments racing to publish never weaken the
+    /// gate.
+    ///
+    /// Skips the update when:
+    /// - no running threshold was configured;
+    /// - the segment returned fewer than `k` entries (the gate would not
+    ///   be a true K-th);
+    /// - every kept entry has a `None` sort key (null-only segment carries
+    ///   no useful threshold information).
+    fn tighten_threshold_after_collect(&self, k: usize, segment_top_k: &[(Option<T>, DocAddress)]) {
+        let Some(thresh) = self.running_threshold.as_ref() else {
+            return;
+        };
+        if segment_top_k.len() < k {
+            return;
+        }
+        // The K-th value (worst kept) is the segment's contribution to the
+        // global threshold. For desc we want the *minimum* non-null kept
+        // value; for asc, the *maximum*. Scanning is `O(k)` — k is the
+        // top-K parameter, typically ≤ 10⁴ — and avoids a brittle
+        // dependency on TopNComputer's harvest order.
+        let kth_u64 = if self.threshold_is_desc {
+            segment_top_k
+                .iter()
+                .filter_map(|(v, _)| v.map(T::to_u64))
+                .min()
+        } else {
+            segment_top_k
+                .iter()
+                .filter_map(|(v, _)| v.map(T::to_u64))
+                .max()
+        };
+        if let Some(kth) = kth_u64 {
+            if self.threshold_is_desc {
+                thresh.fetch_max(kth, Ordering::Relaxed);
+            } else {
+                thresh.fetch_min(kth, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Test hook: read the current running threshold u64 (if configured).
+    #[cfg(test)]
+    pub(crate) fn current_threshold(&self) -> Option<u64> {
+        self.running_threshold
+            .as_ref()
+            .map(|t| t.load(Ordering::Relaxed))
     }
 }
 
@@ -93,6 +219,53 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
             )));
         }
         Ok(())
+    }
+
+    /// **Wave 24.** Cross-segment top-K skip gate. Mirrors the Wave 22
+    /// cursor probe in [`SortByStaticFastValueWithCursor`] but reads its
+    /// threshold from a per-query [`AtomicU64`] tightened by sibling
+    /// segments rather than from a constant cursor value. Cheap: only the
+    /// column-codec stats are touched. Returns `false` (no skip) when no
+    /// running threshold is configured, so the trait default path through
+    /// the `(_, Order)` wrapper is preserved for non-Wave-24 callers.
+    fn should_skip_segment(&self, segment_reader: &SegmentReader) -> bool {
+        if self.running_threshold.is_none() {
+            return false;
+        }
+        match segment_reader.fast_fields().u64_lenient(&self.field) {
+            Ok(Some((sort_column, _))) => self.segment_can_be_skipped_by_threshold(&sort_column),
+            _ => false,
+        }
+    }
+
+    /// **Wave 24.** Override the default top-K collection just enough to
+    /// tighten the running threshold after each segment finishes. The
+    /// body mirrors the trait's default impl (Wave 8 block-mode and Wave
+    /// 19 warm cache are inherited via `segment_sort_key_computer`); the
+    /// only added work is one `O(k)` scan over the harvested top-K plus a
+    /// relaxed atomic.
+    fn collect_segment_top_k(
+        &self,
+        k: usize,
+        weight: &dyn crate::query::Weight,
+        reader: &crate::SegmentReader,
+        segment_ord: u32,
+    ) -> crate::Result<Vec<(Self::SortKey, DocAddress)>> {
+        if self.should_skip_segment(reader) {
+            return Ok(Vec::new());
+        }
+        let with_scoring = self.requires_scoring();
+        let segment_sort_key_computer = self.segment_sort_key_computer(reader)?;
+        let topn_computer = TopNComputer::new_with_comparator(k, self.comparator());
+        let mut segment_top_key_collector = TopBySortKeySegmentCollector {
+            topn_computer,
+            segment_ord,
+            segment_sort_key_computer,
+        };
+        default_collect_segment_impl(&mut segment_top_key_collector, weight, reader, with_scoring)?;
+        let result = segment_top_key_collector.harvest();
+        self.tighten_threshold_after_collect(k, &result);
+        Ok(result)
     }
 
     fn segment_sort_key_computer(
@@ -422,7 +595,149 @@ mod tests {
     use columnar::column_values::VecColumn;
     use columnar::{Column, ColumnIndex};
 
-    use super::{warm_first_values, WARM_FIRST_VALS_MAX_DOCS};
+    use super::{warm_first_values, SortByStaticFastValue, WARM_FIRST_VALS_MAX_DOCS};
+    use crate::DocAddress;
+
+    fn column_with_values(vs: Vec<u64>) -> Column<u64> {
+        Column {
+            index: ColumnIndex::Full,
+            values: Arc::new(VecColumn::from(vs)),
+        }
+    }
+
+    fn doc_addr(doc: u32) -> DocAddress {
+        DocAddress {
+            segment_ord: 0,
+            doc_id: doc,
+        }
+    }
+
+    #[test]
+    fn wave24_no_threshold_does_not_skip() {
+        // Default constructor — no running threshold. The probe must always
+        // return false so callers that opt out of Wave 24 keep the old
+        // behaviour (no skip).
+        let sort = SortByStaticFastValue::<u64>::for_field("x");
+        let col = column_with_values(vec![10, 20, 30, 40]);
+        assert!(!sort.segment_can_be_skipped_by_threshold(&col));
+        assert_eq!(sort.current_threshold(), None);
+    }
+
+    #[test]
+    fn wave24_threshold_desc_skips_when_segment_max_at_or_below() {
+        // Desc top-K wants the largest values. After earlier segments
+        // tighten the threshold to 50, a segment whose max is 50 (tie with
+        // the K-th — strict ">", so still skip) or below cannot contribute.
+        let sort = SortByStaticFastValue::<u64>::for_field("x").with_running_threshold(true);
+        sort.tighten_threshold_after_collect(
+            2,
+            &[(Some(100u64), doc_addr(0)), (Some(50u64), doc_addr(1))],
+        );
+        assert_eq!(sort.current_threshold(), Some(50));
+
+        // Segment with max == 50 → skipped (strict-> entry).
+        assert!(sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![10, 30, 50])));
+        // Segment with max == 51 → cannot skip.
+        assert!(!sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![10, 30, 51])));
+    }
+
+    #[test]
+    fn wave24_threshold_asc_skips_when_segment_min_at_or_above() {
+        // Asc top-K wants the smallest values. K-th is the max in top-K.
+        let sort = SortByStaticFastValue::<u64>::for_field("x").with_running_threshold(false);
+        sort.tighten_threshold_after_collect(
+            2,
+            &[(Some(10u64), doc_addr(0)), (Some(50u64), doc_addr(1))],
+        );
+        assert_eq!(sort.current_threshold(), Some(50));
+
+        assert!(sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![50, 80, 100])));
+        assert!(!sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![49, 80, 100])));
+    }
+
+    #[test]
+    fn wave24_tighten_is_monotone_desc() {
+        // Desc tightens via fetch_max — looser submissions never weaken the
+        // gate even if a slower segment finishes after a tighter one.
+        let sort = SortByStaticFastValue::<u64>::for_field("x").with_running_threshold(true);
+        sort.tighten_threshold_after_collect(
+            2,
+            &[(Some(100u64), doc_addr(0)), (Some(80u64), doc_addr(1))],
+        );
+        assert_eq!(sort.current_threshold(), Some(80));
+
+        // Subsequent segment with K-th = 30 — strictly worse than current 80.
+        sort.tighten_threshold_after_collect(
+            2,
+            &[(Some(50u64), doc_addr(2)), (Some(30u64), doc_addr(3))],
+        );
+        assert_eq!(
+            sort.current_threshold(),
+            Some(80),
+            "fetch_max keeps the tighter (larger) value"
+        );
+
+        // Subsequent segment with K-th = 90 — strictly better.
+        sort.tighten_threshold_after_collect(
+            2,
+            &[(Some(110u64), doc_addr(4)), (Some(90u64), doc_addr(5))],
+        );
+        assert_eq!(sort.current_threshold(), Some(90));
+    }
+
+    #[test]
+    fn wave24_tighten_skips_when_fewer_than_k() {
+        // Partial top-K (segment didn't fill K slots) is not a valid global
+        // threshold — would loosen the gate. Must be a no-op.
+        let sort = SortByStaticFastValue::<u64>::for_field("x").with_running_threshold(true);
+        // Seed a known-good threshold first.
+        sort.tighten_threshold_after_collect(
+            2,
+            &[(Some(100u64), doc_addr(0)), (Some(80u64), doc_addr(1))],
+        );
+        assert_eq!(sort.current_threshold(), Some(80));
+
+        // Now submit a partial top-K (1 entry, k=2): no update.
+        sort.tighten_threshold_after_collect(2, &[(Some(50u64), doc_addr(2))]);
+        assert_eq!(sort.current_threshold(), Some(80));
+    }
+
+    #[test]
+    fn wave24_tighten_ignores_all_null_segments() {
+        // A segment that only matched null-valued docs returns top-K with
+        // `Option::None` sort keys. Nulls sort last by design (see Wave 8
+        // doc-comment) so they should not contribute to the gate.
+        let sort = SortByStaticFastValue::<u64>::for_field("x").with_running_threshold(true);
+        sort.tighten_threshold_after_collect(
+            2,
+            &[(None::<u64>, doc_addr(0)), (None::<u64>, doc_addr(1))],
+        );
+        assert_eq!(
+            sort.current_threshold(),
+            Some(u64::MIN),
+            "initial threshold preserved when no non-null values to publish"
+        );
+    }
+
+    #[test]
+    fn wave24_skip_requires_full_cardinality() {
+        // Optional / Multivalued columns may emit `None` for some docs;
+        // skipping such a segment would silently drop the null-sort-last
+        // docs. Guard mirrors the Wave 22 cursor probe.
+        let sort = SortByStaticFastValue::<u64>::for_field("x").with_running_threshold(true);
+        sort.tighten_threshold_after_collect(
+            2,
+            &[(Some(100u64), doc_addr(0)), (Some(80u64), doc_addr(1))],
+        );
+        let optional_col = Column {
+            index: ColumnIndex::Empty { num_docs: 4 },
+            values: Arc::new(VecColumn::from(Vec::<u64>::new())),
+        };
+        assert!(
+            !sort.segment_can_be_skipped_by_threshold(&optional_col),
+            "non-Full cardinality must never skip"
+        );
+    }
 
     #[test]
     fn warm_first_values_full_column() {

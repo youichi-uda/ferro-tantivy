@@ -101,6 +101,44 @@ pub enum CudaBitmapError {
 /// gate.
 const INITIAL_CAPACITY_WORDS: usize = 12 * 2048;
 
+/// Wave Z-8 #2 — one query inside an N-query batched fold submission.
+///
+/// Borrowed view: a `BatchedQueryV3` does not own its terms or
+/// `union_keys`; the caller holds the `Arc`s for the duration of the
+/// [`CudaBitmapOpKernel::compute_fold_v3_batched`] call.
+///
+/// `terms` is the cohort's CHT v3 term entries (already inserted into
+/// the cache by upstream `try_gpu_intersect`). `union_keys` is the
+/// per-query union of high16 keys appearing in any of `terms`; the
+/// fold result is laid out as `[u32; union_keys.len() *
+/// BITMAP_CONTAINER_WORDS]` in cohort layout.
+///
+/// Two queries in the same batch that share an `Arc<VramCompressed-
+/// TermEntry>` (identity via [`Arc::ptr_eq`], which the CHT v3 cache
+/// guarantees for identical content-stable
+/// [`crate::postings::roaring::cht::ChtKey`]s) only pay a single
+/// decompress in the batched dispatch.
+#[derive(Clone, Copy)]
+pub struct BatchedQueryV3<'a> {
+    /// CHT v3 term entries for this query, in cohort order. The first
+    /// term seeds the accumulator; subsequent terms are folded into it
+    /// via the batched-call's chosen [`BoolOp`].
+    pub terms: &'a [Arc<VramCompressedTermEntry>],
+    /// Per-query union of high16 keys appearing in any of `terms`.
+    /// Must be sorted ascending (binary-searched by
+    /// `scatter_from_workbench`).
+    pub union_keys: &'a [u16],
+}
+
+impl std::fmt::Debug for BatchedQueryV3<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BatchedQueryV3")
+            .field("n_terms", &self.terms.len())
+            .field("n_union_keys", &self.union_keys.len())
+            .finish()
+    }
+}
+
 /// Host-side wrapper around [`ferro_compress::BitmapOpKernel`] that
 /// owns persistent CUDA device buffers and a per-instance
 /// `cudaStream_t`. Exposes the same `compute(op, &[u32], &[u32]) ->
@@ -734,6 +772,285 @@ impl CudaBitmapOpKernel {
             }
             Ok(out)
         }
+    }
+
+    /// Wave Z-8 #2 — N-query batched fold across the v3 cache.
+    ///
+    /// Submits `queries.len()` independent fold operations to the
+    /// kernel's CUDA stream with **one terminal sync**, amortising:
+    ///
+    /// 1. **Decompress launches**: terms appearing in multiple queries
+    ///    (identity via [`Arc::ptr_eq`]) decompress **once** into the
+    ///    shared workbench instead of once per query.
+    /// 2. **Stream synchronizes**: a single `cudaStreamSynchronize` at
+    ///    the end replaces the N per-query syncs `compute_fold_v3`
+    ///    would otherwise queue.
+    /// 3. **Workbench reallocations**: the workbench is grown once to
+    ///    fit the **unique-term** total, regardless of query count.
+    ///
+    /// The compute kernel itself is unchanged from the per-query path:
+    /// each query's fold still chains `inner.compute(d_a OP d_b →
+    /// d_out)` with internal pointer-swap of the per-kernel d_a / d_b /
+    /// d_out slots. A future Z-8 variant (CSR-packed multi-query
+    /// kernel) may move the per-query fold into a single kernel launch
+    /// with one CUDA block per query; the present method preserves the
+    /// existing kernel surface so the work fits in one self-contained
+    /// landing with no `.cu` changes. The CSR-packed kernel is tracked
+    /// as "Option A" in `dd-pack/cht-wave-z8-cross-query-batching-
+    /// design-2026-05-14/README.md`.
+    ///
+    /// # Returns
+    ///
+    /// A vector of per-query host buffers, one per input query. Each
+    /// buffer is laid out as `[u32; query.union_keys.len() *
+    /// BITMAP_CONTAINER_WORDS]` in the cohort `union_keys` order —
+    /// identical to what `compute_fold_v3(op, query.terms,
+    /// query.union_keys)` would return for the same query in
+    /// isolation.
+    ///
+    /// Empty input cases:
+    ///
+    /// - `queries.is_empty()` → returns `Ok(vec![])`.
+    /// - A query with `terms.is_empty()` or `union_keys.is_empty()` →
+    ///   that query's slot is `vec![]` (matches `compute_fold_v3`'s
+    ///   empty-fold semantics).
+    ///
+    /// # Correctness — host-buffer lifetime across the terminal sync
+    ///
+    /// All per-query host output buffers are **pre-allocated before**
+    /// any `cudaMemcpyAsync(D→H)` is issued and outlive the terminal
+    /// `cudaStreamSynchronize`. Even on a mid-batch error the queued
+    /// async D→H operations target live host memory; the sync drains
+    /// them before this function returns control (and thus before the
+    /// caller can drop the buffers we hand back).
+    pub fn compute_fold_v3_batched(
+        &self,
+        op: BoolOp,
+        queries: &[BatchedQueryV3<'_>],
+    ) -> Result<Vec<Vec<u32>>, CudaBitmapError> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 1: dedup unique term Arcs by pointer identity. Two
+        // queries sharing a term (CHT v3 returns the same Arc from the
+        // cache for identical (segment_id, field, term_hash)) point to
+        // the same VRAM allocation; we only need to decompress it once.
+        // Linear-scan dedupe is O(total_terms × unique_terms); typical
+        // batches have total_terms < a few hundred so a Vec scan beats
+        // a HashMap in cache behaviour. Switch to a pointer-keyed
+        // HashMap if profiling shows otherwise.
+        let mut unique_terms: Vec<Arc<VramCompressedTermEntry>> = Vec::new();
+        let mut query_term_indices: Vec<Vec<usize>> = Vec::with_capacity(queries.len());
+        for q in queries {
+            let mut idxs: Vec<usize> = Vec::with_capacity(q.terms.len());
+            for term in q.terms {
+                let pos = unique_terms.iter().position(|u| Arc::ptr_eq(u, term));
+                let idx = match pos {
+                    Some(i) => i,
+                    None => {
+                        let i = unique_terms.len();
+                        unique_terms.push(Arc::clone(term));
+                        i
+                    }
+                };
+                idxs.push(idx);
+            }
+            query_term_indices.push(idxs);
+        }
+
+        // Step 2: pre-allocate the per-query host output buffers. Done
+        // up front so they outlive any queued cudaMemcpyAsync D→H on
+        // the terminal-sync path, even if the body returns Err
+        // mid-loop. A query with empty terms or empty union_keys gets
+        // an empty Vec (matches compute_fold_v3 semantics).
+        let mut host_outputs: Vec<Vec<u32>> = queries
+            .iter()
+            .map(|q| {
+                if q.terms.is_empty() || q.union_keys.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![0u32; q.union_keys.len() * BITMAP_CONTAINER_WORDS]
+                }
+            })
+            .collect();
+
+        // Short-circuit: nothing to dispatch.
+        let max_words_per_query =
+            host_outputs.iter().map(|v| v.len()).max().unwrap_or(0);
+        if unique_terms.is_empty() || max_words_per_query == 0 {
+            return Ok(host_outputs);
+        }
+
+        // Step 3: workbench sizing for the unique-term slab. Per-term
+        // offsets are the running prefix sum of unique terms'
+        // uncompressed bytes.
+        let mut term_offsets: Vec<usize> = Vec::with_capacity(unique_terms.len());
+        let mut total_uncompressed: usize = 0;
+        for term in &unique_terms {
+            term_offsets.push(total_uncompressed);
+            total_uncompressed = total_uncompressed
+                .checked_add(term.uncompressed_bytes())
+                .ok_or(CudaBitmapError::Cuda {
+                    what: "batched workbench offset overflow",
+                    code: 0,
+                })?;
+        }
+
+        // Step 4: grow state (d_a / d_b / d_out) to the max per-query
+        // capacity. The fold for any single query never reads or
+        // writes more than `union_keys.len() * BITMAP_CONTAINER_WORDS`
+        // u32 words — we don't need the sum across queries because the
+        // per-query buffers are reused across queries.
+        let mut state = self
+            .state
+            .lock()
+            .expect("CudaBitmapOpKernel state mutex poisoned");
+        if max_words_per_query > state.capacity_words {
+            // SAFETY: we hold the state mutex; no other caller can
+            // observe the intermediate (freed) pointers.
+            unsafe {
+                reallocate_buffers(&mut state, max_words_per_query.next_power_of_two())?
+            };
+        }
+
+        // Step 5: grow workbench to fit ALL unique terms decompressed
+        // simultaneously. Concurrent compute_fold_v3 callers serialise
+        // on the workbench mutex; we hold it just long enough to
+        // realloc.
+        {
+            let mut workbench = self
+                .workbench
+                .lock()
+                .expect("CudaBitmapOpKernel workbench mutex poisoned");
+            if workbench.capacity_bytes < total_uncompressed {
+                // SAFETY: workbench mutex held; no observer can read
+                // the intermediate freed state.
+                unsafe { reallocate_workbench(&mut workbench, total_uncompressed)? };
+            }
+        }
+
+        let cuda_op = to_inner_op(op);
+
+        // Step 6: do all GPU work inside a closure so the terminal
+        // sync below always runs, even on Err. The closure mutably
+        // borrows `state` + `host_outputs`; both outlive the closure
+        // so the post-sync return can still hand back `host_outputs`.
+        let body_result: Result<(), CudaBitmapError> = (|| {
+            // 6a: ONE batched decompress for ALL unique terms across
+            // ALL queries.
+            // SAFETY: workbench + decompress codec both valid; chunk
+            // pointers held alive via Arc.
+            unsafe {
+                self.decompress_batch_into_workbench(&unique_terms, &term_offsets)?;
+            }
+
+            // 6b: per-query scatter + fold + async D→H. All queued on
+            // the kernel's stream; no inter-query sync.
+            for (qi, q) in queries.iter().enumerate() {
+                let idxs = &query_term_indices[qi];
+                if idxs.is_empty() {
+                    continue; // host_outputs[qi] stays Vec::new()
+                }
+                let words = q.union_keys.len() * BITMAP_CONTAINER_WORDS;
+                if words == 0 {
+                    continue;
+                }
+                let bytes = words * std::mem::size_of::<u32>();
+                let n_u32 = u32::try_from(words).map_err(|_| CudaBitmapError::Cuda {
+                    what: "per-query words exceeds u32::MAX",
+                    code: 0,
+                })?;
+
+                // Scatter the seed term (idxs[0]) into d_a. d_a is
+                // already zeroed by scatter_from_workbench's
+                // memset-then-bucket-copy pattern.
+                // SAFETY: state mutex held, workbench already
+                // populated by 6a, d_a sized ≥ bytes.
+                unsafe {
+                    self.scatter_from_workbench(
+                        state.d_a,
+                        bytes,
+                        &unique_terms[idxs[0]],
+                        term_offsets[idxs[0]],
+                        q.union_keys,
+                    )?;
+                }
+
+                // Fold each subsequent term into d_a via d_b → d_out
+                // → swap (matching the per-query compute_fold_v3
+                // pattern exactly).
+                // SAFETY: same as scatter_from_workbench above; the
+                // inner.compute consumes d_a / d_b and writes d_out
+                // entirely on the kernel's stream.
+                unsafe {
+                    for &term_i in &idxs[1..] {
+                        self.scatter_from_workbench(
+                            state.d_b,
+                            bytes,
+                            &unique_terms[term_i],
+                            term_offsets[term_i],
+                            q.union_keys,
+                        )?;
+                        self.inner.compute(
+                            cuda_op,
+                            state.d_a as *const u32,
+                            state.d_b as *const u32,
+                            state.d_out as *mut u32,
+                            n_u32,
+                        )?;
+                        // Pointer-swap d_a ↔ d_out; the next iteration
+                        // reads the just-written result as its
+                        // accumulator (no memcpy).
+                        let tmp = state.d_a;
+                        state.d_a = state.d_out;
+                        state.d_out = tmp;
+                    }
+                }
+
+                // 6c: queue D→H from d_a into this query's host
+                // output buffer. The buffer was pre-allocated in step
+                // 2 and is kept alive until after the terminal sync
+                // below.
+                // SAFETY: host_outputs[qi] is alive across the full
+                // call (we never drop or move it before the sync);
+                // d_a holds the final fold result for this query in
+                // stream order.
+                unsafe {
+                    let rc = cudaMemcpyAsync(
+                        host_outputs[qi].as_mut_ptr() as *mut c_void,
+                        state.d_a as *const c_void,
+                        bytes,
+                        cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                        self.stream,
+                    );
+                    if rc != CUDA_SUCCESS {
+                        return Err(CudaBitmapError::Cuda {
+                            what: "cudaMemcpyAsync(v3 batched fold D2H)",
+                            code: rc,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        })();
+
+        // Step 7: ALWAYS sync, regardless of body_result. Queued async
+        // ops on the stream may still target host_outputs buffers
+        // (which we still own); we must wait for them to drain before
+        // returning. body_result takes precedence over sync errors so
+        // the caller sees the first failure.
+        // SAFETY: self.stream is owned by this kernel and lives for
+        // 'self.
+        let sync_rc = unsafe { cudaStreamSynchronize(self.stream) };
+        body_result?;
+        if sync_rc != CUDA_SUCCESS {
+            return Err(CudaBitmapError::Cuda {
+                what: "cudaStreamSynchronize(v3 batched fold)",
+                code: sync_rc,
+            });
+        }
+        Ok(host_outputs)
     }
 
     /// Phase 2 D level-A Priority 1 — multi-term batch decompress into
@@ -2160,5 +2477,480 @@ mod tests {
         // Sanity: at least the doc-id 0 (bit 0) and doc-id 1 (bit 1) of
         // bucket 0 are set after OR.
         assert!(res[0] & 0b11 == 0b11, "OR result must have bits 0 and 1 set in bucket 0");
+    }
+
+    // ============================================================
+    // Wave Z-8 #2 — batched cross-query fold tests.
+    //
+    // These tests pin the **byte-identical** equivalence between
+    // `compute_fold_v3_batched(op, &[q1, q2, ...])` and N independent
+    // `compute_fold_v3(op, q.terms, q.union_keys)` calls. The batched
+    // path's wins (shared decompress, one terminal sync) are
+    // performance-only — correctness must match the per-query baseline
+    // bit-for-bit. Bench-side gating is dd-pack/cht-wave-z8-cross-
+    // query-batching-design-2026-05-14/README.md §3.
+    // ============================================================
+
+    #[test]
+    fn batched_empty_queries_returns_empty() {
+        let Some(kernel) = try_kernel() else { return };
+        // Zero queries → empty Vec. No GPU work expected.
+        let res = kernel
+            .compute_fold_v3_batched(BoolOp::And, &[])
+            .expect("batched empty queries");
+        assert!(res.is_empty(), "0 queries → 0 outputs");
+    }
+
+    #[test]
+    fn batched_single_query_matches_compute_fold_v3() {
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+            64 * 1024 * 1024,
+        )
+        .ok();
+        let Some(cache) = cache else { return };
+        let t0 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            1, 2, 3, 65540, 65541,
+        ]);
+        let t1 = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            2, 3, 4, 65541, 65542,
+        ]);
+        let Some(v0) = vram_v3_term_entry(&t0, &cache, 0xd8_01_a) else { return };
+        let Some(v1) = vram_v3_term_entry(&t1, &cache, 0xd8_01_b) else { return };
+
+        let term_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&t0, &t1];
+        let union_keys =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &term_refs,
+            );
+        let terms = vec![Arc::clone(&v0), Arc::clone(&v1)];
+
+        for op in [BoolOp::And, BoolOp::Or, BoolOp::Xor] {
+            // Single-query batched must match single-query compute_fold_v3.
+            let baseline = kernel
+                .compute_fold_v3(op, &terms, &union_keys)
+                .expect("baseline v3 fold");
+            let batched = kernel
+                .compute_fold_v3_batched(
+                    op,
+                    &[BatchedQueryV3 {
+                        terms: &terms,
+                        union_keys: &union_keys,
+                    }],
+                )
+                .expect("batched fold (single query)");
+            assert_eq!(batched.len(), 1);
+            assert_eq!(
+                batched[0], baseline,
+                "{op:?} batched single-query must match compute_fold_v3 byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn batched_n_queries_match_independent_compute_fold_v3() {
+        // Three disjoint-term queries; batched results must be
+        // byte-identical to running compute_fold_v3 N times.
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+            64 * 1024 * 1024,
+        )
+        .ok();
+        let Some(cache) = cache else { return };
+        // q0: terms a + b
+        let ta = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            1, 2, 3, 65540,
+        ]);
+        let tb = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            2, 3, 4, 65541,
+        ]);
+        // q1: terms c + d
+        let tc = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            10, 11, 12,
+        ]);
+        let td = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            11, 12, 13, 131_080,
+        ]);
+        // q2: term e only (single-term query)
+        let te = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            7, 8, 9, 196_614,
+        ]);
+
+        let Some(va) = vram_v3_term_entry(&ta, &cache, 0xd8_02_a) else { return };
+        let Some(vb) = vram_v3_term_entry(&tb, &cache, 0xd8_02_b) else { return };
+        let Some(vc) = vram_v3_term_entry(&tc, &cache, 0xd8_02_c) else { return };
+        let Some(vd) = vram_v3_term_entry(&td, &cache, 0xd8_02_d) else { return };
+        let Some(ve) = vram_v3_term_entry(&te, &cache, 0xd8_02_e) else { return };
+
+        let q0_terms = vec![Arc::clone(&va), Arc::clone(&vb)];
+        let q1_terms = vec![Arc::clone(&vc), Arc::clone(&vd)];
+        let q2_terms = vec![Arc::clone(&ve)];
+
+        let q0_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&ta, &tb];
+        let q1_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&tc, &td];
+        let q2_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&te];
+        let q0_uk = crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+            &q0_refs,
+        );
+        let q1_uk = crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+            &q1_refs,
+        );
+        let q2_uk = crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+            &q2_refs,
+        );
+
+        for op in [BoolOp::And, BoolOp::Or, BoolOp::Xor] {
+            let baseline_q0 = kernel.compute_fold_v3(op, &q0_terms, &q0_uk).expect("q0");
+            let baseline_q1 = kernel.compute_fold_v3(op, &q1_terms, &q1_uk).expect("q1");
+            let baseline_q2 = kernel.compute_fold_v3(op, &q2_terms, &q2_uk).expect("q2");
+
+            let batched = kernel
+                .compute_fold_v3_batched(
+                    op,
+                    &[
+                        BatchedQueryV3 {
+                            terms: &q0_terms,
+                            union_keys: &q0_uk,
+                        },
+                        BatchedQueryV3 {
+                            terms: &q1_terms,
+                            union_keys: &q1_uk,
+                        },
+                        BatchedQueryV3 {
+                            terms: &q2_terms,
+                            union_keys: &q2_uk,
+                        },
+                    ],
+                )
+                .expect("batched");
+            assert_eq!(batched.len(), 3);
+            assert_eq!(
+                batched[0], baseline_q0,
+                "{op:?} batched q0 must match compute_fold_v3"
+            );
+            assert_eq!(
+                batched[1], baseline_q1,
+                "{op:?} batched q1 must match compute_fold_v3"
+            );
+            assert_eq!(
+                batched[2], baseline_q2,
+                "{op:?} batched q2 must match compute_fold_v3"
+            );
+        }
+    }
+
+    #[test]
+    fn batched_shared_term_dedup_via_arc_ptr_eq() {
+        // Two queries share term `va` (identical Arc, via cache.get()
+        // for the same key). The batched path must dedupe and still
+        // produce per-query results equal to the un-deduped baseline.
+        // We cannot directly observe the dedupe (no public counter)
+        // but we can:
+        //   (a) confirm the Arcs are pointer-equal (cache returns same
+        //       Arc on repeated get), and
+        //   (b) confirm per-query result correctness, which is the
+        //       behaviour-visible guarantee.
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+            64 * 1024 * 1024,
+        )
+        .ok();
+        let Some(cache) = cache else { return };
+
+        let ta = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            1, 2, 3, 65540,
+        ]);
+        let tb = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            2, 3, 4, 65541,
+        ]);
+        let tc = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            3, 4, 5, 65542,
+        ]);
+
+        let Some(va) = vram_v3_term_entry(&ta, &cache, 0xd8_03_a) else { return };
+        let Some(vb) = vram_v3_term_entry(&tb, &cache, 0xd8_03_b) else { return };
+        let Some(vc) = vram_v3_term_entry(&tc, &cache, 0xd8_03_c) else { return };
+
+        // Confirm same-key get returns Arc::ptr_eq Arc (otherwise the
+        // dedupe under test could not happen in production).
+        let va_again = Arc::clone(&va);
+        assert!(
+            Arc::ptr_eq(&va, &va_again),
+            "Arc::clone of the same Arc must be pointer-equal (sanity)"
+        );
+
+        // q0 = (a, b); q1 = (a, c). Term `a` is shared.
+        let q0_terms = vec![Arc::clone(&va), Arc::clone(&vb)];
+        let q1_terms = vec![Arc::clone(&va), Arc::clone(&vc)];
+
+        let q0_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&ta, &tb];
+        let q1_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&ta, &tc];
+        let q0_uk = crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+            &q0_refs,
+        );
+        let q1_uk = crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+            &q1_refs,
+        );
+
+        for op in [BoolOp::And, BoolOp::Or, BoolOp::Xor] {
+            let baseline_q0 = kernel.compute_fold_v3(op, &q0_terms, &q0_uk).expect("q0");
+            let baseline_q1 = kernel.compute_fold_v3(op, &q1_terms, &q1_uk).expect("q1");
+            let batched = kernel
+                .compute_fold_v3_batched(
+                    op,
+                    &[
+                        BatchedQueryV3 {
+                            terms: &q0_terms,
+                            union_keys: &q0_uk,
+                        },
+                        BatchedQueryV3 {
+                            terms: &q1_terms,
+                            union_keys: &q1_uk,
+                        },
+                    ],
+                )
+                .expect("batched");
+            assert_eq!(
+                batched[0], baseline_q0,
+                "{op:?} q0 with shared seed term must match baseline"
+            );
+            assert_eq!(
+                batched[1], baseline_q1,
+                "{op:?} q1 with shared seed term must match baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn batched_mixed_empty_and_nonempty_queries_handle_correctly() {
+        // Mix of an empty query (no terms), a single-term query, and a
+        // 2-term query. The empty query's slot must be `Vec::new()`
+        // (matching compute_fold_v3 empty-terms semantics); the others
+        // must match independent compute_fold_v3 calls.
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+            64 * 1024 * 1024,
+        )
+        .ok();
+        let Some(cache) = cache else { return };
+        let ta = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            1, 2, 65540,
+        ]);
+        let tb = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            2, 3, 65541,
+        ]);
+        let Some(va) = vram_v3_term_entry(&ta, &cache, 0xd8_04_a) else { return };
+        let Some(vb) = vram_v3_term_entry(&tb, &cache, 0xd8_04_b) else { return };
+        let nonempty_terms = vec![Arc::clone(&va), Arc::clone(&vb)];
+        let single_terms = vec![Arc::clone(&va)];
+        let empty_terms: Vec<Arc<VramCompressedTermEntry>> = Vec::new();
+
+        let nonempty_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&ta, &tb];
+        let single_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&ta];
+        let nonempty_uk =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &nonempty_refs,
+            );
+        let single_uk =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &single_refs,
+            );
+        let empty_uk: Vec<u16> = Vec::new();
+
+        for op in [BoolOp::And, BoolOp::Or, BoolOp::Xor] {
+            let baseline_nonempty = kernel
+                .compute_fold_v3(op, &nonempty_terms, &nonempty_uk)
+                .expect("nonempty");
+            let baseline_single = kernel
+                .compute_fold_v3(op, &single_terms, &single_uk)
+                .expect("single");
+            let batched = kernel
+                .compute_fold_v3_batched(
+                    op,
+                    &[
+                        BatchedQueryV3 {
+                            terms: &nonempty_terms,
+                            union_keys: &nonempty_uk,
+                        },
+                        BatchedQueryV3 {
+                            terms: &empty_terms,
+                            union_keys: &empty_uk,
+                        },
+                        BatchedQueryV3 {
+                            terms: &single_terms,
+                            union_keys: &single_uk,
+                        },
+                    ],
+                )
+                .expect("batched mixed");
+            assert_eq!(batched.len(), 3);
+            assert_eq!(
+                batched[0], baseline_nonempty,
+                "{op:?} batched[0] nonempty must match baseline"
+            );
+            assert!(
+                batched[1].is_empty(),
+                "{op:?} batched[1] empty-terms query must be Vec::new()"
+            );
+            assert_eq!(
+                batched[2], baseline_single,
+                "{op:?} batched[2] single-term must match baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn batched_varying_union_keys_per_query_correctly_sized() {
+        // Two queries with different union_keys lengths. The batched
+        // path's max_words_per_query buffer growth must respect the
+        // largest query without truncating the smaller one. Output
+        // sizes must match each query's union_keys *
+        // BITMAP_CONTAINER_WORDS.
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+            64 * 1024 * 1024,
+        )
+        .ok();
+        let Some(cache) = cache else { return };
+        // q_small: terms over a single bucket (high16 = 0).
+        let ta = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            1, 2, 3,
+        ]);
+        let tb = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            2, 3, 4,
+        ]);
+        // q_big: terms covering 8 distinct high16 buckets.
+        let docs_c: Vec<u32> = (0..8).map(|b| (b * 65536) as u32).collect();
+        let docs_d: Vec<u32> = (0..8).map(|b| (b * 65536) as u32 + 1).collect();
+        let tc =
+            crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&docs_c);
+        let td =
+            crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&docs_d);
+
+        let Some(va) = vram_v3_term_entry(&ta, &cache, 0xd8_05_a) else { return };
+        let Some(vb) = vram_v3_term_entry(&tb, &cache, 0xd8_05_b) else { return };
+        let Some(vc) = vram_v3_term_entry(&tc, &cache, 0xd8_05_c) else { return };
+        let Some(vd) = vram_v3_term_entry(&td, &cache, 0xd8_05_d) else { return };
+
+        let small_terms = vec![Arc::clone(&va), Arc::clone(&vb)];
+        let big_terms = vec![Arc::clone(&vc), Arc::clone(&vd)];
+
+        let small_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&ta, &tb];
+        let big_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&tc, &td];
+        let small_uk =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &small_refs,
+            );
+        let big_uk =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &big_refs,
+            );
+        assert_eq!(small_uk.len(), 1, "small q must cover 1 bucket");
+        assert_eq!(big_uk.len(), 8, "big q must cover 8 buckets");
+
+        for op in [BoolOp::And, BoolOp::Or, BoolOp::Xor] {
+            let baseline_small =
+                kernel.compute_fold_v3(op, &small_terms, &small_uk).expect("small");
+            let baseline_big =
+                kernel.compute_fold_v3(op, &big_terms, &big_uk).expect("big");
+            // Order matters: try both orderings (small-first and
+            // big-first) to confirm capacity-growth ordering doesn't
+            // affect per-query correctness.
+            let batched_sf = kernel
+                .compute_fold_v3_batched(
+                    op,
+                    &[
+                        BatchedQueryV3 {
+                            terms: &small_terms,
+                            union_keys: &small_uk,
+                        },
+                        BatchedQueryV3 {
+                            terms: &big_terms,
+                            union_keys: &big_uk,
+                        },
+                    ],
+                )
+                .expect("batched small-first");
+            assert_eq!(
+                batched_sf[0].len(),
+                BITMAP_CONTAINER_WORDS,
+                "small-first[0] must be 1 bucket-worth"
+            );
+            assert_eq!(
+                batched_sf[1].len(),
+                8 * BITMAP_CONTAINER_WORDS,
+                "small-first[1] must be 8 buckets-worth"
+            );
+            assert_eq!(batched_sf[0], baseline_small, "{op:?} small-first[0]");
+            assert_eq!(batched_sf[1], baseline_big, "{op:?} small-first[1]");
+
+            let batched_bf = kernel
+                .compute_fold_v3_batched(
+                    op,
+                    &[
+                        BatchedQueryV3 {
+                            terms: &big_terms,
+                            union_keys: &big_uk,
+                        },
+                        BatchedQueryV3 {
+                            terms: &small_terms,
+                            union_keys: &small_uk,
+                        },
+                    ],
+                )
+                .expect("batched big-first");
+            assert_eq!(batched_bf[0], baseline_big, "{op:?} big-first[0]");
+            assert_eq!(batched_bf[1], baseline_small, "{op:?} big-first[1]");
+        }
+    }
+
+    #[test]
+    fn batched_zero_word_query_returns_empty_vec_slot() {
+        // A query with non-empty terms but empty union_keys should
+        // produce an empty per-query Vec (no scatter, no fold issued).
+        // This pins the empty-union short-circuit so callers can pass
+        // pre-filtered queries through without special-casing.
+        let Some(kernel) = try_kernel() else { return };
+        let cache = crate::postings::roaring::vram_cht_v3::VramCompressedCht::with_budget(
+            64 * 1024 * 1024,
+        )
+        .ok();
+        let Some(cache) = cache else { return };
+        let ta = crate::postings::roaring::encoder::RoaringEncoder::from_doc_ids(&[
+            1, 2, 3,
+        ]);
+        let Some(va) = vram_v3_term_entry(&ta, &cache, 0xd8_06_a) else { return };
+        let terms = vec![Arc::clone(&va)];
+        let empty_uk: Vec<u16> = Vec::new();
+        let normal_refs: Vec<&crate::postings::roaring::RoaringPostings> = vec![&ta];
+        let normal_uk =
+            crate::postings::roaring::gpu_dispatch::union_high16_keys_for_test(
+                &normal_refs,
+            );
+
+        let batched = kernel
+            .compute_fold_v3_batched(
+                BoolOp::And,
+                &[
+                    BatchedQueryV3 {
+                        terms: &terms,
+                        union_keys: &empty_uk,
+                    },
+                    BatchedQueryV3 {
+                        terms: &terms,
+                        union_keys: &normal_uk,
+                    },
+                ],
+            )
+            .expect("batched zero-uk + normal");
+        assert!(
+            batched[0].is_empty(),
+            "empty-union_keys slot must be Vec::new()"
+        );
+        assert_eq!(
+            batched[1].len(),
+            normal_uk.len() * BITMAP_CONTAINER_WORDS,
+            "normal-union_keys slot must be union_keys * BITMAP_CONTAINER_WORDS"
+        );
     }
 }

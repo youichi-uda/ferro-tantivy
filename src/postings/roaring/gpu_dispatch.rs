@@ -563,6 +563,134 @@ pub fn try_gpu_bool_v3(
     None
 }
 
+/// Wave Z-8 #2 — N-query batched intersection on the v3 cache.
+///
+/// `queries[q]` is `q`'s already-resolved cohort of `Arc<Vram-
+/// CompressedTermEntry>`s; per-query `union_high16_keys` are computed
+/// internally before one batched
+/// [`super::cuda_dispatch::CudaBitmapOpKernel::compute_fold_v3_batched`]
+/// dispatch.
+///
+/// Returns `None` if any of:
+///
+/// - `queries.is_empty()`
+/// - any query has fewer than 2 terms (single-term doesn't benefit
+///   from intersection at all — the caller should short-circuit on the
+///   per-query path)
+/// - GPU resources are unavailable on this host
+///
+/// Otherwise returns `Some(out)` where `out.len() == queries.len()`
+/// and `out[q]` is the per-query intersection result as a
+/// [`RoaringPostings`], byte-identical to what
+/// [`try_gpu_bool_v3`]`(op, queries[q])` would return.
+///
+/// Each rejected-cohort branch increments the same
+/// `CPU_FALLBACK_COUNT` as the per-query path so dashboards remain
+/// comparable across the two surfaces.
+#[cfg(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel"))]
+pub fn try_gpu_bool_v3_batched(
+    op: BoolOp,
+    queries: &[&[std::sync::Arc<crate::postings::roaring::vram_cht_v3::VramCompressedTermEntry>]],
+) -> Option<Vec<RoaringPostings>> {
+    if queries.is_empty() {
+        return Some(Vec::new());
+    }
+    // Per-query gate: must have ≥ 2 terms to be worth the dispatch.
+    // A single-term cohort doesn't intersect anything; let the caller
+    // serve it from the per-query path (where the gather_v3_term_to_host
+    // shortcut applies).
+    for q in queries {
+        if q.len() < 2 {
+            CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    }
+    let kernel = match gpu_resources() {
+        Some(k) => k,
+        None => {
+            CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+
+    // Compute per-query union_keys. Vecs are owned here for the full
+    // call so their `&[u16]` views in BatchedQueryV3 stay valid for the
+    // duration of compute_fold_v3_batched.
+    let mut per_query_union_keys: Vec<Vec<u16>> = Vec::with_capacity(queries.len());
+    for q in queries {
+        let mut set: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        for term in *q {
+            for (high16, _) in term.bucket_index() {
+                set.insert(*high16);
+            }
+        }
+        per_query_union_keys.push(set.into_iter().collect());
+    }
+
+    // Build the BatchedQueryV3 views.
+    let batched: Vec<super::cuda_dispatch::BatchedQueryV3<'_>> = queries
+        .iter()
+        .zip(per_query_union_keys.iter())
+        .map(|(terms, uk)| super::cuda_dispatch::BatchedQueryV3 {
+            terms,
+            union_keys: uk.as_slice(),
+        })
+        .collect();
+
+    let flat_results = match kernel.compute_fold_v3_batched(op, &batched) {
+        Ok(v) => v,
+        Err(_) => {
+            CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+
+    // Bump dispatch counter once per query (each query is a separate
+    // logical dispatch in the metric sense, even if they share one
+    // kernel launch chain). This keeps the gpu_dispatch_count value
+    // comparable to the per-query path's count when N queries flow
+    // through either route.
+    GPU_DISPATCH_COUNT.fetch_add(queries.len(), Ordering::Relaxed);
+
+    // Decode each per-query flat result back to a RoaringPostings.
+    let mut out: Vec<RoaringPostings> = Vec::with_capacity(queries.len());
+    for (q_i, q_union_keys) in per_query_union_keys.iter().enumerate() {
+        let flat = &flat_results[q_i];
+        if flat.is_empty() || q_union_keys.is_empty() {
+            out.push(RoaringPostings::default());
+            continue;
+        }
+        debug_assert_eq!(flat.len(), q_union_keys.len() * BITMAP_CONTAINER_WORDS);
+        let mut containers = Vec::with_capacity(q_union_keys.len());
+        for (i, &high16) in q_union_keys.iter().enumerate() {
+            let start = i * BITMAP_CONTAINER_WORDS;
+            let end = start + BITMAP_CONTAINER_WORDS;
+            let chunk = &flat[start..end];
+            let mut words: Box<[u32; BITMAP_CONTAINER_WORDS]> =
+                Box::new([0u32; BITMAP_CONTAINER_WORDS]);
+            words.copy_from_slice(chunk);
+            let bm = BitmapContainer::from_words(words);
+            if bm.cardinality() == 0 {
+                continue;
+            }
+            let optimized = Container::Bitmap(bm).optimize();
+            containers.push((high16, optimized));
+        }
+        out.push(RoaringPostings { containers });
+    }
+    Some(out)
+}
+
+/// Stub for the no-feature / no-cuda path.
+#[cfg(not(all(feature = "gpu", feature = "ferro-compress", feature = "cuda-bitmap-kernel")))]
+pub fn try_gpu_bool_v3_batched(
+    _op: BoolOp,
+    _queries: &[&[std::sync::Arc<()>]],
+) -> Option<Vec<RoaringPostings>> {
+    CPU_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
 // ============================================================
 // Internal helpers.
 // ============================================================

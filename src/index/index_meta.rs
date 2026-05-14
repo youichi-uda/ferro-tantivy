@@ -383,6 +383,19 @@ impl IndexSettings {
                 )));
             }
         }
+        // **Codex DD P1 fix (Wave 26 post-review)**: cap the auxiliary
+        // cursor count too, so direct tantivy callers cannot bypass the
+        // ferrosearch auto-induce cap and blow up commit / merge time
+        // with unbounded `O(N log N)` cursor builds.
+        if let Some(aux) = &self.auxiliary_sort_cursors {
+            if aux.len() > crate::index::SORT_CURSOR_MAX_FIELDS {
+                return Err(crate::TantivyError::InvalidArgument(format!(
+                    "IndexSettings::auxiliary_sort_cursors supports at most {} fields, got {}",
+                    crate::index::SORT_CURSOR_MAX_FIELDS,
+                    aux.len()
+                )));
+            }
+        }
         Ok(())
     }
 }

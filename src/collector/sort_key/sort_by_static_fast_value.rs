@@ -132,15 +132,28 @@ impl<T: FastValue> SortByStaticFastValue<T> {
         let max_v = sort_column.values.max_value();
         let threshold_value = thresh.load(Ordering::Relaxed);
         if self.threshold_is_desc {
-            // Desc: top-K keeps largest. Threshold = current K-th (smallest
-            // in top-K seen so far). Entry requires strict `> threshold`,
-            // so a segment with `max <= threshold` cannot contribute.
-            max_v <= threshold_value
+            // Desc: top-K keeps largest. Skip iff every value in the segment
+            // is **strictly worse** than the global K-th.
+            //
+            // **Codex DD P0 fix (Wave 24 post-Wave-27 review)**: the prior
+            // weak `<=` was unsound. `TopNComputer`'s heap tie-breaks on
+            // ascending `DocAddress`, and its `threshold` field omits the
+            // `DocId`/`DocAddress` component (see
+            // `src/collector/top_score_collector.rs:538`). So at `max ==
+            // threshold` a segment may still contain a doc whose
+            // `(value, DocAddress)` ties on value but wins the tie-break
+            // against the segment that published the current threshold —
+            // skipping here would silently drop a real top-K member.
+            // Strict dominance (`max < threshold`) is the safe gate: every
+            // value in the segment is strictly worse than the global K-th,
+            // so no tie possible.
+            max_v < threshold_value
         } else {
-            // Asc: top-K keeps smallest. Threshold = current K-th (largest
-            // in top-K seen so far). Entry requires strict `< threshold`,
-            // so a segment with `min >= threshold` cannot contribute.
-            min_v >= threshold_value
+            // Asc: top-K keeps smallest. Same DocAddress tie-break concern
+            // as the desc arm — use strict `>` to leave tied segments to
+            // the standard collection path where the heap can pick the
+            // tie-break winner.
+            min_v > threshold_value
         }
     }
 
@@ -567,18 +580,37 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
         // the heap-maintenance cost on every block. After `first_vals`
         // populated the scratch, an `O(BLOCK)` min/max scan + one
         // comparison against the heap's K-th lets us drop the entire
-        // block when no doc in it can enter the top-K. This is the
-        // primary lever for the Wave 20.1 `sort-size-*` / `sort-status-*`
-        // defeats at 50M-doc scale, where each shard's segment is
-        // 10M docs (40× the warm-cache cap) and the running K-th
-        // tightens after the first ~1-2 blocks for low-cardinality
-        // categorical fields (`status`) or uniform-distribution numeric
-        // fields (`size`).
+        // block when no doc in it can enter the top-K.
         //
-        // Mirrors `should_skip_segment` semantics at block granularity:
-        // - Desc: block can be skipped if `block_max <= threshold`
-        //   (strict `>` entry into the heap means tie loses).
-        // - Asc: block can be skipped if `block_min >= threshold`.
+        // **Honest framing (Codex DD P2 fix, Wave 24-27 post-review)**:
+        // this branch is **defensive coverage** for the streaming path,
+        // not the lever that closed the Wave 20.1 `sort-size-*` /
+        // `sort-status-*` defeats at 50M-doc scale. Wave 19's
+        // `warm_fast_field_dense_u64` populates the segment-lifetime
+        // warm cache for *any* `ColumnIndex::Full` column (the
+        // `WARM_FIRST_VALS_MAX_DOCS` cap only governs the legacy
+        // per-collector decode), so 10M-doc Full segments take the
+        // warm-cache branch and Wave 14 SIMD does the block skip there
+        // — this streaming-path code never executes for the canonical
+        // closure workload. The 50M closure came from Wave 26 (per-field
+        // auxiliary cursors) + Wave 27 (`assume_all_matched` shortcut)
+        // routing those queries to the cursor-walk fast path entirely.
+        // Wave 25 stays in for `Optional` / `Multivalued` columns and
+        // any future workload that bypasses the dense warm cache.
+        //
+        // Mirrors `should_skip_segment` semantics at block granularity.
+        //
+        // **Codex DD P0 fix (Wave 24-27 post-review)**: use *strict*
+        // dominance so a block whose extreme value ties the heap's K-th
+        // is not silently dropped. `TopNComputer`'s heap tie-breaks on
+        // ascending `DocId` within the segment and its `threshold` omits
+        // the `DocId` component (`top_score_collector.rs:538`), so at
+        // `block_max == threshold` the block may still hold a doc whose
+        // `DocId` is lower than the current K-th's and that ought to win
+        // the tie-break. The right gate is "every value strictly worse
+        // than threshold":
+        // - Desc: skip iff `block_max < threshold`.
+        // - Asc:  skip iff `block_min > threshold`.
         //
         // Cursor variant (`cursor_u64.is_some()`) is excluded — the
         // cursor filter already provides a strict gate that the heap
@@ -608,8 +640,8 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
                     }
                     if any_non_null {
                         let block_cant_contribute = match order {
-                            super::simd_top_k::DetectedOrder::Desc => block_max <= threshold,
-                            super::simd_top_k::DetectedOrder::Asc => block_min >= threshold,
+                            super::simd_top_k::DetectedOrder::Desc => block_max < threshold,
+                            super::simd_top_k::DetectedOrder::Asc => block_min > threshold,
                             super::simd_top_k::DetectedOrder::Unknown => false,
                         };
                         if block_cant_contribute {
@@ -692,10 +724,14 @@ mod tests {
     }
 
     #[test]
-    fn wave24_threshold_desc_skips_when_segment_max_at_or_below() {
-        // Desc top-K wants the largest values. After earlier segments
-        // tighten the threshold to 50, a segment whose max is 50 (tie with
-        // the K-th — strict ">", so still skip) or below cannot contribute.
+    fn wave24_threshold_desc_skips_only_when_strictly_dominated() {
+        // **Codex DD P0 fix**: skipping at `max == threshold` was unsound
+        // because `TopNComputer`'s heap tie-breaks on `DocAddress` (which
+        // the threshold omits). A segment whose max ties the global K-th
+        // may still hold a doc that wins the tie on lower `DocAddress`
+        // and must be allowed to enter the heap. Only segments whose
+        // **every** value is strictly worse than threshold are
+        // unambiguously droppable.
         let sort = SortByStaticFastValue::<u64>::for_field("x").with_running_threshold(true);
         sort.tighten_threshold_after_collect(
             2,
@@ -703,15 +739,18 @@ mod tests {
         );
         assert_eq!(sort.current_threshold(), Some(50));
 
-        // Segment with max == 50 → skipped (strict-> entry).
-        assert!(sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![10, 30, 50])));
-        // Segment with max == 51 → cannot skip.
+        // Tie at threshold → must NOT skip (tie-break may still favour this segment).
+        assert!(!sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![10, 30, 50])));
+        // Strictly worse than threshold → safe to skip.
+        assert!(sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![10, 30, 49])));
+        // Strictly better → no skip.
         assert!(!sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![10, 30, 51])));
     }
 
     #[test]
-    fn wave24_threshold_asc_skips_when_segment_min_at_or_above() {
-        // Asc top-K wants the smallest values. K-th is the max in top-K.
+    fn wave24_threshold_asc_skips_only_when_strictly_dominated() {
+        // Asc dual of the desc test above — strict `>` gate for symmetric
+        // tie-break safety.
         let sort = SortByStaticFastValue::<u64>::for_field("x").with_running_threshold(false);
         sort.tighten_threshold_after_collect(
             2,
@@ -719,7 +758,11 @@ mod tests {
         );
         assert_eq!(sort.current_threshold(), Some(50));
 
-        assert!(sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![50, 80, 100])));
+        // Tie at threshold → must NOT skip.
+        assert!(!sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![50, 80, 100])));
+        // Strictly worse (every value > threshold) → safe to skip.
+        assert!(sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![51, 80, 100])));
+        // Strictly better → no skip.
         assert!(!sort.segment_can_be_skipped_by_threshold(&column_with_values(vec![49, 80, 100])));
     }
 

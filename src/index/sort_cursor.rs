@@ -1137,8 +1137,24 @@ pub fn build_and_write_sort_cursors(
             if written.iter().any(|f| f == &aux.field) {
                 continue;
             }
-            if build_and_write_sort_cursor_for(segment, &aux.field, aux.order)? {
-                written.push(aux.field.clone());
+            // **Codex DD P1 fix (Wave 26 post-review)**: a non-FAST,
+            // missing, or unsupported-type auxiliary field would
+            // otherwise propagate via `?` and abort the entire commit
+            // / merge. That's the wrong default for an auxiliary cursor
+            // — a misconfigured `index.sort.auxiliary_field` entry
+            // should degrade gracefully (skip that one cursor with a
+            // warn, keep the segment usable) rather than block the
+            // whole index from making progress. Log + skip per field.
+            match build_and_write_sort_cursor_for(segment, &aux.field, aux.order) {
+                Ok(true) => written.push(aux.field.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!(
+                        "Wave 26: auxiliary sort cursor for field `{}` failed to build, \
+                         skipping (other cursors continue); reason: {}",
+                        aux.field, e
+                    );
+                }
             }
         }
         return Ok(written);

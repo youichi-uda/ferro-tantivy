@@ -8,11 +8,6 @@ use crate::collector::sort_key::simd_top_k::{
 };
 use crate::collector::sort_key::sort_by_static_fast_value::warm_first_values;
 use crate::collector::sort_key::NaturalComparator;
-use crate::collector::sort_key::simd_top_k::{
-    DetectedOrder, detect_order, is_contiguous_block, simd_filter_block_gt_u64,
-    simd_filter_block_lt_u64, unwrap_threshold,
-};
-use crate::collector::sort_key::sort_by_static_fast_value::warm_first_values;
 use crate::collector::{SegmentSortKeyComputer, SortKeyComputer};
 use crate::termdict::TermOrdinal;
 use crate::{DocId, Score};

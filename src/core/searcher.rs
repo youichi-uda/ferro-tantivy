@@ -13,7 +13,6 @@ use crate::schema::{Schema, Term};
 use crate::space_usage::SearcherSpaceUsage;
 use crate::store::{CacheStats, StoreReader};
 use crate::{DocAddress, Index, Opstamp, TrackedObject};
-use common::OwnedBytes;
 
 /// Identifies the searcher generation accessed by a [`Searcher`].
 ///

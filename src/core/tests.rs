@@ -475,14 +475,13 @@ fn test_non_text_json_term_freq_bitpacked() {
 // observable contract:
 //
 //   1. The default executor is `Executor::SingleThread`.
-//   2. After `set_multithread_executor`, the executor is `ThreadPool` with
-//      the requested thread count.
-//   3. `Searcher::search` returns identical results regardless of executor
-//      variant — parallelism is a perf concern, not a semantic one.  This
-//      is the property FerroSearch's Wave 10 #X fix relies on.
-//   4. `Searcher::clone` (the PIT pinning operation) preserves the
-//      executor — both clones share `Arc<SearcherInner>` whose `Index`
-//      holds an Arc-backed executor.
+//   2. After `set_multithread_executor`, the executor is `ThreadPool` with the requested thread
+//      count.
+//   3. `Searcher::search` returns identical results regardless of executor variant — parallelism is
+//      a perf concern, not a semantic one.  This is the property FerroSearch's Wave 10 #X fix
+//      relies on.
+//   4. `Searcher::clone` (the PIT pinning operation) preserves the executor — both clones share
+//      `Arc<SearcherInner>` whose `Index` holds an Arc-backed executor.
 //
 // These tests are deliberately small (each ≤500 docs across 2-4 segments).
 // They validate the wiring, not the perf characteristics — a bench in
@@ -665,7 +664,9 @@ fn sort_key_segment_computers_are_send() {
         S::SegmentSortKey: Send,
     {
     }
-    assert_seg_keys_send::<<crate::collector::sort_key::SortByStaticFastValue<u64> as SortKeyComputer>::Child>();
+    assert_seg_keys_send::<
+        <crate::collector::sort_key::SortByStaticFastValue<u64> as SortKeyComputer>::Child,
+    >();
     assert_seg_keys_send::<<crate::collector::sort_key::SortByString as SortKeyComputer>::Child>();
 }
 

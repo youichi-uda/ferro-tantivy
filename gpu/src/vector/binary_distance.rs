@@ -23,53 +23,43 @@
 //! For `dim_bits = 768`, `dim_u32 = 24`, `N = 1_000_000` corpus vectors:
 //! - corpus size = `N * dim_u32 * 4 B` = ~96 MB
 //! - at 50 GB/s effective the GPU reads the corpus in ~2 ms
-//! - per-vector work = 24 XOR + 24 popcount + 24 add = trivially overlaps
-//!   memory latency, so kernel time ≈ memory time ≈ 2 ms.
-//! - on CPU at 40 GB/s, same scan is ~2.4 ms — GPU win is small for a
-//!   single query, but **batched-query** workloads (`Q` queries amortise
-//!   the corpus read once into shared memory / L2) push the GPU to
-//!   10-50× over CPU.
+//! - per-vector work = 24 XOR + 24 popcount + 24 add = trivially overlaps memory latency, so kernel
+//!   time ≈ memory time ≈ 2 ms.
+//! - on CPU at 40 GB/s, same scan is ~2.4 ms — GPU win is small for a single query, but
+//!   **batched-query** workloads (`Q` queries amortise the corpus read once into shared memory /
+//!   L2) push the GPU to 10-50× over CPU.
 //!
 //! ## Scope of this file (Phase 2 A integration)
 //!
 //! Phase 2 A integration delivers:
-//! 1. The single-query WGSL shader (`xor_popcount.wgsl`) with vec4<u32>
-//!    SIMD widening of the inner XOR+popcount loop.
-//! 2. A batched multi-query WGSL shader (`xor_popcount_batched.wgsl`)
-//!    with workgroup-shared corpus tiling — a single dispatch produces
-//!    the full Q × N distance matrix.
-//! 3. An on-GPU bitonic top-K shader (`top_k_select.wgsl`) which keeps
-//!    only the K smallest distances per query, slashing PCIe readback
-//!    from `Q × N × 4 B` to `Q × K × 8 B`.
-//! 4. The Rust kernel wrapper [`BinaryDistanceKernel`] exposing
-//!    `compute()` (single-query, back-compat), `compute_batched()`
-//!    (Q × N matrix), and `knn_search()` (Q × top-K end-to-end).
-//! 5. A CPU reference implementation [`hamming_distance_cpu`] used as
-//!    the gold-standard test oracle, plus
-//!    [`hamming_distances_batched_cpu`] for batched correctness.
+//! 1. The single-query WGSL shader (`xor_popcount.wgsl`) with vec4<u32> SIMD widening of the inner
+//!    XOR+popcount loop.
+//! 2. A batched multi-query WGSL shader (`xor_popcount_batched.wgsl`) with workgroup-shared corpus
+//!    tiling — a single dispatch produces the full Q × N distance matrix.
+//! 3. An on-GPU bitonic top-K shader (`top_k_select.wgsl`) which keeps only the K smallest
+//!    distances per query, slashing PCIe readback from `Q × N × 4 B` to `Q × K × 8 B`.
+//! 4. The Rust kernel wrapper [`BinaryDistanceKernel`] exposing `compute()` (single-query,
+//!    back-compat), `compute_batched()` (Q × N matrix), and `knn_search()` (Q × top-K end-to-end).
+//! 5. A CPU reference implementation [`hamming_distance_cpu`] used as the gold-standard test
+//!    oracle, plus [`hamming_distances_batched_cpu`] for batched correctness.
 //!
 //! Phase 2 A integration does **not** include:
-//! - HNSW graph traversal with binary codes — that requires
-//!   `BinaryDistanceMetric` threaded through `HnswIndex` traversal and
-//!   is the Phase 2 A-final wave.
-//! - Real-data benchmarks on SIFT1M / GIST1M / DEEP1B — needs dataset
-//!   download + ferro-bench-runner integration; GA-prep wave.
+//! - HNSW graph traversal with binary codes — that requires `BinaryDistanceMetric` threaded through
+//!   `HnswIndex` traversal and is the Phase 2 A-final wave.
+//! - Real-data benchmarks on SIFT1M / GIST1M / DEEP1B — needs dataset download + ferro-bench-runner
+//!   integration; GA-prep wave.
 //! - Recall@k measurement against a vetted ground-truth set.
 //!
 //! ## Calling contract
 //!
-//! - `query_bits` (single): bit-packed query, length `dim_u32 = ceil(dim_bits/32)`.
-//!   Padding of unused trailing bits to zero is the **caller's**
-//!   responsibility — the kernel does not mask.
-//! - `queries_bits` (batched): `num_queries * dim_u32` u32 words, queries
-//!   flat-laid.
+//! - `query_bits` (single): bit-packed query, length `dim_u32 = ceil(dim_bits/32)`. Padding of
+//!   unused trailing bits to zero is the **caller's** responsibility — the kernel does not mask.
+//! - `queries_bits` (batched): `num_queries * dim_u32` u32 words, queries flat-laid.
 //! - `corpus_bits`: `num_vecs * dim_u32` u32 words, vectors flat-laid.
-//! - `compute()` returns `Vec<u32>` of length `num_vecs`, each entry in
-//!   `0..=dim_bits`.
-//! - `compute_batched()` returns `Vec<u32>` of length
-//!   `num_queries * num_vecs` (row-major).
-//! - `knn_search()` returns `Vec<Vec<(u32, u32)>>` (per-query
-//!   `(distance, corpus_id)` pairs sorted ascending by distance).
+//! - `compute()` returns `Vec<u32>` of length `num_vecs`, each entry in `0..=dim_bits`.
+//! - `compute_batched()` returns `Vec<u32>` of length `num_queries * num_vecs` (row-major).
+//! - `knn_search()` returns `Vec<Vec<(u32, u32)>>` (per-query `(distance, corpus_id)` pairs sorted
+//!   ascending by distance).
 //!
 //! The CPU and GPU paths produce **byte-equal** outputs (bitwise
 //! `popcount` is exact integer arithmetic — no float drift to worry about).
@@ -173,6 +163,14 @@ pub struct BinaryDistanceKernel {
     pipeline_batched: GpuPipelineRaw,
     pipeline_top_k: GpuPipelineRaw,
     ctx: GpuContext,
+    /// Optional NVIDIA Tensor Core fast path. Initialised once at
+    /// construction (if the `cuda-tensor-core` feature is on **and**
+    /// the runtime can load libcuda + cuBLASLt + the NVRTC kernel) and
+    /// consulted by [`Self::compute_batched`] before the WGSL pipeline.
+    /// `None` on AMD / Apple / Intel / CPU-fallback / containers
+    /// without GPU passthrough.
+    #[cfg(feature = "cuda-tensor-core")]
+    cuda_kernel: Option<crate::vector::cuda_tensor_core::CudaTensorCoreKernel>,
 }
 
 impl GpuKernel for BinaryDistanceKernel {
@@ -195,11 +193,36 @@ impl GpuKernel for BinaryDistanceKernel {
             TOP_K_SELECT_SHADER,
             "top_k_select",
         )?;
+        // Try to spin up the CUDA Tensor Core fast path. Failure here
+        // is non-fatal — the WGSL pipeline above is the source of
+        // truth, the CUDA path is a runtime optimisation.
+        #[cfg(feature = "cuda-tensor-core")]
+        let cuda_kernel = if ctx.is_hardware_gpu() {
+            match crate::vector::cuda_tensor_core::CudaTensorCoreKernel::try_new() {
+                Ok(k) => {
+                    log::info!(
+                        "binary-distance: CUDA Tensor Core fast path enabled (cuBLASLt INT8 IMMA)"
+                    );
+                    Some(k)
+                }
+                Err(e) => {
+                    log::debug!(
+                        "binary-distance: CUDA Tensor Core path unavailable, using WGSL: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            // Honour the caller's explicit CPU-fallback choice.
+            None
+        };
         Ok(Self {
             pipeline,
             pipeline_batched,
             pipeline_top_k,
             ctx: ctx.clone(),
+            #[cfg(feature = "cuda-tensor-core")]
+            cuda_kernel,
         })
     }
 }
@@ -212,6 +235,24 @@ impl BinaryDistanceKernel {
         <Self as GpuKernel>::compile(ctx)
     }
 
+    /// Construct a binary distance kernel with the CUDA Tensor Core
+    /// fast path explicitly disabled, even when the
+    /// `cuda-tensor-core` feature is enabled and the host has a
+    /// reachable NVIDIA device.
+    ///
+    /// This exists for benchmark harnesses that need to A/B the WGSL
+    /// pipeline against the CUDA path on the same kernel instance.
+    /// Production callers should use [`Self::new`].
+    pub fn new_wgsl_only(ctx: &GpuContext) -> GpuResult<Self> {
+        #[cfg_attr(not(feature = "cuda-tensor-core"), allow(unused_mut))]
+        let mut kernel = Self::new(ctx)?;
+        #[cfg(feature = "cuda-tensor-core")]
+        {
+            kernel.cuda_kernel = None;
+        }
+        Ok(kernel)
+    }
+
     /// Compute Hamming distances between one query and a batch of
     /// corpus vectors.
     ///
@@ -219,9 +260,8 @@ impl BinaryDistanceKernel {
     /// - `query_bits`: bit-packed query, `dim_u32` u32 words.
     /// - `corpus_bits`: `num_vecs * dim_u32` u32 words, vectors flat-laid.
     /// - `num_vecs`: number of corpus vectors.
-    /// - `dim_bits`: vector dimension in bits. The number of u32 words
-    ///   per vector is `dim_u32 = ceil(dim_bits / 32)`. Trailing
-    ///   padding bits in the last word **must** be zeroed by the
+    /// - `dim_bits`: vector dimension in bits. The number of u32 words per vector is `dim_u32 =
+    ///   ceil(dim_bits / 32)`. Trailing padding bits in the last word **must** be zeroed by the
     ///   caller — the shader does not mask them out.
     ///
     /// # Returns
@@ -334,8 +374,8 @@ impl BinaryDistanceKernel {
     /// - `corpus_bits`: `num_vecs * dim_u32` u32 words.
     /// - `num_queries`: count of queries (Q).
     /// - `num_vecs`: count of corpus vectors (N).
-    /// - `dim_bits`: vector dimension in bits; `dim_u32 = ceil(dim_bits / 32)`
-    ///   must be ≤ [`BATCHED_MAX_DIM_U32`].
+    /// - `dim_bits`: vector dimension in bits; `dim_u32 = ceil(dim_bits / 32)` must be ≤
+    ///   [`BATCHED_MAX_DIM_U32`].
     ///
     /// # Returns
     /// `Vec<u32>` of length `num_queries * num_vecs`. Empty `num_queries`
@@ -361,7 +401,8 @@ impl BinaryDistanceKernel {
         if dim_u32 as u32 > BATCHED_MAX_DIM_U32 {
             return Err(GpuError::CpuFallback {
                 reason: format!(
-                    "compute_batched: dim_u32 = {dim_u32} exceeds shader limit {BATCHED_MAX_DIM_U32} (dim_bits = {dim_bits})"
+                    "compute_batched: dim_u32 = {dim_u32} exceeds shader limit \
+                     {BATCHED_MAX_DIM_U32} (dim_bits = {dim_bits})"
                 ),
             });
         }
@@ -377,6 +418,24 @@ impl BinaryDistanceKernel {
                 expected: format!("corpus_bits.len() == {}", num_vecs * dim_u32),
                 actual: format!("corpus_bits.len() == {}", corpus_bits.len()),
             });
+        }
+
+        // CUDA Tensor Core fast path — bit-exact with the WGSL kernel
+        // (popcount-identity reformulation, INT8 IMMA + INT32 accum).
+        // Falls through to WGSL on `CpuFallback` (no NVIDIA, no cuBLASLt
+        // algorithm matched, etc.); any other error is propagated.
+        #[cfg(feature = "cuda-tensor-core")]
+        if let Some(ref cuda) = self.cuda_kernel {
+            match cuda.compute_batched(queries_bits, corpus_bits, num_queries, num_vecs, dim_bits) {
+                Ok(result) => return Ok(result),
+                Err(GpuError::CpuFallback { reason }) => {
+                    log::debug!(
+                        "binary-distance: CUDA path skipped (Q={num_queries}, N={num_vecs}, \
+                         dim_bits={dim_bits}): {reason}; falling back to WGSL"
+                    );
+                }
+                Err(other) => return Err(other),
+            }
         }
 
         let queries_buf = GpuBuffer::new::<u32>(
@@ -487,8 +546,7 @@ impl BinaryDistanceKernel {
     ///
     /// # Errors
     /// - [`GpuError::ColumnTypeMismatch`] on slice-length mismatch.
-    /// - [`GpuError::CpuFallback`] if `dim_u32 > BATCHED_MAX_DIM_U32`
-    ///   or `k > TOP_K_MAX_K_PADDED`.
+    /// - [`GpuError::CpuFallback`] if `dim_u32 > BATCHED_MAX_DIM_U32` or `k > TOP_K_MAX_K_PADDED`.
     pub fn knn_search(
         &self,
         queries_bits: &[u32],
@@ -531,6 +589,32 @@ impl BinaryDistanceKernel {
                 expected: format!("corpus_bits.len() == {}", num_vecs * dim_u32),
                 actual: format!("corpus_bits.len() == {}", corpus_bits.len()),
             });
+        }
+
+        // CUDA Tensor Core fast path. Bit-equivalent to the WGSL
+        // pipeline below: same popcount-identity GEMM, same bitonic
+        // top-K (CUDA port preserves the WGSL tie-break rule "lower id
+        // wins at equal distance"). Falls through to WGSL on
+        // `CpuFallback`; any other error propagates.
+        #[cfg(feature = "cuda-tensor-core")]
+        if let Some(ref cuda) = self.cuda_kernel {
+            match cuda.knn_search(
+                queries_bits,
+                corpus_bits,
+                num_queries,
+                num_vecs,
+                dim_bits,
+                k_eff,
+            ) {
+                Ok(result) => return Ok(result),
+                Err(GpuError::CpuFallback { reason }) => {
+                    log::debug!(
+                        "knn_search: CUDA path skipped (Q={num_queries}, N={num_vecs}, \
+                         dim_bits={dim_bits}, k={k_eff}): {reason}; falling back to WGSL"
+                    );
+                }
+                Err(other) => return Err(other),
+            }
         }
 
         // ── Stage 1: batched distance matrix ──
@@ -588,12 +672,8 @@ impl BinaryDistanceKernel {
             k: k_eff as u32,
             k_padded,
         };
-        let top_params_buf = GpuBuffer::new::<TopKParams>(
-            &self.ctx,
-            "knn-top-params",
-            1,
-            BufferUsage::UNIFORM,
-        )?;
+        let top_params_buf =
+            GpuBuffer::new::<TopKParams>(&self.ctx, "knn-top-params", 1, BufferUsage::UNIFORM)?;
         top_params_buf.upload(&self.ctx, &[top_params])?;
 
         let bind_group_top = self.ctx.device().create_bind_group(
@@ -936,10 +1016,14 @@ mod tests {
         // Direct CPU-to-CPU sanity (no GPU dependency at all).
         let q = vec![0xFFFF_FFFFu32, 0u32]; // 32 + 0 = 32 ones
         let c = vec![
-            0u32, 0u32,                       // dist = 32
-            0xFFFF_FFFFu32, 0u32,             // dist = 0
-            0u32, 0xFFFF_FFFFu32,             // dist = 64
-            0xFFFF_FFFFu32, 0xFFFF_FFFFu32,   // dist = 32
+            0u32,
+            0u32, // dist = 32
+            0xFFFF_FFFFu32,
+            0u32, // dist = 0
+            0u32,
+            0xFFFF_FFFFu32, // dist = 64
+            0xFFFF_FFFFu32,
+            0xFFFF_FFFFu32, // dist = 32
         ];
         let out = hamming_distance_cpu(&q, &c, 4, 2);
         assert_eq!(out, vec![32, 0, 64, 32]);
@@ -1000,9 +1084,7 @@ mod tests {
         let queries = random_u32_vec(num_queries * dim_u32, 0xaaaa_bbbb_cccc_dddd);
         let corpus = random_u32_vec(num_vecs * dim_u32, 0x1111_2222_3333_4444);
 
-        let cpu = hamming_distances_batched_cpu(
-            &queries, &corpus, num_queries, num_vecs, dim_u32,
-        );
+        let cpu = hamming_distances_batched_cpu(&queries, &corpus, num_queries, num_vecs, dim_u32);
         let gpu = cpu_kernel()
             .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
             .expect("compute_batched");
@@ -1062,9 +1144,7 @@ mod tests {
         let kernel = cpu_kernel();
         let q = vec![0u32; dim_u32];
         let c = vec![0u32; dim_u32];
-        let err = kernel
-            .compute_batched(&q, &c, 1, 1, dim_bits)
-            .unwrap_err();
+        let err = kernel.compute_batched(&q, &c, 1, 1, dim_bits).unwrap_err();
         assert!(matches!(err, GpuError::CpuFallback { .. }));
     }
 
@@ -1083,9 +1163,8 @@ mod tests {
         let corpus = random_u32_vec(num_vecs * dim_u32, 0xbabe_babe_babe_babe);
 
         // CPU oracle: full distance matrix → CPU top-K.
-        let dists_cpu = hamming_distances_batched_cpu(
-            &queries, &corpus, num_queries, num_vecs, dim_u32,
-        );
+        let dists_cpu =
+            hamming_distances_batched_cpu(&queries, &corpus, num_queries, num_vecs, dim_u32);
         let cpu_topk = top_k_select_cpu(&dists_cpu, num_queries, num_vecs, k);
 
         let gpu_topk = cpu_kernel()
@@ -1093,11 +1172,7 @@ mod tests {
             .expect("knn_search");
         assert_eq!(gpu_topk.len(), num_queries);
         for q in 0..num_queries {
-            assert_eq!(
-                gpu_topk[q].len(),
-                k,
-                "row {q} length mismatch"
-            );
+            assert_eq!(gpu_topk[q].len(), k, "row {q} length mismatch");
             // Check distances are exactly equal.
             let cpu_dists: Vec<u32> = cpu_topk[q].iter().map(|&(d, _)| d).collect();
             let gpu_dists: Vec<u32> = gpu_topk[q].iter().map(|&(d, _)| d).collect();
@@ -1131,9 +1206,8 @@ mod tests {
         let queries = random_u32_vec(num_queries * dim_u32, 0x9876_5432_10ab_cdef);
         let corpus = random_u32_vec(num_vecs * dim_u32, 0xabcd_ef01_2345_6789);
 
-        let dists = hamming_distances_batched_cpu(
-            &queries, &corpus, num_queries, num_vecs, dim_u32,
-        );
+        let dists =
+            hamming_distances_batched_cpu(&queries, &corpus, num_queries, num_vecs, dim_u32);
         let cpu = top_k_select_cpu(&dists, num_queries, num_vecs, 1);
         let gpu = cpu_kernel()
             .knn_search(&queries, &corpus, num_queries, num_vecs, dim_bits, 1)
@@ -1214,9 +1288,7 @@ mod tests {
         let kernel = cpu_kernel();
         let q = random_u32_vec(8, 0x1);
         let c = random_u32_vec(16, 0x2);
-        let out = kernel
-            .knn_search(&q, &c, 1, 2, 256, 0)
-            .expect("k=0");
+        let out = kernel.knn_search(&q, &c, 1, 2, 256, 0).expect("k=0");
         assert_eq!(out.len(), 1);
         assert!(out[0].is_empty());
     }

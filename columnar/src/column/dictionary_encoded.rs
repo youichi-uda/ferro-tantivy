@@ -98,10 +98,7 @@ impl BytesColumn {
             return Ok(Some((min_buf.clone(), min_buf)));
         }
         let mut max_buf = Vec::new();
-        if !self
-            .dictionary
-            .ord_to_term((n - 1) as u64, &mut max_buf)?
-        {
+        if !self.dictionary.ord_to_term((n - 1) as u64, &mut max_buf)? {
             return Ok(None);
         }
         Ok(Some((min_buf, max_buf)))

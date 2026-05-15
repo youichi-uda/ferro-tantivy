@@ -80,6 +80,16 @@ pub struct IndexMerger {
     schema: Schema,
     pub(crate) readers: Vec<SegmentReader>,
     max_doc: u32,
+    /// **FerroSearch Wave 15 Phase H-2.**  When `Some`, the merger
+    /// reorders alive docs in the merged segment so the new doc-id
+    /// sequence matches the configured sort order.  Set by the
+    /// `IndexMerger::open*` callers from `index.settings().sort_by_field`
+    /// — the segment_updater always populates this when calling
+    /// `IndexMerger::open` so post-merge segments preserve the
+    /// physical sort layout that the SegmentWriter would have written
+    /// at flush time.  `None` keeps the original concatenated layout
+    /// (Stacked / StackedWithDeletes mappings).
+    sort_by_field: Option<crate::index::IndexSortByField>,
 }
 
 struct DeltaComputer {
@@ -112,7 +122,12 @@ fn convert_to_merge_order(
 ) -> MergeRowOrder {
     match doc_id_mapping.mapping_type() {
         MappingType::Stacked => MergeRowOrder::Stack(StackMergeOrder::stack(columnars)),
-        MappingType::StackedWithDeletes => {
+        // Wave 15 Phase H-2: `Sorted` reuses the `Shuffled` path because
+        // both deviate from in-order concatenation.  The columnar merger
+        // doesn't care WHY the rows are shuffled (deletes vs index-time
+        // sort) — it just needs the new→old row mapping + per-segment
+        // alive bitsets, which `SegmentDocIdMapping` already provides.
+        MappingType::StackedWithDeletes | MappingType::Sorted => {
             // RUST/LLVM is amazing. The following conversion is actually a no-op:
             // no allocation, no copy.
             let new_row_id_to_old_row_id: Vec<RowAddr> = doc_id_mapping
@@ -145,9 +160,43 @@ fn extract_fast_field_required_columns(schema: &Schema) -> Vec<(String, ColumnTy
 }
 
 impl IndexMerger {
+    /// Public API entry point preserved for downstream callers; equivalent
+    /// to [`Self::open_with_sort_by_field`] with `sort_by_field = None`.
+    /// FerroSearch internal call sites use the sort-aware variant directly.
+    #[allow(dead_code)]
     pub fn open(schema: Schema, segments: &[Segment]) -> crate::Result<IndexMerger> {
         let alive_bitset = segments.iter().map(|_| None).collect_vec();
         Self::open_with_custom_alive_set(schema, segments, alive_bitset)
+    }
+
+    /// **FerroSearch Wave 15 Phase H-2.**  Variant of [`Self::open`] that
+    /// also threads the index-time sort field through to the merger so
+    /// the produced segment has its doc-id sequence physically reordered
+    /// to match the sort.  Pass `None` for `sort_by_field` to behave as
+    /// the legacy `open` (no reorder).
+    pub fn open_with_sort_by_field(
+        schema: Schema,
+        segments: &[Segment],
+        sort_by_field: Option<crate::index::IndexSortByField>,
+    ) -> crate::Result<IndexMerger> {
+        let alive_bitset = segments.iter().map(|_| None).collect_vec();
+        let mut merger = Self::open_with_custom_alive_set(schema, segments, alive_bitset)?;
+        merger.sort_by_field = sort_by_field;
+        Ok(merger)
+    }
+
+    /// **FerroSearch Wave 15 Phase H-2.**  Combined variant for the
+    /// cross-index merger path (`merge_filtered_segments`): custom
+    /// per-segment alive bitsets AND optional sort-by-field reorder.
+    pub fn open_with_custom_alive_set_and_sort(
+        schema: Schema,
+        segments: &[Segment],
+        alive_bitset_opt: Vec<Option<AliveBitSet>>,
+        sort_by_field: Option<crate::index::IndexSortByField>,
+    ) -> crate::Result<IndexMerger> {
+        let mut merger = Self::open_with_custom_alive_set(schema, segments, alive_bitset_opt)?;
+        merger.sort_by_field = sort_by_field;
+        Ok(merger)
     }
 
     // Create merge with a custom delete set.
@@ -189,6 +238,7 @@ impl IndexMerger {
             schema,
             readers,
             max_doc,
+            sort_by_field: None,
         })
     }
 
@@ -279,6 +329,95 @@ impl IndexMerger {
         Ok(SegmentDocIdMapping::new(
             mapping,
             mapping_type,
+            alive_bitsets,
+        ))
+    }
+
+    /// **FerroSearch Wave 15 Phase H-2.**  Builds a doc-id mapping that
+    /// reorders the input segments' alive docs by an index-time sort
+    /// field, so the merged segment's doc-id sequence physically matches
+    /// the sort order.
+    ///
+    /// `field` is the sort field name; `descending` selects DESC order.
+    /// Missing values sort last regardless of order, matching the
+    /// `SortCursorIndex` (Phase A) `missing="_last"` semantics.
+    ///
+    /// Returns `Err` when the field is not a fast field of a numeric /
+    /// date type on every reader (the caller should fall back to
+    /// `get_doc_id_from_concatenated_data`).  The mapping uses
+    /// `MappingType::Sorted` so `convert_to_merge_order` routes
+    /// columnar merge through the `Shuffled` path.
+    pub(crate) fn get_doc_id_mapping_sorted_by_field(
+        &self,
+        field: &str,
+        descending: bool,
+    ) -> crate::Result<SegmentDocIdMapping> {
+        // Read the (segment_ord, doc_id, sort_key) tuples for every
+        // alive doc.  We use `u64_lenient` so the same code path covers
+        // i64 / u64 / f64 / DateTime — the monotonic u64 mapping
+        // preserves the natural order on the underlying type.
+        let mut keyed: Vec<(u64, u8, u32, u32)> =
+            Vec::with_capacity(self.readers.iter().map(|r| r.num_docs() as usize).sum());
+        for (segment_ord, reader) in self.readers.iter().enumerate() {
+            let column_opt = reader.fast_fields().u64_lenient(field)?;
+            let (column, _column_type) = column_opt.ok_or_else(|| {
+                crate::TantivyError::SchemaError(format!(
+                    "Wave 15 Phase H-2: sort field `{field}` not available as a fast field on \
+                     segment {segment_ord}"
+                ))
+            })?;
+            for doc_id in reader.doc_ids_alive() {
+                let key_opt = column.first(doc_id);
+                // Encode missing as `1` and present as `0` in the
+                // missing flag so missing always sorts last regardless
+                // of `descending`, matching the on-disk
+                // SortCursorIndex semantics.
+                let (missing_flag, key) = match key_opt {
+                    Some(k) => (0u8, k),
+                    None => (1u8, 0u64),
+                };
+                keyed.push((key, missing_flag, segment_ord as u32, doc_id));
+            }
+        }
+        // Sort: missing-last (always), then by u64 value (asc or desc),
+        // then deterministic (segment_ord, doc_id) tie-break.  Stable
+        // not required because we tie-break explicitly.
+        keyed.sort_unstable_by(|a, b| {
+            // Compare missing flags first — both 0 or both 1 means we
+            // compare values; otherwise the 0 (present) wins (sorts
+            // before the missing 1).
+            match a.1.cmp(&b.1) {
+                std::cmp::Ordering::Equal => {}
+                ord => return ord,
+            }
+            let value_cmp = if descending {
+                b.0.cmp(&a.0)
+            } else {
+                a.0.cmp(&b.0)
+            };
+            value_cmp
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
+
+        let mapping: Vec<DocAddress> = keyed
+            .into_iter()
+            .map(|(_key, _missing, segment_ord, doc_id)| DocAddress {
+                segment_ord,
+                doc_id,
+            })
+            .collect();
+        let alive_bitsets: Vec<Option<ReadOnlyBitSet>> = self
+            .readers
+            .iter()
+            .map(|reader| {
+                let alive_bitset = reader.alive_bitset()?;
+                Some(alive_bitset.bitset().clone())
+            })
+            .collect();
+        Ok(SegmentDocIdMapping::new(
+            mapping,
+            MappingType::Sorted,
             alive_bitsets,
         ))
     }
@@ -427,35 +566,84 @@ impl IndexMerger {
 
             field_serializer.new_term(term_bytes, total_doc_freq, has_term_freq)?;
 
-            // We can now serialize this postings, by pushing each document to the
-            // postings serializer.
-            for (segment_ord, mut segment_postings) in
-                segment_postings_containing_the_term.drain(..)
-            {
-                let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
+            // Wave 15 Phase H-2: when the merger is reordering docs by an
+            // index-time sort field, the per-segment iteration emits docs
+            // in OLD doc-id order (which is no longer monotonic in the
+            // remapped NEW doc-id space).  The postings BitPacker
+            // requires monotonic input, so we collect all
+            // (new_doc, term_freq, positions) triples across every
+            // segment containing the term, sort by new_doc, then write
+            // in sorted order.  Per-term Vec allocation is bounded by
+            // the term's document frequency — modest for any real term
+            // distribution.
+            //
+            // The legacy Stack/StackedWithDeletes paths preserve
+            // per-segment doc-id order (segment N's docs map to a
+            // contiguous range starting after segment N-1), so the
+            // remapped doc_ids are monotonic by construction; the fast
+            // per-segment loop below stays unchanged for those paths.
+            let needs_global_sort = doc_id_mapping.mapping_type() == MappingType::Sorted;
 
-                let mut doc = segment_postings.doc();
-                while doc != TERMINATED {
-                    // deleted doc are skipped as they do not have a `remapped_doc_id`.
-                    if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
-                        // we make sure to only write the term if
-                        // there is at least one document.
-                        let term_freq = if has_term_freq {
-                            segment_postings.positions(&mut positions_buffer);
-                            segment_postings.term_freq()
-                        } else {
-                            // The positions_buffer may contain positions from the previous term
-                            // Existence of positions depend on the value type in JSON fields.
-                            // https://github.com/quickwit-oss/tantivy/issues/2283
-                            positions_buffer.clear();
-                            0u32
-                        };
+            if needs_global_sort {
+                let mut term_docs: Vec<(DocId, u32, Vec<u32>)> =
+                    Vec::with_capacity(total_doc_freq as usize);
+                for (segment_ord, mut segment_postings) in
+                    segment_postings_containing_the_term.drain(..)
+                {
+                    let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
 
-                        let delta_positions = delta_computer.compute_delta(&positions_buffer);
-                        field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
+                    let mut doc = segment_postings.doc();
+                    while doc != TERMINATED {
+                        if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
+                            let term_freq = if has_term_freq {
+                                segment_postings.positions(&mut positions_buffer);
+                                segment_postings.term_freq()
+                            } else {
+                                positions_buffer.clear();
+                                0u32
+                            };
+                            term_docs.push((remapped_doc_id, term_freq, positions_buffer.clone()));
+                        }
+                        doc = segment_postings.advance();
                     }
+                }
+                // Sort by new doc-id — the postings BitPacker contract.
+                term_docs.sort_unstable_by_key(|x| x.0);
+                for (new_doc_id, term_freq, positions) in term_docs {
+                    let delta_positions = delta_computer.compute_delta(&positions);
+                    field_serializer.write_doc(new_doc_id, term_freq, delta_positions);
+                }
+            } else {
+                // Legacy fast path: per-segment loop, remapped doc_ids
+                // monotonic by construction (Stack / StackedWithDeletes).
+                for (segment_ord, mut segment_postings) in
+                    segment_postings_containing_the_term.drain(..)
+                {
+                    let old_to_new_doc_id = &merged_doc_id_map[segment_ord];
 
-                    doc = segment_postings.advance();
+                    let mut doc = segment_postings.doc();
+                    while doc != TERMINATED {
+                        // deleted doc are skipped as they do not have a `remapped_doc_id`.
+                        if let Some(remapped_doc_id) = old_to_new_doc_id[doc as usize] {
+                            // we make sure to only write the term if
+                            // there is at least one document.
+                            let term_freq = if has_term_freq {
+                                segment_postings.positions(&mut positions_buffer);
+                                segment_postings.term_freq()
+                            } else {
+                                // The positions_buffer may contain positions from the previous term
+                                // Existence of positions depend on the value type in JSON fields.
+                                // https://github.com/quickwit-oss/tantivy/issues/2283
+                                positions_buffer.clear();
+                                0u32
+                            };
+
+                            let delta_positions = delta_computer.compute_delta(&positions_buffer);
+                            field_serializer.write_doc(remapped_doc_id, term_freq, delta_positions);
+                        }
+
+                        doc = segment_postings.advance();
+                    }
                 }
             }
             // closing the term.
@@ -486,9 +674,35 @@ impl IndexMerger {
         Ok(())
     }
 
-    fn write_storable_fields(&self, store_writer: &mut StoreWriter) -> crate::Result<()> {
+    fn write_storable_fields(
+        &self,
+        store_writer: &mut StoreWriter,
+        doc_id_mapping: &SegmentDocIdMapping,
+    ) -> crate::Result<()> {
         debug_time!("write-storable-fields");
         debug!("write-storable-field");
+
+        // Wave 15 Phase H-2: when the merger is reordering docs by an
+        // index-time sort field, we MUST iterate the source store in
+        // new-doc-id order — `stack` and the per-segment `iter_raw`
+        // both preserve the source segment order, which conflicts with
+        // the sort permutation.  Open one store reader per source
+        // segment up-front, then for each new doc-id pull the bytes
+        // from the right (source_segment, source_doc) tuple.  This
+        // path bypasses the stack-blocks optimisation but keeps the
+        // doc store correctly aligned to the post-merge doc layout.
+        if doc_id_mapping.mapping_type() == MappingType::Sorted {
+            let mut store_readers = Vec::with_capacity(self.readers.len());
+            for reader in &self.readers {
+                store_readers.push(reader.get_store_reader(1)?);
+            }
+            for old_doc_addr in doc_id_mapping.iter_old_doc_addrs() {
+                let store_reader = &store_readers[old_doc_addr.segment_ord as usize];
+                let doc_bytes = store_reader.get_document_bytes(old_doc_addr.doc_id)?;
+                store_writer.store_bytes(&doc_bytes)?;
+            }
+            return Ok(());
+        }
 
         for reader in &self.readers {
             let store_reader = reader.get_store_reader(1)?;
@@ -526,7 +740,25 @@ impl IndexMerger {
     /// # Returns
     /// The number of documents in the resulting segment.
     pub fn write(&self, mut serializer: SegmentSerializer) -> crate::Result<u32> {
-        let doc_id_mapping = self.get_doc_id_from_concatenated_data()?;
+        // Wave 15 Phase H-2: when the merger was constructed with a
+        // sort_by_field hint, build a sort-order doc-id mapping so the
+        // merged segment's physical doc layout matches the index sort.
+        // Falling back to the concatenated mapping is correct (the
+        // legacy stack/shuffle paths still work) but loses the early-
+        // term win at query time.
+        let doc_id_mapping = match self.sort_by_field.as_ref() {
+            Some(sort_by) => {
+                debug!(
+                    "Wave 15 H-2: building sort-order doc-id mapping field={} order={:?}",
+                    sort_by.field, sort_by.order
+                );
+                self.get_doc_id_mapping_sorted_by_field(
+                    &sort_by.field,
+                    sort_by.order == crate::index::Order::Desc,
+                )?
+            }
+            None => self.get_doc_id_from_concatenated_data()?,
+        };
         debug!("write-fieldnorms");
         if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
             self.write_fieldnorms(fieldnorms_serializer, &doc_id_mapping)?;
@@ -543,7 +775,7 @@ impl IndexMerger {
         )?;
 
         debug!("write-storagefields");
-        self.write_storable_fields(serializer.get_store_writer())?;
+        self.write_storable_fields(serializer.get_store_writer(), &doc_id_mapping)?;
         debug!("write-fastfields");
         self.write_fast_fields(serializer.get_fast_field_write(), doc_id_mapping)?;
 

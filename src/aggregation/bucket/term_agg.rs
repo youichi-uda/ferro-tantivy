@@ -146,9 +146,7 @@ pub enum IncludeExcludeParam {
 
 impl Serialize for IncludeExcludeParam {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
+    where S: serde::Serializer {
         match self {
             IncludeExcludeParam::Regex(s) => serializer.serialize_str(s),
             IncludeExcludeParam::Values(v) => v.serialize(serializer),
@@ -159,9 +157,7 @@ impl Serialize for IncludeExcludeParam {
 // Custom deserializer to accept either a single string (regex) or an array of strings (values).
 impl<'de> Deserialize<'de> for IncludeExcludeParam {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
+    where D: serde::Deserializer<'de> {
         use serde::de::{self, SeqAccess, Visitor};
         struct IncludeExcludeVisitor;
 
@@ -173,30 +169,22 @@ impl<'de> Deserialize<'de> for IncludeExcludeParam {
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
+            where E: de::Error {
                 Ok(IncludeExcludeParam::Regex(v.to_string()))
             }
 
             fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
+            where E: de::Error {
                 Ok(IncludeExcludeParam::Regex(v.to_string()))
             }
 
             fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
+            where E: de::Error {
                 Ok(IncludeExcludeParam::Regex(v))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
+            where A: SeqAccess<'de> {
                 let mut values: Vec<String> = Vec::new();
                 while let Some(elem) = seq.next_element::<String>()? {
                     values.push(elem);
@@ -2495,11 +2483,15 @@ mod tests {
             index_writer.set_merge_policy(Box::new(NoMergePolicy));
             let ops: Vec<UserOperation<crate::TantivyDocument>> = vec![
                 UserOperation::Delete(crate::Term::from_field_text(id_field, "a")),
-                UserOperation::Add(doc!(id_field => "a", author_name => "alice", author_raw => "alice")),
+                UserOperation::Add(
+                    doc!(id_field => "a", author_name => "alice", author_raw => "alice"),
+                ),
                 UserOperation::Delete(crate::Term::from_field_text(id_field, "r1")),
                 UserOperation::Add(doc!(id_field => "r1", foo => "bar", foo_keyword => "bar")),
                 UserOperation::Delete(crate::Term::from_field_text(id_field, "b")),
-                UserOperation::Add(doc!(id_field => "b", author_name => "bob", author_raw => "bob")),
+                UserOperation::Add(
+                    doc!(id_field => "b", author_name => "bob", author_raw => "bob"),
+                ),
             ];
             index_writer.run(ops)?;
             index_writer.commit()?;
@@ -2516,8 +2508,12 @@ mod tests {
         for b in buckets {
             let key = b["key"].as_str().unwrap();
             let count = b["doc_count"].as_u64().unwrap();
-            if key == "alice" { alice_count = count; }
-            if key == "bob" { bob_count = count; }
+            if key == "alice" {
+                alice_count = count;
+            }
+            if key == "bob" {
+                bob_count = count;
+            }
         }
         assert_eq!(alice_count, 1, "alice over-count: buckets = {buckets:?}");
         assert_eq!(bob_count, 1, "bob count: buckets = {buckets:?}");

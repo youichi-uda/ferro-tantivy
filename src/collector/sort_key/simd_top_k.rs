@@ -9,13 +9,12 @@
 //! slower than ES 9.3.2.  ES wins because Lucene's `NumericComparator` does
 //! three things our hot loop did NOT:
 //!
-//! 1. **Type-specialized threshold compare** (raw `u64`/`i64`/`f64` rather
-//!    than going through a generic `Comparator<Option<u64>>`).
+//! 1. **Type-specialized threshold compare** (raw `u64`/`i64`/`f64` rather than going through a
+//!    generic `Comparator<Option<u64>>`).
 //! 2. **Branchless asc/desc** via const generic / template specialization.
-//! 3. **Block-level SIMD** that filters a 64-doc block against the
-//!    current top-K threshold in a few vector ops, with bitmask compress
-//!    so the tight inner loop is just a couple of vpcmpgtq / vpand /
-//!    movemask instructions.
+//! 3. **Block-level SIMD** that filters a 64-doc block against the current top-K threshold in a few
+//!    vector ops, with bitmask compress so the tight inner loop is just a couple of vpcmpgtq /
+//!    vpand / movemask instructions.
 //!
 //! With top_n=10 (typical Rally `desc_sort_*` query) the threshold fills
 //! after the first 10 docs and from then on, **almost every doc in the
@@ -42,15 +41,13 @@
 //!
 //! # SIMD dispatch
 //!
-//! - `aarch64`: NEON `uint64x2_t` (2 lanes per vector, 4 vectors per 8-element
-//!   group).  Used on Graviton EC2 / Apple Silicon.
-//! - `x86_64` with AVX2: `__m256i` 4-lane u64 with `_mm256_cmpgt_epi64` and
-//!   movemask via `_mm256_movemask_pd` (cast).  AVX2 is baseline on every
-//!   c5/c6/c7 instance and modern Ryzen.
-//! - Scalar fallback for everything else.  The compiler's autovectorizer
-//!   typically reaches 75–90% of the hand-rolled SIMD on the scalar path
-//!   for a tight `for i in 0..n { mask |= (a[i] > t) as u64 << i }` loop —
-//!   we still get a meaningful win because the `Comparator<Option<u64>>`
+//! - `aarch64`: NEON `uint64x2_t` (2 lanes per vector, 4 vectors per 8-element group).  Used on
+//!   Graviton EC2 / Apple Silicon.
+//! - `x86_64` with AVX2: `__m256i` 4-lane u64 with `_mm256_cmpgt_epi64` and movemask via
+//!   `_mm256_movemask_pd` (cast).  AVX2 is baseline on every c5/c6/c7 instance and modern Ryzen.
+//! - Scalar fallback for everything else.  The compiler's autovectorizer typically reaches 75–90%
+//!   of the hand-rolled SIMD on the scalar path for a tight `for i in 0..n { mask |= (a[i] > t) as
+//!   u64 << i }` loop — we still get a meaningful win because the `Comparator<Option<u64>>`
 //!   dispatch is gone.
 
 #![allow(unsafe_code)]
@@ -616,7 +613,8 @@ mod tests {
                 let scal = scalar::filter_block_gt_u64(&v, threshold, n);
                 assert_eq!(
                     simd, scal,
-                    "gt mismatch: threshold={threshold:#x}, n={n}, simd={simd:#x}, scalar={scal:#x}"
+                    "gt mismatch: threshold={threshold:#x}, n={n}, simd={simd:#x}, \
+                     scalar={scal:#x}"
                 );
             }
         }
@@ -631,7 +629,8 @@ mod tests {
                 let scal = scalar::filter_block_lt_u64(&v, threshold, n);
                 assert_eq!(
                     simd, scal,
-                    "lt mismatch: threshold={threshold:#x}, n={n}, simd={simd:#x}, scalar={scal:#x}"
+                    "lt mismatch: threshold={threshold:#x}, n={n}, simd={simd:#x}, \
+                     scalar={scal:#x}"
                 );
             }
         }

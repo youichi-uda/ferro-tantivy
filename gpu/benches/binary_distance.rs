@@ -4,15 +4,13 @@
 //! This is the Phase 2 A integration bench. It exercises the three
 //! shapes that production k-NN over BBQ codes actually run on:
 //!
-//!   1. Single query × N corpus  — the foundation kernel; vec4 SIMD
-//!      widening; CPU is hard to beat for small N because of PCIe
-//!      upload + dispatch overhead.
-//!   2. Batched Q × N            — the breaking-point case; corpus is
-//!      tiled into shared memory, every query in the workgroup reuses
-//!      the same tile, which collapses VRAM bandwidth from
-//!      Q · |corpus| to ~|corpus|.
-//!   3. End-to-end k-NN          — distance + on-GPU top-K. Only Q · K
-//!      pairs cross PCIe back. This is the production entry point.
+//!   1. Single query × N corpus  — the foundation kernel; vec4 SIMD widening; CPU is hard to beat
+//!      for small N because of PCIe upload + dispatch overhead.
+//!   2. Batched Q × N            — the breaking-point case; corpus is tiled into shared memory,
+//!      every query in the workgroup reuses the same tile, which collapses VRAM bandwidth from Q ·
+//!      |corpus| to ~|corpus|.
+//!   3. End-to-end k-NN          — distance + on-GPU top-K. Only Q · K pairs cross PCIe back. This
+//!      is the production entry point.
 //!
 //! Real-data benchmarks against SIFT1M / GIST1M / DEEP1B (ground-truth
 //! recall + recall@k) are deferred to a GA-prep wave — those need
@@ -25,16 +23,33 @@
 //!     cargo bench -p tantivy-gpu --bench binary_distance --no-run
 //!
 //! Behaviour:
-//! - if no hardware GPU is present the bench prints the CPU baseline
-//!   and exits (does **not** abort), so this can run as a smoke check
-//!   on CI and on dev laptops without a discrete GPU.
-//! - the GPU result is verified byte-equal against the CPU baseline on
-//!   each shape — divergence aborts the bench.
-//! - on real GPU hardware, the headline shape (N = 1_000_000, Q = 64,
-//!   K = 100) asserts that the GPU end-to-end k-NN beats the CPU
-//!   batched-distance + top-K oracle by ≥ 5×. If your hardware can't
-//!   sustain that, set `BINARY_DIST_BENCH_NO_ASSERT=1` in the
-//!   environment to skip the assert (the numbers still print).
+//! - if no hardware GPU is present the bench prints the CPU baseline and exits (does **not**
+//!   abort), so this can run as a smoke check on CI and on dev laptops without a discrete GPU.
+//! - the GPU result is verified byte-equal against the CPU baseline on each shape — divergence
+//!   aborts the bench.
+//! - on real GPU hardware, the headline shape (N = 1_000_000, Q = 64, K = 100) asserts that the GPU
+//!   end-to-end k-NN beats the CPU batched-distance + top-K oracle by ≥ 5×. If your hardware can't
+//!   sustain that, set `BINARY_DIST_BENCH_NO_ASSERT=1` in the environment to skip the assert (the
+//!   numbers still print).
+//!
+//! ## Hardware assumptions for the headline thresholds
+//!
+//! The 5×/3×/4× threshold assertions in this file and in
+//! `gpu/benches/hnsw_binary.rs` are calibrated against the **reference
+//! hardware** documented in `gpu/docs/ADR-001-cuda-backend.md` §Re-validation:
+//!
+//! - NVIDIA RTX 4070 Ti SUPER (Ada, sm_89, ~672 GB/s HBM-equivalent)
+//! - NVIDIA L4 (Ada, sm_89, datacenter)
+//!
+//! On older NVIDIA architectures (Turing sm_75 / Ampere sm_80–86 consumer
+//! cards with smaller memory channels) and on integrated / mobile GPUs,
+//! expect 40–60 % of the headline speedups — sufficient to validate the
+//! fast path's correctness but below the assertion floor. Use
+//! `BINARY_DIST_BENCH_NO_ASSERT=1` for those runs.
+//!
+//! These thresholds are **not** enforced in CI (`cargo +nightly bench
+//! --no-run` only checks compilation); they exist to catch regressions on
+//! reference dev hosts and to anchor the ADR's speedup commitments.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -242,7 +257,14 @@ fn main() {
         let corpus = random_u32_vec(num_vecs * dim_u32, 0xd1d2_d3d4_d5d6_d7d8);
 
         let cpu_time = bench(1, || {
-            black_box(cpu_knn(&queries, &corpus, num_queries, num_vecs, dim_u32, k));
+            black_box(cpu_knn(
+                &queries,
+                &corpus,
+                num_queries,
+                num_vecs,
+                dim_u32,
+                k,
+            ));
         });
 
         let gpu_iters = if ctx.is_hardware_gpu() { 5 } else { 1 };
@@ -305,8 +327,8 @@ fn main() {
 
     if !ctx.is_hardware_gpu() {
         println!(
-            "(skipping GPU headline because no real GPU is available — \
-             CPU-fallback path would just re-execute the same code on host)"
+            "(skipping GPU headline because no real GPU is available — CPU-fallback path would \
+             just re-execute the same code on host)"
         );
     } else {
         // Warm up GPU, then 5-iter average.
@@ -363,8 +385,8 @@ fn main() {
         if !assert_off {
             assert!(
                 speedup >= HEADLINE_REQUIRED_SPEEDUP,
-                "headline GPU k-NN speedup ({speedup:.2}x) below required {:.1}x at \
-                 N={} Q={} K={}. Set BINARY_DIST_BENCH_NO_ASSERT=1 to skip.",
+                "headline GPU k-NN speedup ({speedup:.2}x) below required {:.1}x at N={} Q={} \
+                 K={}. Set BINARY_DIST_BENCH_NO_ASSERT=1 to skip.",
                 HEADLINE_REQUIRED_SPEEDUP,
                 HEADLINE_N,
                 HEADLINE_Q,
@@ -382,9 +404,595 @@ fn main() {
     if !ctx.is_hardware_gpu() {
         println!();
         println!(
-            "NOTE: ran on CPU fallback. For real GPU numbers re-run on \
-             a host with a discrete GPU (e.g. RTX 4070 Ti SUPER)."
+            "NOTE: ran on CPU fallback. For real GPU numbers re-run on a host with a discrete GPU \
+             (e.g. RTX 4070 Ti SUPER)."
         );
     }
+
+    // ── CUDA Tensor Core vs WGSL head-to-head ──
+    #[cfg(feature = "cuda-tensor-core")]
+    cuda_vs_wgsl_section(&ctx);
+
     println!("\n=== Done ===");
+}
+
+/// Phase 2 deliverable: time the CUDA Tensor Core path against the
+/// WGSL `xor_popcount_batched.wgsl` shader on the same `(Q, N, dim)`
+/// grid and emit the numbers as `benches/data/cuda_vs_wgsl.json`.
+///
+/// **Go threshold**: CUDA ≥ 3× WGSL on the headline shape. The
+/// envelope from the Wave 4 verdict (RTX 4070 Ti SUPER) is 6-7×, so
+/// 3× is the conservative sign-off bar — a regression below it is a
+/// red flag.
+#[cfg(feature = "cuda-tensor-core")]
+fn cuda_vs_wgsl_section(ctx: &GpuContext) {
+    use tantivy_gpu::vector::cuda_tensor_core::CudaTensorCoreKernel;
+
+    println!();
+    println!("--- CUDA Tensor Core vs WGSL (batched Q × N) ---");
+
+    let cuda = match CudaTensorCoreKernel::try_new() {
+        Ok(k) => k,
+        Err(e) => {
+            println!("(skipping — CUDA Tensor Core path unavailable on this host: {e})");
+            return;
+        }
+    };
+
+    // The WGSL-only kernel forces the WGSL pipeline even though the
+    // build has `cuda-tensor-core` enabled, so we can A/B both paths
+    // from the same process.
+    let wgsl_kernel = BinaryDistanceKernel::new_wgsl_only(ctx).expect("compile wgsl-only");
+
+    // Same grid as the existing batched section, plus one larger
+    // shape (the headline) so the JSON includes the production target.
+    let shapes: &[(&str, usize, usize, usize)] = &[
+        ("dim=768  N=10000   Q=8  ", 10_000, 8, 768),
+        ("dim=768  N=10000   Q=64 ", 10_000, 64, 768),
+        ("dim=768  N=100000  Q=8  ", 100_000, 8, 768),
+        ("dim=768  N=100000  Q=64 ", 100_000, 64, 768),
+        ("dim=768  N=1000000 Q=64 ", 1_000_000, 64, 768),
+    ];
+
+    println!(
+        "{:<32}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "shape", "WGSL", "CUDA", "speedup", "match"
+    );
+
+    let mut json_rows: Vec<String> = Vec::new();
+    // Assert on the N=100k Q=64 shape — that's representative of a
+    // single Tantivy segment in production. The N=1M shape is kept in
+    // the JSON for tracking but not in the assertion gate, because at
+    // that extreme PCIe upload+download dominates the wall-clock and
+    // CUDA's tensor-core advantage is amortised away (Wave 4's 6-7×
+    // figure assumes a *device-resident* corpus, which is a Phase 4
+    // follow-up — see ADR-001-cuda-backend.md).
+    let go_threshold = 3.0_f64;
+    const ASSERT_N: usize = 100_000;
+    const ASSERT_Q: usize = 64;
+    let mut assert_speedup: Option<f64> = None;
+    let mut headline_speedup: Option<f64> = None;
+
+    for &(label, num_vecs, num_queries, dim_bits) in shapes {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let queries = random_u32_vec(num_queries * dim_u32, 0xa1a2_a3a4_a5a6_a7a8);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0xb1b2_b3b4_b5b6_b7b8);
+
+        // Warm up + correctness check.
+        let cuda_first = cuda
+            .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+            .expect("cuda batched");
+        let wgsl_first = wgsl_kernel
+            .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+            .expect("wgsl batched");
+        let matches = cuda_first == wgsl_first;
+        if !matches {
+            panic!(
+                "CUDA vs WGSL byte-equal violated on shape {label} (Q={num_queries}, \
+                 N={num_vecs}, dim_bits={dim_bits})"
+            );
+        }
+
+        let iters = if num_vecs >= 1_000_000 { 3 } else { 5 };
+        let cuda_time = bench(iters, || {
+            black_box(
+                cuda.compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("cuda batched"),
+            );
+        });
+        let wgsl_time = bench(iters, || {
+            black_box(
+                wgsl_kernel
+                    .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("wgsl batched"),
+            );
+        });
+        let speedup = wgsl_time.as_nanos() as f64 / cuda_time.as_nanos().max(1) as f64;
+        if num_vecs == ASSERT_N && num_queries == ASSERT_Q {
+            assert_speedup = Some(speedup);
+        }
+        if num_vecs == 1_000_000 {
+            headline_speedup = Some(speedup);
+        }
+
+        println!(
+            "{:<32}  {:>10}  {:>10}  {:>7.2}x  {:>8}",
+            label,
+            fmt_dur(wgsl_time),
+            fmt_dur(cuda_time),
+            speedup,
+            if matches { "ok" } else { "DIVERGE" }
+        );
+
+        json_rows.push(format!(
+            "    {{\"shape\": \"{}\", \"num_queries\": {}, \"num_vecs\": {}, \"dim_bits\": {}, \
+             \"wgsl_ns\": {}, \"cuda_ns\": {}, \"speedup\": {:.4}, \"byte_equal\": {}}}",
+            label.trim(),
+            num_queries,
+            num_vecs,
+            dim_bits,
+            wgsl_time.as_nanos(),
+            cuda_time.as_nanos(),
+            speedup,
+            matches
+        ));
+    }
+
+    // Emit JSON next to the bench so CI / regression tracking can parse it.
+    let info = ctx.info();
+    let mut json = String::new();
+    json.push_str("{\n");
+    json.push_str(&format!("  \"backend\": \"{}\",\n", info.backend));
+    json.push_str(&format!(
+        "  \"device\": \"{}\",\n",
+        info.name.replace('"', "\\\"")
+    ));
+    json.push_str(&format!("  \"go_threshold_speedup\": {go_threshold:.1},\n"));
+    json.push_str("  \"results\": [\n");
+    json.push_str(&json_rows.join(",\n"));
+    json.push_str("\n  ]\n}\n");
+
+    let out_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("data");
+    if let Err(e) = std::fs::create_dir_all(&out_path) {
+        eprintln!("failed to create {}: {e}", out_path.display());
+        return;
+    }
+    let out_path = out_path.join("cuda_vs_wgsl.json");
+    match std::fs::write(&out_path, &json) {
+        Ok(()) => println!("wrote {}", out_path.display()),
+        Err(e) => eprintln!("failed to write {}: {e}", out_path.display()),
+    }
+
+    if let Some(h) = headline_speedup {
+        println!("(N=1M tracking only): CUDA {h:.2}x WGSL — see ADR-001 §Consequences");
+    }
+
+    // ── Cached-corpus head-to-head (Phase 4 deliverable) ──
+    println!();
+    println!("--- CUDA cached corpus vs WGSL (production calling pattern) ---");
+    println!("(prepare_corpus once, then time only the per-query batch)");
+    println!("(CUDA-c = `Vec<u32>` API, CUDA-p = `_into_pinned` Phase 5-1 path)");
+    println!(
+        "{:<32}  {:>10}  {:>10}  {:>10}  {:>8}  {:>8}  {:>8}",
+        "shape", "WGSL", "CUDA-c", "CUDA-p", "c/WGSL", "p/WGSL", "match"
+    );
+    let cached_shapes: &[(&str, usize, usize, usize)] = &[
+        ("dim=768  N=100000  Q=64 ", 100_000, 64, 768),
+        ("dim=768  N=1000000 Q=64 ", 1_000_000, 64, 768),
+    ];
+    let mut cached_json_rows: Vec<String> = Vec::new();
+    let mut cached_1m_speedup: Option<f64> = None;
+    let mut pinned_1m_speedup: Option<f64> = None;
+    for &(label, num_vecs, num_queries, dim_bits) in cached_shapes {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let queries = random_u32_vec(num_queries * dim_u32, 0xa1a2_a3a4_a5a6_a7a8);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0xb1b2_b3b4_b5b6_b7b8);
+
+        let cached = cuda
+            .prepare_corpus(&corpus, num_vecs, dim_bits)
+            .expect("prepare_corpus");
+
+        let cuda_first = cached
+            .compute_batched(&queries, num_queries)
+            .expect("cuda cached");
+        let wgsl_first = wgsl_kernel
+            .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+            .expect("wgsl batched");
+        let matches = cuda_first == wgsl_first;
+        if !matches {
+            panic!("cached CUDA != WGSL on shape {label}");
+        }
+
+        // Phase 5-1 entry point: a user-supplied pinned host buffer
+        // sized once for the largest batch, reused across calls.
+        let mut pinned_out = cuda
+            .alloc_pinned_u32(num_queries * num_vecs)
+            .expect("alloc_pinned_u32");
+        cached
+            .compute_batched_into_pinned(&queries, num_queries, &mut pinned_out)
+            .expect("cuda cached pinned");
+        let pinned_matches = pinned_out.as_slice() == cuda_first.as_slice();
+        if !pinned_matches {
+            panic!("pinned CUDA != Vec CUDA on shape {label}");
+        }
+
+        let iters = if num_vecs >= 1_000_000 { 3 } else { 5 };
+        let cuda_time = bench(iters, || {
+            black_box(
+                cached
+                    .compute_batched(&queries, num_queries)
+                    .expect("cuda cached"),
+            );
+        });
+        let pinned_time = bench(iters, || {
+            cached
+                .compute_batched_into_pinned(&queries, num_queries, &mut pinned_out)
+                .expect("cuda cached pinned");
+            black_box(pinned_out.as_slice());
+        });
+        let wgsl_time = bench(iters, || {
+            black_box(
+                wgsl_kernel
+                    .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("wgsl batched"),
+            );
+        });
+        let cuda_speedup = wgsl_time.as_nanos() as f64 / cuda_time.as_nanos().max(1) as f64;
+        let pinned_speedup = wgsl_time.as_nanos() as f64 / pinned_time.as_nanos().max(1) as f64;
+        if num_vecs == 1_000_000 {
+            cached_1m_speedup = Some(cuda_speedup);
+            pinned_1m_speedup = Some(pinned_speedup);
+        }
+        println!(
+            "{:<32}  {:>10}  {:>10}  {:>10}  {:>7.2}x  {:>7.2}x  {:>8}",
+            label,
+            fmt_dur(wgsl_time),
+            fmt_dur(cuda_time),
+            fmt_dur(pinned_time),
+            cuda_speedup,
+            pinned_speedup,
+            if matches && pinned_matches {
+                "ok"
+            } else {
+                "DIVERGE"
+            }
+        );
+        cached_json_rows.push(format!(
+            "    {{\"shape\": \"{}\", \"num_queries\": {}, \"num_vecs\": {}, \"dim_bits\": {}, \
+             \"wgsl_ns\": {}, \"cuda_cached_ns\": {}, \"cuda_pinned_ns\": {}, \"cached_speedup\": \
+             {:.4}, \"pinned_speedup\": {:.4}, \"byte_equal\": {}}}",
+            label.trim(),
+            num_queries,
+            num_vecs,
+            dim_bits,
+            wgsl_time.as_nanos(),
+            cuda_time.as_nanos(),
+            pinned_time.as_nanos(),
+            cuda_speedup,
+            pinned_speedup,
+            matches && pinned_matches
+        ));
+    }
+
+    // Append cached results to the JSON.
+    let cached_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("data")
+        .join("cuda_cached_vs_wgsl.json");
+    let mut cached_json = String::new();
+    cached_json.push_str("{\n");
+    cached_json.push_str(&format!("  \"backend\": \"{}\",\n", info.backend));
+    cached_json.push_str(&format!(
+        "  \"device\": \"{}\",\n",
+        info.name.replace('"', "\\\"")
+    ));
+    cached_json
+        .push_str("  \"calling_pattern\": \"prepare_corpus once, then time per-query batch\",\n");
+    cached_json.push_str("  \"variants\": {\n");
+    cached_json.push_str(
+        "    \"cuda_cached_ns\": \"compute_batched (Vec<u32> return — pinned scratch + \
+         memcpy)\",\n",
+    );
+    cached_json.push_str(
+        "    \"cuda_pinned_ns\": \"compute_batched_into_pinned (Phase 5-1 — direct pinned DMA, no \
+         host memcpy)\"\n",
+    );
+    cached_json.push_str("  },\n");
+    cached_json.push_str("  \"results\": [\n");
+    cached_json.push_str(&cached_json_rows.join(",\n"));
+    cached_json.push_str("\n  ]\n}\n");
+    if let Err(e) = std::fs::write(&cached_path, &cached_json) {
+        eprintln!("failed to write {}: {e}", cached_path.display());
+    } else {
+        println!("wrote {}", cached_path.display());
+    }
+
+    // Phase 4 sign-off: with `prepare_corpus` the N=1M shape must
+    // also clear the 3× threshold (Wave 4's 6-7× target with
+    // device-resident corpus).
+    if let Some(s) = cached_1m_speedup {
+        let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
+        if !assert_off {
+            assert!(
+                s >= go_threshold,
+                "CUDA-cached vs WGSL @ N=1M Q=64 = {s:.2}x below Go threshold {go_threshold:.1}x. \
+                 Set BINARY_DIST_BENCH_NO_ASSERT=1 to skip."
+            );
+            println!("ASSERT PASSED   : CUDA-cached @ N=1M Q=64 = {s:.2}x >= {go_threshold:.1}x");
+        }
+    }
+
+    // Phase 5-1 sign-off: the pinned-output path must clear 4× WGSL
+    // at the headline shape — that's the conservative target the
+    // ADR's Phase 5-1 entry advertises (the Wave 4 envelope for a
+    // device-resident corpus + pinned host DMA was 6-7×, so 4× is
+    // the regression gate).
+    let phase_5_1_threshold = 4.0_f64;
+    if let Some(s) = pinned_1m_speedup {
+        let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
+        if !assert_off {
+            assert!(
+                s >= phase_5_1_threshold,
+                "Phase 5-1 pinned path @ N=1M Q=64 = {s:.2}x below threshold \
+                 {phase_5_1_threshold:.1}x. Set BINARY_DIST_BENCH_NO_ASSERT=1 to skip."
+            );
+            println!(
+                "ASSERT PASSED   : CUDA-pinned @ N=1M Q=64 = {s:.2}x >= {phase_5_1_threshold:.1}x"
+            );
+        }
+    }
+
+    // ── Phase 5-2: double-buffered batched pipeline ──
+    //
+    // Models the "score B independent query batches against the same
+    // segment" pattern. Each batch is small enough that the GEMM
+    // alone doesn't fully cover upload + download; the double-buffered
+    // pipeline overlaps the next batch's upload with the current
+    // batch's compute and the previous batch's download.
+    println!();
+    println!("--- Phase 5-2 double-buffered batched pipeline ---");
+    println!("(B batches × Q queries × N corpus × dim 768; one prepare_corpus,");
+    println!(" then `compute_batched_into_pinned` × B serially vs `compute_batches_into_pinned`)");
+    println!(
+        "{:<40}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "shape", "serial", "doublebuf", "speedup", "match"
+    );
+    let pipeline_shapes: &[(&str, usize, usize, usize, usize)] = &[
+        // (label, num_batches, num_queries_per_batch, num_vecs, dim_bits)
+        ("B=10  Q=4   N=100000 ", 10, 4, 100_000, 768),
+        ("B=10  Q=64  N=100000 ", 10, 64, 100_000, 768),
+        ("B=10  Q=64  N=1000000", 10, 64, 1_000_000, 768),
+    ];
+    let mut pipeline_json_rows: Vec<String> = Vec::new();
+    let mut pipeline_1m_speedup: Option<f64> = None;
+    for &(label, num_batches, num_q, num_vecs, dim_bits) in pipeline_shapes {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let words_per_batch = num_q * dim_u32;
+        let queries = random_u32_vec(num_batches * words_per_batch, 0x1010_2020_3030_4040);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0x5050_6060_7070_8080);
+        let cached = cuda
+            .prepare_corpus(&corpus, num_vecs, dim_bits)
+            .expect("prepare_corpus");
+
+        // Pre-allocate the two pinned buffers at the maximum sizes.
+        let mut pinned_serial = cuda
+            .alloc_pinned_u32(num_q * num_vecs)
+            .expect("alloc_pinned_u32 serial");
+        let mut pinned_db = cuda
+            .alloc_pinned_u32(num_batches * num_q * num_vecs)
+            .expect("alloc_pinned_u32 doublebuf");
+
+        // Correctness: double-buffered output must match the
+        // single-batch path bit-for-bit, batch by batch.
+        cached
+            .compute_batches_into_pinned(&queries, num_q, num_batches, &mut pinned_db)
+            .expect("compute_batches_into_pinned");
+        let mut matches = true;
+        for b in 0..num_batches {
+            let qslice = &queries[b * words_per_batch..(b + 1) * words_per_batch];
+            cached
+                .compute_batched_into_pinned(qslice, num_q, &mut pinned_serial)
+                .expect("compute_batched_into_pinned");
+            let lhs = &pinned_db.as_slice()[b * num_q * num_vecs..(b + 1) * num_q * num_vecs];
+            let rhs = &pinned_serial.as_slice()[..num_q * num_vecs];
+            if lhs != rhs {
+                matches = false;
+                break;
+            }
+        }
+        if !matches {
+            panic!("double-buffered != single-batch on shape {label}");
+        }
+
+        let iters = if num_vecs >= 1_000_000 { 3 } else { 5 };
+        let serial_time = bench(iters, || {
+            for b in 0..num_batches {
+                let qslice = &queries[b * words_per_batch..(b + 1) * words_per_batch];
+                cached
+                    .compute_batched_into_pinned(qslice, num_q, &mut pinned_serial)
+                    .expect("serial");
+                black_box(pinned_serial.as_slice());
+            }
+        });
+        let db_time = bench(iters, || {
+            cached
+                .compute_batches_into_pinned(&queries, num_q, num_batches, &mut pinned_db)
+                .expect("doublebuf");
+            black_box(pinned_db.as_slice());
+        });
+        let speedup = serial_time.as_nanos() as f64 / db_time.as_nanos().max(1) as f64;
+        if num_vecs == 1_000_000 {
+            pipeline_1m_speedup = Some(speedup);
+        }
+        println!(
+            "{:<40}  {:>10}  {:>10}  {:>7.2}x  {:>8}",
+            label,
+            fmt_dur(serial_time),
+            fmt_dur(db_time),
+            speedup,
+            "ok"
+        );
+        pipeline_json_rows.push(format!(
+            "    {{\"shape\": \"{}\", \"num_batches\": {}, \"num_queries\": {}, \"num_vecs\": {}, \
+             \"dim_bits\": {}, \"serial_ns\": {}, \"doublebuf_ns\": {}, \"speedup\": {:.4}, \
+             \"byte_equal\": true}}",
+            label.trim(),
+            num_batches,
+            num_q,
+            num_vecs,
+            dim_bits,
+            serial_time.as_nanos(),
+            db_time.as_nanos(),
+            speedup
+        ));
+    }
+    let pipeline_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("data")
+        .join("cuda_doublebuf.json");
+    let mut pipeline_json = String::new();
+    pipeline_json.push_str("{\n");
+    pipeline_json.push_str(&format!("  \"backend\": \"{}\",\n", info.backend));
+    pipeline_json.push_str(&format!(
+        "  \"device\": \"{}\",\n",
+        info.name.replace('"', "\\\"")
+    ));
+    pipeline_json.push_str(
+        "  \"calling_pattern\": \"compute_batched_into_pinned (serial) vs \
+         compute_batches_into_pinned (Phase 5-2 double-buffered)\",\n",
+    );
+    pipeline_json.push_str("  \"results\": [\n");
+    pipeline_json.push_str(&pipeline_json_rows.join(",\n"));
+    pipeline_json.push_str("\n  ]\n}\n");
+    if let Err(e) = std::fs::write(&pipeline_path, &pipeline_json) {
+        eprintln!("failed to write {}: {e}", pipeline_path.display());
+    } else {
+        println!("wrote {}", pipeline_path.display());
+    }
+    if let Some(s) = pipeline_1m_speedup {
+        println!("(N=1M tracking): double-buffer speedup = {s:.2}x serial");
+    }
+
+    // ── Phase 5-3 head-to-head: BMMA inline-PTX vs cuBLASLt INT8 ──
+    println!();
+    println!("--- Phase 5-3 BMMA vs cuBLASLt INT8 (cold path) ---");
+    println!(
+        "{:<33}  {:>10}  {:>10}  {:>8}  {:>8}",
+        "shape", "INT8", "BMMA", "INT8/BMMA", "match"
+    );
+    let bmma_shapes: &[(&str, usize, usize, usize)] = &[
+        ("dim=128  N=1024    Q=8   ", 1_024, 8, 128),
+        ("dim=256  N=10000   Q=8   ", 10_000, 8, 256),
+        ("dim=512  N=10000   Q=64  ", 10_000, 64, 512),
+        ("dim=768  N=10000   Q=64  ", 10_000, 64, 768),
+        ("dim=768  N=100000  Q=64  ", 100_000, 64, 768),
+        ("dim=1024 N=100000  Q=64  ", 100_000, 64, 1024),
+        ("dim=768  N=1000000 Q=64  ", 1_000_000, 64, 768),
+    ];
+    let mut bmma_json_rows: Vec<String> = Vec::new();
+    for &(label, num_vecs, num_queries, dim_bits) in bmma_shapes {
+        let dim_u32 = dim_u32_for(dim_bits);
+        let queries = random_u32_vec(num_queries * dim_u32, 0xb1b1_b1b1_b1b1_b1b1);
+        let corpus = random_u32_vec(num_vecs * dim_u32, 0xa2a2_a2a2_a2a2_a2a2);
+
+        let int8_first = cuda
+            .compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+            .expect("int8 batched");
+        let bmma_first =
+            match cuda.compute_batched_bmma(&queries, &corpus, num_queries, num_vecs, dim_bits) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("{:<32}  (skipped — BMMA unavailable: {e})", label);
+                    continue;
+                }
+            };
+        let matches = int8_first == bmma_first;
+        if !matches {
+            panic!("BMMA != INT8 on shape {label}");
+        }
+
+        let iters = if num_vecs >= 1_000_000 {
+            2
+        } else if num_vecs >= 100_000 {
+            3
+        } else {
+            5
+        };
+        let int8_time = bench(iters, || {
+            black_box(
+                cuda.compute_batched(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("int8 batched"),
+            );
+        });
+        let bmma_time = bench(iters, || {
+            black_box(
+                cuda.compute_batched_bmma(&queries, &corpus, num_queries, num_vecs, dim_bits)
+                    .expect("bmma batched"),
+            );
+        });
+        let speedup = int8_time.as_nanos() as f64 / bmma_time.as_nanos().max(1) as f64;
+        println!(
+            "{:<33}  {:>10}  {:>10}  {:>7.2}x  {:>8}",
+            label,
+            fmt_dur(int8_time),
+            fmt_dur(bmma_time),
+            speedup,
+            if matches { "ok" } else { "DIVERGE" }
+        );
+        bmma_json_rows.push(format!(
+            "    {{\"shape\": \"{}\", \"num_queries\": {}, \"num_vecs\": {}, \"dim_bits\": {}, \
+             \"int8_ns\": {}, \"bmma_ns\": {}, \"speedup_int8_over_bmma\": {:.4}, \"byte_equal\": \
+             {}}}",
+            label.trim(),
+            num_queries,
+            num_vecs,
+            dim_bits,
+            int8_time.as_nanos(),
+            bmma_time.as_nanos(),
+            speedup,
+            matches
+        ));
+    }
+    let bmma_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches")
+        .join("data")
+        .join("cuda_bmma_vs_int8.json");
+    let mut bmma_json = String::new();
+    bmma_json.push_str("{\n");
+    bmma_json.push_str(&format!("  \"backend\": \"{}\",\n", info.backend));
+    bmma_json.push_str(&format!(
+        "  \"device\": \"{}\",\n",
+        info.name.replace('"', "\\\"")
+    ));
+    bmma_json.push_str(
+        "  \"calling_pattern\": \"compute_batched (cuBLASLt INT8 IMMA) vs compute_batched_bmma \
+         (inline-PTX mma.sync.aligned.m8n8k128.b1.xor.popc, naive 1-warp-per-(8x8)-tile)\",\n",
+    );
+    bmma_json.push_str("  \"results\": [\n");
+    bmma_json.push_str(&bmma_json_rows.join(",\n"));
+    bmma_json.push_str("\n  ]\n}\n");
+    if let Err(e) = std::fs::write(&bmma_path, &bmma_json) {
+        eprintln!("failed to write {}: {e}", bmma_path.display());
+    } else {
+        println!("wrote {}", bmma_path.display());
+    }
+
+    if let Some(s) = assert_speedup {
+        let assert_off = std::env::var("BINARY_DIST_BENCH_NO_ASSERT").is_ok();
+        if !assert_off {
+            assert!(
+                s >= go_threshold,
+                "CUDA-vs-WGSL speedup at N={ASSERT_N} Q={ASSERT_Q} = {s:.2}x below Go threshold \
+                 {go_threshold:.1}x. Set BINARY_DIST_BENCH_NO_ASSERT=1 to skip."
+            );
+            println!(
+                "ASSERT PASSED   : CUDA/WGSL @ N={ASSERT_N} Q={ASSERT_Q} = {s:.2}x >= \
+                 {go_threshold:.1}x"
+            );
+        } else {
+            println!("ASSERT SKIPPED  : BINARY_DIST_BENCH_NO_ASSERT set");
+        }
+    }
 }

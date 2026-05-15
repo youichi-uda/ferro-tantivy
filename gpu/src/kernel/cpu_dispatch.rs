@@ -27,9 +27,7 @@ pub fn dispatch_cpu_kernel(
         "bm25_score" => dispatch_bm25_score(bind_groups, workgroups, buffers),
         "compute_distances" => dispatch_compute_distances(bind_groups, workgroups, buffers),
         "xor_popcount" => dispatch_xor_popcount(bind_groups, workgroups, buffers),
-        "xor_popcount_batched" => {
-            dispatch_xor_popcount_batched(bind_groups, workgroups, buffers)
-        }
+        "xor_popcount_batched" => dispatch_xor_popcount_batched(bind_groups, workgroups, buffers),
         "top_k_select" => dispatch_top_k_select(bind_groups, workgroups, buffers),
         "bitmap_and" => dispatch_bitmap_op(bind_groups, workgroups, buffers, BitmapOp::And),
         "bitmap_or" => dispatch_bitmap_op(bind_groups, workgroups, buffers, BitmapOp::Or),

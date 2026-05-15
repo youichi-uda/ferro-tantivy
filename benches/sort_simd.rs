@@ -154,10 +154,5 @@ fn main() {
 
     // Adversarial: threshold above all values → no docs survive (best case
     // for both paths — measures pure compare throughput).
-    bench_kernel(
-        "1M docs adversarial (none pass)",
-        &input,
-        u64::MAX,
-        10,
-    );
+    bench_kernel("1M docs adversarial (none pass)", &input, u64::MAX, 10);
 }

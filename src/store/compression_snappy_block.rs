@@ -13,8 +13,7 @@
 //! markers) because Tantivy's docstore already block-aligns the writes
 //! and verifies block boundaries via the outer footer.
 
-use std::io;
-use std::mem;
+use std::{io, mem};
 
 use snap::raw::{decompress_len, max_compress_len, Decoder, Encoder};
 

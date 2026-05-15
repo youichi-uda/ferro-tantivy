@@ -12,8 +12,7 @@
 //!
 //! - [`Container::Array`] → `binary_search` on the sorted `keys` vec
 //! - [`Container::Bitmap`] → bit-scan from the target word
-//! - [`Container::Run`] → `partition_point` on run starts + offset
-//!   inside the matched run
+//! - [`Container::Run`] → `partition_point` on run starts + offset inside the matched run
 //!
 //! This keeps `seek(target)` at `O(log num_containers + log
 //! container_size)` worst-case instead of the linear scan a naive
@@ -194,12 +193,10 @@ impl<'a> RoaringDecoder<'a> {
     /// [`None`] if `target` exceeds every doc-id in the stream.
     ///
     /// Two-stage galloping search:
-    /// 1. Binary-search the `(high16, container)` table for the
-    ///    container that *might* contain `target` (i.e. the first
-    ///    container whose `high16` ≥ `target_high16`).
-    /// 2. If we land on the bucket that holds `target_high16`,
-    ///    binary-search within that container's low16 form. Otherwise
-    ///    enter the bucket fresh (its first key is ≥ `target` by
+    /// 1. Binary-search the `(high16, container)` table for the container that *might* contain
+    ///    `target` (i.e. the first container whose `high16` ≥ `target_high16`).
+    /// 2. If we land on the bucket that holds `target_high16`, binary-search within that
+    ///    container's low16 form. Otherwise enter the bucket fresh (its first key is ≥ `target` by
     ///    construction).
     pub fn seek(&mut self, target: u32) -> Option<u32> {
         let target_high16 = (target >> 16) as u16;

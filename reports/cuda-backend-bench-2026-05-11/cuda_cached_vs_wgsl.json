@@ -1,0 +1,13 @@
+{
+  "backend": "Vulkan",
+  "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "calling_pattern": "prepare_corpus once, then time per-query batch",
+  "variants": {
+    "cuda_cached_ns": "compute_batched (Vec<u32> return — pinned scratch + memcpy)",
+    "cuda_pinned_ns": "compute_batched_into_pinned (Phase 5-1 — direct pinned DMA, no host memcpy)"
+  },
+  "results": [
+    {"shape": "dim=768  N=100000  Q=64", "num_queries": 64, "num_vecs": 100000, "dim_bits": 768, "wgsl_ns": 26552063, "cuda_cached_ns": 2284075, "cuda_pinned_ns": 2201399, "cached_speedup": 11.6249, "pinned_speedup": 12.0614, "byte_equal": true},
+    {"shape": "dim=768  N=1000000 Q=64", "num_queries": 64, "num_vecs": 1000000, "dim_bits": 768, "wgsl_ns": 253260041, "cuda_cached_ns": 73447118, "cuda_pinned_ns": 27221729, "cached_speedup": 3.4482, "pinned_speedup": 9.3036, "byte_equal": true}
+  ]
+}

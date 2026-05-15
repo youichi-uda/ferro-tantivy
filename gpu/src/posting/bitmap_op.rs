@@ -54,30 +54,27 @@
 //! ## Scope of this file (Phase 2 C-1)
 //!
 //! Phase 2 C-1 delivers:
-//! 1. Three WGSL shaders (`bitmap_and.wgsl` / `bitmap_or.wgsl` /
-//!    `bitmap_xor.wgsl`) — each ~30 LOC, scalar word-wise body, bounds-
-//!    checked so the host can dispatch any `num_words` not a multiple
-//!    of the workgroup size.
-//! 2. A Rust kernel wrapper [`BitmapOpKernel`] that compiles all three
-//!    pipelines once and dispatches the requested [`BitmapOp`] against
-//!    a flat `&[u32]` representing `num_containers * 2048` words.
-//! 3. A CPU reference implementation [`bitmap_op_cpu`] used as the gold
-//!    oracle for tests — byte-equal to the GPU output (bitwise integer
-//!    arithmetic is exact, no float drift).
+//! 1. Three WGSL shaders (`bitmap_and.wgsl` / `bitmap_or.wgsl` / `bitmap_xor.wgsl`) — each ~30 LOC,
+//!    scalar word-wise body, bounds- checked so the host can dispatch any `num_words` not a
+//!    multiple of the workgroup size.
+//! 2. A Rust kernel wrapper [`BitmapOpKernel`] that compiles all three pipelines once and
+//!    dispatches the requested [`BitmapOp`] against a flat `&[u32]` representing `num_containers *
+//!    2048` words.
+//! 3. A CPU reference implementation [`bitmap_op_cpu`] used as the gold oracle for tests —
+//!    byte-equal to the GPU output (bitwise integer arithmetic is exact, no float drift).
 //! 4. Empty / unaligned / multi-container correctness tests.
 //!
 //! Phase 2 C-1 does **not** include:
 //! - Tantivy `vendor/tantivy-local/src/postings/roaring/` — that is C-3.
-//! - `ferro-compress` Bitcomp decompress + recompress bridge — that is
-//!   C-2 and lives in a different crate.
+//! - `ferro-compress` Bitcomp decompress + recompress bridge — that is C-2 and lives in a different
+//!   crate.
 //! - A query-planner dispatching threshold — that is C-4.
 //!
 //! ## Calling contract
 //!
-//! - `a` and `b` must have **identical** lengths and that length must
-//!   be a multiple of [`BITMAP_CONTAINER_WORDS`] (= 2048). Each input
-//!   is interpreted as `num_containers = a.len() / 2048` containers
-//!   laid flat.
+//! - `a` and `b` must have **identical** lengths and that length must be a multiple of
+//!   [`BITMAP_CONTAINER_WORDS`] (= 2048). Each input is interpreted as `num_containers = a.len() /
+//!   2048` containers laid flat.
 //! - `compute()` returns a `Vec<u32>` of the same length.
 //! - GPU and CPU output are **byte-equal**.
 //!
@@ -229,14 +226,12 @@ impl BitmapOpKernel {
     /// path API ([`Self::compute_resident`] / [`Self::download`]).
     ///
     /// # Errors
-    /// - [`GpuError::ColumnTypeMismatch`] if the length is not a
-    ///   multiple of [`BITMAP_CONTAINER_WORDS`].
+    /// - [`GpuError::ColumnTypeMismatch`] if the length is not a multiple of
+    ///   [`BITMAP_CONTAINER_WORDS`].
     pub fn upload(&self, label: &str, words: &[u32]) -> GpuResult<GpuBuffer> {
         if words.len() % BITMAP_CONTAINER_WORDS != 0 {
             return Err(GpuError::ColumnTypeMismatch {
-                expected: format!(
-                    "len multiple of {BITMAP_CONTAINER_WORDS}"
-                ),
+                expected: format!("len multiple of {BITMAP_CONTAINER_WORDS}"),
                 actual: format!("len == {}", words.len()),
             });
         }
@@ -251,14 +246,12 @@ impl BitmapOpKernel {
     /// later through [`Self::download`].
     ///
     /// # Errors
-    /// - [`GpuError::ColumnTypeMismatch`] if `num_words` is not a
-    ///   multiple of [`BITMAP_CONTAINER_WORDS`].
+    /// - [`GpuError::ColumnTypeMismatch`] if `num_words` is not a multiple of
+    ///   [`BITMAP_CONTAINER_WORDS`].
     pub fn alloc_output(&self, label: &str, num_words: usize) -> GpuResult<GpuBuffer> {
         if num_words % BITMAP_CONTAINER_WORDS != 0 {
             return Err(GpuError::ColumnTypeMismatch {
-                expected: format!(
-                    "num_words multiple of {BITMAP_CONTAINER_WORDS}"
-                ),
+                expected: format!("num_words multiple of {BITMAP_CONTAINER_WORDS}"),
                 actual: format!("num_words == {num_words}"),
             });
         }
@@ -286,13 +279,10 @@ impl BitmapOpKernel {
     /// each operand and writes that many to `out`.
     ///
     /// # Errors
-    /// - [`GpuError::ColumnTypeMismatch`] if any of the three buffers
-    ///   has a length that isn't a multiple of
-    ///   [`BITMAP_CONTAINER_WORDS`], or if `a` or `b` is shorter than
-    ///   `out`.
-    /// - [`GpuError::Dispatch`] if the bitmap op pipeline isn't
-    ///   compiled (impossible to hit through the public `new`/
-    ///   `compile` constructors, but defensive).
+    /// - [`GpuError::ColumnTypeMismatch`] if any of the three buffers has a length that isn't a
+    ///   multiple of [`BITMAP_CONTAINER_WORDS`], or if `a` or `b` is shorter than `out`.
+    /// - [`GpuError::Dispatch`] if the bitmap op pipeline isn't compiled (impossible to hit through
+    ///   the public `new`/ `compile` constructors, but defensive).
     pub fn compute_resident(
         &self,
         op: BitmapOp,
@@ -306,9 +296,7 @@ impl BitmapOpKernel {
         }
         if num_words % BITMAP_CONTAINER_WORDS != 0 {
             return Err(GpuError::ColumnTypeMismatch {
-                expected: format!(
-                    "out.len() multiple of {BITMAP_CONTAINER_WORDS}"
-                ),
+                expected: format!("out.len() multiple of {BITMAP_CONTAINER_WORDS}"),
                 actual: format!("out.len() == {num_words}"),
             });
         }
@@ -374,18 +362,17 @@ impl BitmapOpKernel {
     ///
     /// # Arguments
     /// - `op`: the bitwise operation to apply.
-    /// - `a`, `b`: flat u32 arrays representing `num_containers * 2048`
-    ///   words. Both must have the same length, and that length must
-    ///   be a multiple of [`BITMAP_CONTAINER_WORDS`]. An empty slice
-    ///   is allowed and returns an empty result without dispatching.
+    /// - `a`, `b`: flat u32 arrays representing `num_containers * 2048` words. Both must have the
+    ///   same length, and that length must be a multiple of [`BITMAP_CONTAINER_WORDS`]. An empty
+    ///   slice is allowed and returns an empty result without dispatching.
     ///
     /// # Returns
     /// `Vec<u32>` of length `a.len()` such that
     /// `result[i] == a[i] OP b[i]` for all `i`.
     ///
     /// # Errors
-    /// - [`GpuError::ColumnTypeMismatch`] if `a.len() != b.len()` or
-    ///   if the length is not a multiple of [`BITMAP_CONTAINER_WORDS`].
+    /// - [`GpuError::ColumnTypeMismatch`] if `a.len() != b.len()` or if the length is not a
+    ///   multiple of [`BITMAP_CONTAINER_WORDS`].
     pub fn compute(&self, op: BitmapOp, a: &[u32], b: &[u32]) -> GpuResult<Vec<u32>> {
         if a.len() != b.len() {
             return Err(GpuError::ColumnTypeMismatch {
@@ -396,8 +383,7 @@ impl BitmapOpKernel {
         if a.len() % BITMAP_CONTAINER_WORDS != 0 {
             return Err(GpuError::ColumnTypeMismatch {
                 expected: format!(
-                    "a.len() multiple of {BITMAP_CONTAINER_WORDS} \
-                     (8 KiB Roaring Bitmap container)"
+                    "a.len() multiple of {BITMAP_CONTAINER_WORDS} (8 KiB Roaring Bitmap container)"
                 ),
                 actual: format!("a.len() == {}", a.len()),
             });
@@ -703,8 +689,7 @@ mod tests {
 
     #[test]
     fn bitmap_op_all_iterates_canonical_order() {
-        let labels: Vec<&'static str> =
-            BitmapOp::ALL.iter().map(|o| o.label()).collect();
+        let labels: Vec<&'static str> = BitmapOp::ALL.iter().map(|o| o.label()).collect();
         assert_eq!(labels, vec!["AND", "OR", "XOR"]);
     }
 
@@ -771,14 +756,8 @@ mod tests {
     fn convenience_wrappers_match() {
         let a = random_u32_vec(BITMAP_CONTAINER_WORDS, 0x1234_5678_9abc_def0);
         let b = random_u32_vec(BITMAP_CONTAINER_WORDS, 0x0fed_cba9_8765_4321);
-        assert_eq!(
-            bitmap_and_cpu(&a, &b),
-            bitmap_op_cpu(BitmapOp::And, &a, &b)
-        );
+        assert_eq!(bitmap_and_cpu(&a, &b), bitmap_op_cpu(BitmapOp::And, &a, &b));
         assert_eq!(bitmap_or_cpu(&a, &b), bitmap_op_cpu(BitmapOp::Or, &a, &b));
-        assert_eq!(
-            bitmap_xor_cpu(&a, &b),
-            bitmap_op_cpu(BitmapOp::Xor, &a, &b)
-        );
+        assert_eq!(bitmap_xor_cpu(&a, &b), bitmap_op_cpu(BitmapOp::Xor, &a, &b));
     }
 }

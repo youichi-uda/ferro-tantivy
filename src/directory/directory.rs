@@ -223,6 +223,42 @@ pub trait Directory: DirectoryClone + fmt::Debug + Send + Sync + 'static {
     /// `OnCommitWithDelay` `ReloadPolicy`. Not implementing watch in a `Directory` only prevents
     /// the `OnCommitWithDelay` `ReloadPolicy` to work properly.
     fn watch(&self, watch_callback: WatchCallback) -> crate::Result<WatchHandle>;
+
+    /// Marks a file as "pending publication", protecting it from
+    /// garbage collection until [`Directory::release_pending`] is called.
+    ///
+    /// **FerroSearch extension (Wave 15 Phase H-6 GC fix).** A worker
+    /// thread that writes an aux-segment file (e.g. the auxiliary
+    /// sort cursor) and intends to advertise it via a
+    /// [`SegmentMeta`][crate::index::SegmentMeta] published through
+    /// `schedule_add_segment` has a publication gap: the file is
+    /// already in `managed_paths` (via `open_write`) but the
+    /// `SegmentMeta` is not yet in the committed segment list, so
+    /// `list_files` does not include the path.  If
+    /// [`ManagedDirectory::garbage_collect`] fires inside that gap
+    /// (the segment-updater single-thread pool serializes tasks,
+    /// but the GC task can be enqueued ahead of the `add_segment`
+    /// task), the cursor file gets deleted before the segment is
+    /// added — surfacing later as `OpenReadError(FileDoesNotExist)`
+    /// at refresh time (Wave 15 Phase H-5b graceful warns).
+    ///
+    /// Pairing `mark_pending` with `release_pending` bridges the gap:
+    /// pending paths are excluded from the GC's "orphan" set even
+    /// while their owning SegmentMeta is in transit.
+    ///
+    /// Default impl: no-op.  Only [`ManagedDirectory`] tracks pending
+    /// paths because it is the sole impl that runs a GC.
+    fn mark_pending(&self, _path: &Path) {}
+
+    /// Releases a path from the "pending publication" set.  Idempotent
+    /// (no-op when the path is not present).
+    ///
+    /// Should be called once the file's owning `SegmentMeta` has been
+    /// added to the segment manager (so `list_files` covers the path
+    /// going forward).
+    ///
+    /// Default impl: no-op.
+    fn release_pending(&self, _path: &Path) {}
 }
 
 /// DirectoryClone
@@ -232,8 +268,7 @@ pub trait DirectoryClone {
 }
 
 impl<T> DirectoryClone for T
-where
-    T: 'static + Directory + Clone,
+where T: 'static + Directory + Clone
 {
     fn box_clone(&self) -> Box<dyn Directory> {
         Box::new(self.clone())

@@ -1,0 +1,14 @@
+{
+  "backend": "Vulkan",
+  "device": "NVIDIA GeForce RTX 4070 Ti SUPER",
+  "calling_pattern": "compute_batched (cuBLASLt INT8 IMMA) vs compute_batched_bmma (inline-PTX mma.sync.aligned.m8n8k128.b1.xor.popc, naive 1-warp-per-(8x8)-tile)",
+  "results": [
+    {"shape": "dim=128  N=1024    Q=8", "num_queries": 8, "num_vecs": 1024, "dim_bits": 128, "int8_ns": 39729, "bmma_ns": 20845, "speedup_int8_over_bmma": 1.9059, "byte_equal": true},
+    {"shape": "dim=256  N=10000   Q=8", "num_queries": 8, "num_vecs": 10000, "dim_bits": 256, "int8_ns": 155109, "bmma_ns": 101151, "speedup_int8_over_bmma": 1.5334, "byte_equal": true},
+    {"shape": "dim=512  N=10000   Q=64", "num_queries": 64, "num_vecs": 10000, "dim_bits": 512, "int8_ns": 425064, "bmma_ns": 337875, "speedup_int8_over_bmma": 1.2581, "byte_equal": true},
+    {"shape": "dim=768  N=10000   Q=64", "num_queries": 64, "num_vecs": 10000, "dim_bits": 768, "int8_ns": 494000, "bmma_ns": 376331, "speedup_int8_over_bmma": 1.3127, "byte_equal": true},
+    {"shape": "dim=768  N=100000  Q=64", "num_queries": 64, "num_vecs": 100000, "dim_bits": 768, "int8_ns": 4144848, "bmma_ns": 3019871, "speedup_int8_over_bmma": 1.3725, "byte_equal": true},
+    {"shape": "dim=1024 N=100000  Q=64", "num_queries": 64, "num_vecs": 100000, "dim_bits": 1024, "int8_ns": 4791528, "bmma_ns": 3291865, "speedup_int8_over_bmma": 1.4556, "byte_equal": true},
+    {"shape": "dim=768  N=1000000 Q=64", "num_queries": 64, "num_vecs": 1000000, "dim_bits": 768, "int8_ns": 97125802, "bmma_ns": 79384401, "speedup_int8_over_bmma": 1.2235, "byte_equal": true}
+  ]
+}

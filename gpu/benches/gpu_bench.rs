@@ -159,14 +159,7 @@ fn main() {
         for _ in 0..20 {
             let mut scores = Vec::with_capacity(n);
             for (i, &tf) in term_freqs.iter().enumerate() {
-                scores.push(cpu_bm25_score(
-                    2.5,
-                    1.2,
-                    0.75,
-                    120.0,
-                    tf,
-                    (i % 40) as f32,
-                ));
+                scores.push(cpu_bm25_score(2.5, 1.2, 0.75, 120.0, tf, (i % 40) as f32));
             }
             black_box(&scores);
         }

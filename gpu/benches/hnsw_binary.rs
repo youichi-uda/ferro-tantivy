@@ -5,29 +5,22 @@
 //!
 //! Two production-shaped paths compared on the same `BinaryHnswIndex`:
 //!
-//! 1. CPU-only:
-//!    `BinaryHnswIndex::search` — graph traversal + popcount on CPU,
-//!    no GPU involved. The baseline.
+//! 1. CPU-only: `BinaryHnswIndex::search` — graph traversal + popcount on CPU, no GPU involved. The
+//!    baseline.
 //!
-//! 2. GPU rerank:
-//!    `BinaryHnswIndex::search_gpu_rerank` (single-query) and
-//!    `BinaryHnswIndex::search_batch_gpu_rerank` (multi-query) —
-//!    graph traversal on CPU, candidate-set rerank on GPU in **one**
-//!    batched dispatch.
+//! 2. GPU rerank: `BinaryHnswIndex::search_gpu_rerank` (single-query) and
+//!    `BinaryHnswIndex::search_batch_gpu_rerank` (multi-query) — graph traversal on CPU,
+//!    candidate-set rerank on GPU in **one** batched dispatch.
 //!
 //! ## What we expect
 //!
-//! - At small `ef_search` (≤ 64) the GPU rerank is **slower** than
-//!   CPU because the dispatch overhead (~1-3 ms) exceeds the actual
-//!   work. This is expected and documented; the bench prints the
-//!   relative numbers without asserting a particular speedup at
-//!   small ef.
-//! - At `ef_search ≥ 256` and multi-query batches (`Q ≥ 8`) the GPU
-//!   path should clear well into the win regime — the production
-//!   target shape is `Q = 64, ef = 256, K = 10` over `N = 100k`.
-//! - The CPU graph-traversal time bounds the overall speedup. Phase 2
-//!   A-final does NOT GPU-accelerate the graph walk itself; that is
-//!   future work (a dedicated graph-walk shader).
+//! - At small `ef_search` (≤ 64) the GPU rerank is **slower** than CPU because the dispatch
+//!   overhead (~1-3 ms) exceeds the actual work. This is expected and documented; the bench prints
+//!   the relative numbers without asserting a particular speedup at small ef.
+//! - At `ef_search ≥ 256` and multi-query batches (`Q ≥ 8`) the GPU path should clear well into the
+//!   win regime — the production target shape is `Q = 64, ef = 256, K = 10` over `N = 100k`.
+//! - The CPU graph-traversal time bounds the overall speedup. Phase 2 A-final does NOT
+//!   GPU-accelerate the graph walk itself; that is future work (a dedicated graph-walk shader).
 //!
 //! ## Recall
 //!
@@ -124,7 +117,10 @@ fn main() {
             .expect("insert");
     }
     let build_time = build_start.elapsed();
-    println!("Build time      : {} for {N_BUILD} vectors", fmt_dur(build_time));
+    println!(
+        "Build time      : {} for {N_BUILD} vectors",
+        fmt_dur(build_time)
+    );
     println!();
 
     // ── Single-query: CPU-only vs GPU rerank ──
@@ -163,12 +159,7 @@ fn main() {
     );
     let multi_efs: &[usize] = &[64, 128, 256, 512];
     let queries: Vec<Vec<u32>> = (0..64)
-        .map(|qi| {
-            random_u32_vec(
-                dim_u32,
-                0x9999_aaaa_bbbb_ccccu64.wrapping_add(qi as u64),
-            )
-        })
+        .map(|qi| random_u32_vec(dim_u32, 0x9999_aaaa_bbbb_ccccu64.wrapping_add(qi as u64)))
         .collect();
     let mut best_multi_speedup: f64 = 0.0;
     let mut best_multi_label = String::new();
@@ -212,8 +203,8 @@ fn main() {
     let ef_recall = 256;
     let k_recall = 10;
     for qi in 0..recall_qs {
-        let q_seed = 0xfeed_face_dead_beefu64
-            .wrapping_add((qi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let q_seed =
+            0xfeed_face_dead_beefu64.wrapping_add((qi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let query = random_u32_vec(dim_u32, q_seed);
 
         let bf = brute_force_knn_cpu(&query, &raw_corpus, N_BUILD, dim_u32, k_recall);
@@ -240,11 +231,11 @@ fn main() {
     println!("CPU-only      recall@10 = {recall_cpu:.4}");
     println!("GPU-rerank    recall@10 = {recall_gpu:.4}");
     println!(
-        "(Note: synthetic random u32 bits at dim=768, N=100k give a degenerate \
-         neighbour distribution — true top-10 is statistically indistinguishable \
-         from positions 11-1000. The unit test test_binary_hnsw_recall_at_10_mid_scale \
-         verifies a 0.85 floor at the more separable dim=256, N=2000 shape; \
-         real-data validation on SIFT1M / GIST1M is the GA-prep wave.)"
+        "(Note: synthetic random u32 bits at dim=768, N=100k give a degenerate neighbour \
+         distribution — true top-10 is statistically indistinguishable from positions 11-1000. \
+         The unit test test_binary_hnsw_recall_at_10_mid_scale verifies a 0.85 floor at the more \
+         separable dim=256, N=2000 shape; real-data validation on SIFT1M / GIST1M is the GA-prep \
+         wave.)"
     );
     println!();
 
@@ -253,16 +244,16 @@ fn main() {
     // either the kernel or the candidate-set unioning is broken.
     assert!(
         (recall_cpu - recall_gpu).abs() < 1e-9,
-        "CPU and GPU recall@10 must be identical (rerank is exact): \
-         cpu={recall_cpu}, gpu={recall_gpu}"
+        "CPU and GPU recall@10 must be identical (rerank is exact): cpu={recall_cpu}, \
+         gpu={recall_gpu}"
     );
     println!("ASSERT PASSED : CPU and GPU rerank recall agree exactly");
 
     if !ctx.is_hardware_gpu() {
         println!();
         println!(
-            "NOTE: ran on CPU fallback. For real GPU numbers re-run on \
-             a host with a discrete GPU (e.g. RTX 4070 Ti SUPER)."
+            "NOTE: ran on CPU fallback. For real GPU numbers re-run on a host with a discrete GPU \
+             (e.g. RTX 4070 Ti SUPER)."
         );
     }
     println!("\n=== Done ===");

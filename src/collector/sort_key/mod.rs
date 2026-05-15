@@ -458,8 +458,7 @@ pub(crate) mod tests {
     }
 
     /// Wave 14: large-segment string sort exercises both
-    ///   - the term-ordinal warm cache (segment ≥ 1024 docs and ≤ 256 K),
-    ///     and
+    ///   - the term-ordinal warm cache (segment ≥ 1024 docs and ≤ 256 K), and
     ///   - the SIMD top-K threshold filter on contiguous 64-doc blocks
     ///     (`compute_block_sort_keys_and_collect` warm-cache path).
     ///

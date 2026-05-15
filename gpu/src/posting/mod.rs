@@ -9,15 +9,13 @@
 //!
 //! This module currently exports [`BitmapOpKernel`] and the
 //! [`BitmapOp`] enum. Future Phase 2 C waves layer:
-//! - **C-2**: `ferro-compress` Bitcomp decompress + bit-op pipeline
-//!   (CUDA-only path) so containers can stay compressed in VRAM
-//!   between dispatches.
-//! - **C-3**: Tantivy fork — Roaring container 3-form encoder/decoder
-//!   (Array / Bitmap / Run) inside `vendor/tantivy-local/src/postings/`.
-//! - **C-4**: Bool query (AND/OR) GPU dispatch path with the planner
-//!   threshold (5 % field-doc-ratio + 10-container minimum) so light
-//!   queries avoid wgpu dispatch overhead and route through the CPU
-//!   galloping AVX2 path.
+//! - **C-2**: `ferro-compress` Bitcomp decompress + bit-op pipeline (CUDA-only path) so containers
+//!   can stay compressed in VRAM between dispatches.
+//! - **C-3**: Tantivy fork — Roaring container 3-form encoder/decoder (Array / Bitmap / Run) inside
+//!   `vendor/tantivy-local/src/postings/`.
+//! - **C-4**: Bool query (AND/OR) GPU dispatch path with the planner threshold (5 % field-doc-ratio
+//!   + 10-container minimum) so light queries avoid wgpu dispatch overhead and route through the
+//!   CPU galloping AVX2 path.
 //!
 //! ## Honest scope
 //!

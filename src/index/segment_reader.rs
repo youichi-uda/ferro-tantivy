@@ -10,7 +10,10 @@ use crate::directory::{CompositeFile, FileSlice};
 use crate::error::DataCorruption;
 use crate::fastfield::{intersect_alive_bitsets, AliveBitSet, FacetReader, FastFieldReaders};
 use crate::fieldnorm::{FieldNormReader, FieldNormReaders};
-use crate::index::{InvertedIndexReader, Segment, SegmentComponent, SegmentId};
+use crate::index::{
+    InvertedIndexReader, Segment, SegmentComponent, SegmentId, SortCursorAny, SortCursorIndex,
+    SortCursorIndexV2,
+};
 use crate::json_utils::json_path_sep_to_dot;
 use crate::schema::{Field, IndexRecordOption, Schema, Type};
 use crate::space_usage::SegmentSpaceUsage;
@@ -47,6 +50,33 @@ pub struct SegmentReader {
     store_file: FileSlice,
     alive_bitset_opt: Option<AliveBitSet>,
     schema: Schema,
+    /// **FerroSearch extension (Wave 15).** Eagerly-loaded auxiliary sort
+    /// cursors, keyed by field name. Populated from
+    /// `Segment::meta().sort_cursor_fields()` at `open` time. Each entry
+    /// is a small `Vec<DocId>` (~4 bytes/doc) wrapped in `Arc` for cheap
+    /// sharing across `Searcher` clones.
+    ///
+    /// Only carries v1 (single-field) cursors; v2 (multi-field) cursors
+    /// live in [`Self::sort_cursors_v2`] keyed by the **primary** field
+    /// name. A given field name can only appear in one map per segment.
+    sort_cursors: Arc<HashMap<String, Arc<SortCursorIndex>>>,
+    /// **FerroSearch Wave 18-1.** Eagerly-loaded multi-field sort
+    /// cursors, keyed by their primary field name. Populated from the
+    /// same `Segment::meta().sort_cursor_fields()` list as the v1 map;
+    /// the on-disk file's version byte is peeked at open time to route
+    /// each cursor to the correct map.
+    sort_cursors_v2: Arc<HashMap<String, Arc<SortCursorIndexV2>>>,
+    /// **FerroSearch Wave 19.** Lazily-populated per-field warm cache of
+    /// dense single-valued numeric fast-field values, keyed by field
+    /// name. First call decodes the column into a contiguous
+    /// `Box<[u64]>` (Lucene "doc-values warm"); subsequent calls return
+    /// the cached `Arc` in O(1). Shared across all queries for the
+    /// lifetime of the segment reader, eliminating the per-query
+    /// alloc+decode cost that capped the previous (per-collector) warm
+    /// cache at `WARM_FIRST_VALS_MAX_DOCS = 256 K` docs.  Only
+    /// `ColumnIndex::Full` columns are cached; optional / multivalued
+    /// columns keep the streaming `Column::first` path.
+    warm_fast_field_cache: Arc<RwLock<FnvHashMap<String, Arc<Box<[u64]>>>>>,
 }
 
 impl SegmentReader {
@@ -190,6 +220,64 @@ impl SegmentReader {
             .map(|alive_bitset| alive_bitset.num_alive_docs() as u32)
             .unwrap_or(max_doc);
 
+        // FerroSearch (Wave 15 / Wave 18-1 / Wave 15 Phase H-5b): eagerly
+        // load any auxiliary sort cursors listed in segment meta. Each
+        // file's version byte is peeked at open time so v1 (single-field)
+        // and v2 (multi-field) cursors land in their respective maps.
+        //
+        // **Wave 15 Phase H-5b.** Missing or corrupt cursor files are
+        // logged as warnings instead of erroring the whole SegmentReader
+        // open. The Phase E dispatch gate naturally degrades to the
+        // legacy `SortByStaticFastValue` path (single-field) or to the
+        // Wave 18-2 `EarlyTermOrFallbackCollectorMulti` per-segment
+        // fallback (multi-field) when `sort_cursor()` /
+        // `sort_cursor_v2()` returns `None`.
+        //
+        // Phase H-4 EC2 stress-bench (c7gd.8xlarge, Rally http_logs
+        // append-no-conflicts with `bulk_indexing_clients=8`,
+        // `index.sort.field=@timestamp desc`) observed ~0.2% of segments
+        // (1 in 516) reach the reader with `sort_cursor_fields`
+        // advertised in `meta.json` but the `.sortcursor` file absent
+        // on disk. The H-5 `sync_directory()` fix in
+        // `build_and_write_sort_cursors` handles 99.8% of segments
+        // correctly; the remaining edge case (root cause not yet fully
+        // identified) caused `bulk_auto_soft_refresh` to fail with
+        // `OpenReadError(FileDoesNotExist)` ~12+ times/sec until that
+        // segment was dropped from the committed list, blocking
+        // production indexing under load.
+        let mut sort_cursors: HashMap<String, Arc<SortCursorIndex>> = HashMap::new();
+        let mut sort_cursors_v2: HashMap<String, Arc<SortCursorIndexV2>> = HashMap::new();
+        for field in segment.meta().sort_cursor_fields() {
+            match segment.open_sort_cursor_read(field) {
+                Ok(slice) => match SortCursorAny::open(slice) {
+                    Ok(SortCursorAny::V1(c)) => {
+                        sort_cursors.insert(field.clone(), Arc::new(c));
+                    }
+                    Ok(SortCursorAny::V2(c)) => {
+                        sort_cursors_v2.insert(field.clone(), Arc::new(c));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Wave 15: sort cursor for segment {} field {} failed to parse, \
+                             falling back to legacy sort path: {}",
+                            segment.id().uuid_string(),
+                            field,
+                            e
+                        );
+                    }
+                },
+                Err(e) => {
+                    log::warn!(
+                        "Wave 15: sort cursor file missing for segment {} field {}, falling back \
+                         to legacy sort path: {}",
+                        segment.id().uuid_string(),
+                        field,
+                        e
+                    );
+                }
+            }
+        }
+
         let reader = SegmentReader {
             inv_idx_reader_cache: Default::default(),
             num_docs,
@@ -204,6 +292,9 @@ impl SegmentReader {
             alive_bitset_opt,
             positions_composite,
             schema,
+            sort_cursors: Arc::new(sort_cursors),
+            sort_cursors_v2: Arc::new(sort_cursors_v2),
+            warm_fast_field_cache: Arc::new(RwLock::new(FnvHashMap::default())),
         };
 
         // Wave Z-1 #1 — segment-warm hook for CHT v3 eager cache fill.
@@ -216,6 +307,80 @@ impl SegmentReader {
         crate::postings::roaring::warm_segment_v3(&reader);
 
         Ok(reader)
+    }
+
+    /// **FerroSearch Wave 19.** Returns a shared, dense warm cache for
+    /// the given single-valued `Column<u64>`, populating it on first
+    /// access.  Returns `None` for `Optional` / `Multivalued` columns
+    /// or empty columns; the doc→row mapping makes a flat `Vec<u64>`
+    /// invalid for those.
+    ///
+    /// The cache lives for the lifetime of this `SegmentReader`, so
+    /// every collector against the segment shares one decoded buffer
+    /// and the per-collector decode cost (the old Wave 8
+    /// `warm_first_values`) is paid only once per (segment, field).
+    ///
+    /// Memory: `num_docs × 8 bytes` per cached field per segment.
+    pub fn warm_fast_field_dense_u64(
+        &self,
+        field_name: &str,
+        column: &columnar::Column<u64>,
+    ) -> Option<Arc<Box<[u64]>>> {
+        use columnar::ColumnIndex;
+        if !matches!(column.index, ColumnIndex::Full) {
+            return None;
+        }
+        if let Some(hit) = self
+            .warm_fast_field_cache
+            .read()
+            .expect("warm_fast_field_cache lock poisoned")
+            .get(field_name)
+            .cloned()
+        {
+            return Some(hit);
+        }
+        let mut write = self
+            .warm_fast_field_cache
+            .write()
+            .expect("warm_fast_field_cache lock poisoned");
+        if let Some(hit) = write.get(field_name).cloned() {
+            return Some(hit);
+        }
+        let num_docs = column.num_docs() as usize;
+        if num_docs == 0 {
+            return None;
+        }
+        let mut buf = vec![0u64; num_docs];
+        column.values.get_range(0, &mut buf);
+        let arc: Arc<Box<[u64]>> = Arc::new(buf.into_boxed_slice());
+        write.insert(field_name.to_string(), arc.clone());
+        Some(arc)
+    }
+
+    /// **FerroSearch extension (Wave 15).** Returns the auxiliary sort
+    /// cursor for `field`, or `None` if the segment does not advertise
+    /// one in its meta. The returned `Arc` is shared with this reader
+    /// and is cheap to clone.
+    pub fn sort_cursor(&self, field: &str) -> Option<Arc<SortCursorIndex>> {
+        self.sort_cursors.get(field).cloned()
+    }
+
+    /// **FerroSearch Wave 18-1.** Returns the multi-field sort cursor
+    /// keyed by `primary_field` (the first field in its declaration
+    /// order), or `None` if the segment does not carry one. The
+    /// returned `Arc` is shared with this reader and is cheap to clone.
+    pub fn sort_cursor_v2(&self, primary_field: &str) -> Option<Arc<SortCursorIndexV2>> {
+        self.sort_cursors_v2.get(primary_field).cloned()
+    }
+
+    /// **FerroSearch extension (Wave 15).** Returns the names of the
+    /// fields for which a sort cursor (v1 or v2) was loaded. v2 cursors
+    /// are reported under their primary field name.
+    pub fn sort_cursor_fields(&self) -> impl Iterator<Item = &str> + '_ {
+        self.sort_cursors
+            .keys()
+            .chain(self.sort_cursors_v2.keys())
+            .map(String::as_str)
     }
 
     /// Returns a field reader associated with the field given in argument.

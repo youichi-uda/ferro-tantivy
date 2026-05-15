@@ -5,16 +5,13 @@
 //! into one of three container forms chosen for cardinality + run
 //! density:
 //!
-//! - [`ArrayContainer`] — sorted unique `u16` for sparse buckets
-//!   (cardinality ≤ [`ARRAY_TO_BITMAP_THRESHOLD`]). Storage:
-//!   `2 × cardinality` bytes.
-//! - [`BitmapContainer`] — fixed `[u32; 2048]` (= 8 KiB, 65 536 bits)
-//!   for dense buckets. Word-wise bitwise AND/OR/XOR is the
-//!   GPU-friendly form (Wave 4-B kernel uses this exact layout).
-//! - [`RunContainer`] — sorted non-overlapping `Run { start, length }`
-//!   for runs-of-set-bits buckets. Best when the content is a small
-//!   number of contiguous ranges (`(num_runs * 4 + 2) < cardinality * 2`,
-//!   i.e. average run length > 4).
+//! - [`ArrayContainer`] — sorted unique `u16` for sparse buckets (cardinality ≤
+//!   [`ARRAY_TO_BITMAP_THRESHOLD`]). Storage: `2 × cardinality` bytes.
+//! - [`BitmapContainer`] — fixed `[u32; 2048]` (= 8 KiB, 65 536 bits) for dense buckets. Word-wise
+//!   bitwise AND/OR/XOR is the GPU-friendly form (Wave 4-B kernel uses this exact layout).
+//! - [`RunContainer`] — sorted non-overlapping `Run { start, length }` for runs-of-set-bits
+//!   buckets. Best when the content is a small number of contiguous ranges (`(num_runs * 4 + 2) <
+//!   cardinality * 2`, i.e. average run length > 4).
 //!
 //! [`Container`] is the top-level dispatch enum with all 9 set-op
 //! combinations (3 LHS forms × 3 RHS forms) wired in. Promotion and
@@ -1116,12 +1113,10 @@ impl Container {
     /// Pick the best container form for the current contents.
     ///
     /// Logic (Lemire 2014 § 3.3):
-    /// - cardinality ≤ [`ARRAY_TO_BITMAP_THRESHOLD`]: prefer
-    ///   [`ArrayContainer`] (or [`RunContainer`] when run-density
-    ///   yields strictly smaller storage).
-    /// - cardinality > [`ARRAY_TO_BITMAP_THRESHOLD`]: prefer
-    ///   [`BitmapContainer`] (or [`RunContainer`] when run-density
-    ///   wins).
+    /// - cardinality ≤ [`ARRAY_TO_BITMAP_THRESHOLD`]: prefer [`ArrayContainer`] (or
+    ///   [`RunContainer`] when run-density yields strictly smaller storage).
+    /// - cardinality > [`ARRAY_TO_BITMAP_THRESHOLD`]: prefer [`BitmapContainer`] (or
+    ///   [`RunContainer`] when run-density wins).
     ///
     /// "Run-density wins" means encoded run bytes (`2 + 4 *
     /// num_runs`) is strictly less than the alternative encoding

@@ -3,18 +3,14 @@
 //! Builds a [`RoaringPostings`] from a stream of `u32` doc-ids. The
 //! flow is:
 //!
-//! 1. [`RoaringEncoder::add`] (or [`RoaringEncoder::add_sorted`])
-//!    splits each id into `(high16, low16)` and forwards `low16` into
-//!    a per-bucket [`Container`] that grows in [`ArrayContainer`] form
-//!    by default.
-//! 2. [`ArrayContainer::insert`] auto-promotes to [`BitmapContainer`]
-//!    once the per-bucket cardinality crosses
-//!    [`crate::postings::roaring::container::ARRAY_TO_BITMAP_THRESHOLD`].
-//!    We promote *eagerly* on insert to keep the `Vec<u16>` insertion
-//!    cost bounded.
-//! 3. [`RoaringEncoder::finalize`] runs [`Container::optimize`] across
-//!    every bucket — that's the moment a contiguous bucket gets
-//!    rewritten as a [`RunContainer`].
+//! 1. [`RoaringEncoder::add`] (or [`RoaringEncoder::add_sorted`]) splits each id into `(high16,
+//!    low16)` and forwards `low16` into a per-bucket [`Container`] that grows in [`ArrayContainer`]
+//!    form by default.
+//! 2. [`ArrayContainer::insert`] auto-promotes to [`BitmapContainer`] once the per-bucket
+//!    cardinality crosses [`crate::postings::roaring::container::ARRAY_TO_BITMAP_THRESHOLD`]. We
+//!    promote *eagerly* on insert to keep the `Vec<u16>` insertion cost bounded.
+//! 3. [`RoaringEncoder::finalize`] runs [`Container::optimize`] across every bucket — that's the
+//!    moment a contiguous bucket gets rewritten as a [`RunContainer`].
 //!
 //! ## Wire format ([`RoaringPostings::to_bytes`])
 //!

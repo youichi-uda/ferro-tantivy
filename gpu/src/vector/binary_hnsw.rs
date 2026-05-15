@@ -11,8 +11,7 @@
 //! not `f32`). Threading a `DistanceMetric` enum that mixes both
 //! through `HnswIndex` would either:
 //!  - waste memory storing float vectors alongside binary codes, or
-//!  - require trait-object dispatch per edge (cache hostile, no
-//!    win for the small per-edge work).
+//!  - require trait-object dispatch per edge (cache hostile, no win for the small per-edge work).
 //!
 //! Instead this module provides [`BinaryHnswIndex`], a **structural
 //! mirror** of `HnswIndex` that swaps the storage and distance kernel
@@ -56,18 +55,16 @@
 //!
 //! ## Calling contract
 //!
-//! - `dim_bits` is fixed at construction; every inserted code must be
-//!   exactly `dim_u32 = ceil(dim_bits / 32)` u32 words, with trailing
-//!   padding bits zeroed by the caller.
+//! - `dim_bits` is fixed at construction; every inserted code must be exactly `dim_u32 =
+//!   ceil(dim_bits / 32)` u32 words, with trailing padding bits zeroed by the caller.
 //! - [`BinaryHnswIndex::insert`] takes a `Vec<u32>` of length `dim_u32`.
-//! - [`BinaryHnswIndex::search`] performs CPU graph traversal with
-//!   CPU popcount distance and returns top-K. **No GPU is involved.**
-//! - [`BinaryHnswIndex::search_gpu_rerank`] does CPU graph traversal
-//!   to produce an `ef_search`-sized candidate set, then dispatches
-//!   one batched GPU rerank to produce the final top-K.
-//! - [`BinaryHnswIndex::search_batch_gpu_rerank`] is the multi-query
-//!   form: every query's candidate set is reranked in one fused GPU
-//!   dispatch. This is the production entry point for serving
+//! - [`BinaryHnswIndex::search`] performs CPU graph traversal with CPU popcount distance and
+//!   returns top-K. **No GPU is involved.**
+//! - [`BinaryHnswIndex::search_gpu_rerank`] does CPU graph traversal to produce an
+//!   `ef_search`-sized candidate set, then dispatches one batched GPU rerank to produce the final
+//!   top-K.
+//! - [`BinaryHnswIndex::search_batch_gpu_rerank`] is the multi-query form: every query's candidate
+//!   set is reranked in one fused GPU dispatch. This is the production entry point for serving
 //!   workloads.
 
 use std::cmp::Reverse;
@@ -92,8 +89,7 @@ const EF_CONSTRUCTION: usize = 200;
 /// Storage layout:
 /// - `corpus_bits`: flat `num_vecs * dim_u32` u32 array (row-major).
 /// - `graph[level][node_id] = Vec<neighbor_id>`.
-/// - `levels[node_id] = level` (the topmost layer at which this node
-///   participates).
+/// - `levels[node_id] = level` (the topmost layer at which this node participates).
 ///
 /// The graph is byte-shape-identical to [`crate::vector::hnsw::HnswIndex`]
 /// but with `vectors: Vec<Vec<f32>>` swapped for `corpus_bits: Vec<u32>`.
@@ -195,7 +191,10 @@ impl BinaryHnswIndex {
     pub fn len(&self) -> usize {
         // `dim_u32 = 0` only if the user constructed the index with
         // `dim_bits = 0` — degenerate but legal; treat as empty.
-        self.corpus_bits.len().checked_div(self.dim_u32).unwrap_or(0)
+        self.corpus_bits
+            .len()
+            .checked_div(self.dim_u32)
+            .unwrap_or(0)
     }
 
     /// Whether the index is empty.
@@ -413,16 +412,13 @@ impl BinaryHnswIndex {
     /// candidates contribute distances we simply ignore).
     ///
     /// Why union-and-filter rather than per-query GPU dispatch:
-    /// - The batched GPU kernel requires a *single shared* corpus
-    ///   across queries (it tiles corpus rows into shared memory
-    ///   reused by every query in the workgroup). A per-query
-    ///   dispatch would lose that shared-memory tile reuse.
-    /// - The post-dispatch CPU filter is cheap: `Q × |union|` is
-    ///   bounded by `Q × Q × ef_search`, typically a few thousand
-    ///   `u32` lookups per query — single-digit microseconds.
-    /// - Recall is unchanged: the filter projects each query's row
-    ///   back onto its own candidate set, identical to what a
-    ///   per-query rerank would have produced.
+    /// - The batched GPU kernel requires a *single shared* corpus across queries (it tiles corpus
+    ///   rows into shared memory reused by every query in the workgroup). A per-query dispatch
+    ///   would lose that shared-memory tile reuse.
+    /// - The post-dispatch CPU filter is cheap: `Q × |union|` is bounded by `Q × Q × ef_search`,
+    ///   typically a few thousand `u32` lookups per query — single-digit microseconds.
+    /// - Recall is unchanged: the filter projects each query's row back onto its own candidate set,
+    ///   identical to what a per-query rerank would have produced.
     ///
     /// Returns one `Vec<(distance, doc_id)>` per query, each sorted
     /// ascending.
@@ -436,7 +432,10 @@ impl BinaryHnswIndex {
         ef_search: usize,
     ) -> GpuResult<Vec<Vec<(u32, u32)>>> {
         if self.gpu_kernel.is_none() {
-            return queries.iter().map(|q| self.search(q, k, ef_search)).collect();
+            return queries
+                .iter()
+                .map(|q| self.search(q, k, ef_search))
+                .collect();
         }
         if queries.is_empty() || k == 0 || self.is_empty() {
             return Ok(vec![Vec::new(); queries.len()]);
@@ -462,8 +461,7 @@ impl BinaryHnswIndex {
         // insertion order so that multiple paths (single-vs-batched)
         // see deterministic id orderings.
         let mut union_ids: Vec<u32> = Vec::new();
-        let mut id_to_pos: std::collections::HashMap<u32, usize> =
-            std::collections::HashMap::new();
+        let mut id_to_pos: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
         for cs in &cand_sets {
             for c in cs {
                 if let std::collections::hash_map::Entry::Vacant(e) = id_to_pos.entry(c.id) {
@@ -744,11 +742,7 @@ mod tests {
 
     /// Build a binary HNSW from a flat corpus + dim_bits, returning
     /// (index, corpus_bits) for downstream brute-force comparison.
-    fn build_index(
-        dim_bits: usize,
-        num_vecs: usize,
-        seed: u64,
-    ) -> (BinaryHnswIndex, Vec<u32>) {
+    fn build_index(dim_bits: usize, num_vecs: usize, seed: u64) -> (BinaryHnswIndex, Vec<u32>) {
         let dim_u32 = dim_u32_for(dim_bits);
         let corpus = random_u32_vec(num_vecs * dim_u32, seed);
         let mut idx = BinaryHnswIndex::new(dim_bits, BinaryDistanceMetric::Hamming);
@@ -869,7 +863,8 @@ mod tests {
         let recall = total_correct as f64 / total_expected as f64;
         assert!(
             recall >= 0.85,
-            "binary HNSW recall@{k} = {recall:.3} below 0.85 floor (correct {total_correct} / {total_expected})"
+            "binary HNSW recall@{k} = {recall:.3} below 0.85 floor (correct {total_correct} / \
+             {total_expected})"
         );
     }
 
@@ -940,7 +935,10 @@ mod tests {
             // Distance-vector equality is the sound check.
             let sd: Vec<u32> = s.iter().map(|&(d, _)| d).collect();
             let bd: Vec<u32> = b.iter().map(|&(d, _)| d).collect();
-            assert_eq!(sd, bd, "query {q}: single vs batched rerank distance mismatch");
+            assert_eq!(
+                sd, bd,
+                "query {q}: single vs batched rerank distance mismatch"
+            );
         }
     }
 
@@ -975,10 +973,14 @@ mod tests {
         let dim_bits = 64;
         let dim_u32 = 2;
         let corpus = vec![
-            0xFFFF_FFFFu32, 0xFFFF_FFFF, // id 0: all 1s — dist 0 from query
-            0u32, 0u32,                   // id 1: all 0s — dist 64
-            0xFFFF_FFFFu32, 0u32,         // id 2: half — dist 32
-            0u32, 0xFFFF_FFFFu32,         // id 3: half — dist 32
+            0xFFFF_FFFFu32,
+            0xFFFF_FFFF, // id 0: all 1s — dist 0 from query
+            0u32,
+            0u32, // id 1: all 0s — dist 64
+            0xFFFF_FFFFu32,
+            0u32, // id 2: half — dist 32
+            0u32,
+            0xFFFF_FFFFu32, // id 3: half — dist 32
         ];
         let query = vec![0xFFFF_FFFFu32, 0xFFFF_FFFFu32];
         let out = brute_force_knn_cpu(&query, &corpus, 4, dim_u32, 3);

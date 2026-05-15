@@ -7,54 +7,44 @@
 //! 10 000 (= 80 MiB / op = the headline 100-term Bool AND on a 1 M-doc
 //! 64-shard segment) and report two distinct timings per shape:
 //!
-//! 1. **Cold path** (`compute`): full PCIe round-trip — host upload of
-//!    both operands, dispatch, host readback of the result. This is
-//!    what a one-shot ad-hoc query pays.
-//! 2. **Warm path** (`compute_resident`): both operands and the output
-//!    buffer are already on-device. This is what the Phase 2 D
-//!    Compressed Hot Tier (CHT) measures, and is the cell that
-//!    dominates production-rate query workloads where a session keeps
-//!    posting lists resident in VRAM.
+//! 1. **Cold path** (`compute`): full PCIe round-trip — host upload of both operands, dispatch,
+//!    host readback of the result. This is what a one-shot ad-hoc query pays.
+//! 2. **Warm path** (`compute_resident`): both operands and the output buffer are already
+//!    on-device. This is what the Phase 2 D Compressed Hot Tier (CHT) measures, and is the cell
+//!    that dominates production-rate query workloads where a session keeps posting lists resident
+//!    in VRAM.
 //!
 //! ## What we expect to see
 //!
-//! - **Tiny N (10 containers, 80 KiB)**: CPU wins on cold, GPU loses
-//!   even on warm. wgpu dispatch overhead (~100s of µs to ~few ms
-//!   depending on driver state) exceeds the few-µs CPU loop. This is
-//!   the regime the Phase 2 C-4 query planner will route to the CPU
-//!   path; we measure it here so the crossover point is documented.
-//! - **Mid N (100–1000 containers, 800 KiB–8 MiB)**: GPU starts to
-//!   amortise dispatch overhead on warm path. Cold path is dominated
-//!   by PCIe upload (~25 GB/s, 8 MiB → ~330 µs).
+//! - **Tiny N (10 containers, 80 KiB)**: CPU wins on cold, GPU loses even on warm. wgpu dispatch
+//!   overhead (~100s of µs to ~few ms depending on driver state) exceeds the few-µs CPU loop. This
+//!   is the regime the Phase 2 C-4 query planner will route to the CPU path; we measure it here so
+//!   the crossover point is documented.
+//! - **Mid N (100–1000 containers, 800 KiB–8 MiB)**: GPU starts to amortise dispatch overhead on
+//!   warm path. Cold path is dominated by PCIe upload (~25 GB/s, 8 MiB → ~330 µs).
 //! - **Large N (10 000 containers, 80 MiB)**:
-//!   - **Warm**: GPU 800 GB/s vs CPU naive scalar loop = clear GPU
-//!     win. We assert ≥ 5× on this shape.
-//!   - **Cold**: PCIe 4.0 ≈ 25 GB/s × 2 transfers (upload a+b,
-//!     read back out) caps the cold-path latency at ~12 ms regardless
-//!     of GPU speed. CPU naive loop on 80 MiB at ~3 GB/s is ~25 ms,
-//!     so cold path can still beat CPU but not by 5×. We **do not**
-//!     assert on cold path.
+//!   - **Warm**: GPU 800 GB/s vs CPU naive scalar loop = clear GPU win. We assert ≥ 5× on this
+//!     shape.
+//!   - **Cold**: PCIe 4.0 ≈ 25 GB/s × 2 transfers (upload a+b, read back out) caps the cold-path
+//!     latency at ~12 ms regardless of GPU speed. CPU naive loop on 80 MiB at ~3 GB/s is ~25 ms, so
+//!     cold path can still beat CPU but not by 5×. We **do not** assert on cold path.
 //!
 //! ## Honest scope
 //!
-//! - vec4<u32> SIMD widening is **not** in this wave (scalar already
-//!   saturates VRAM bandwidth). If a future bench shows the kernel is
-//!   ALU-bound on a particular GPU, a `_vec4` variant can be slotted in
-//!   without changing the binding layout — we'd just compile a fourth
-//!   pipeline and select on dispatch.
-//! - This bench measures the kernel layer only. End-to-end Roaring
-//!   posting list AND with `ferro-compress` Bitcomp decompress and
-//!   Tantivy posting wire-up is Phase 2 C-2 / C-3 / C-4.
-//! - The bench is **not** a criterion harness — `criterion` would add
-//!   a heavyweight statistics layer that masks the GPU dispatch tail
-//!   distribution, and we need to print clear human-readable shape ×
-//!   speedup tables for the Phase 2 C R&D record. We use the same
-//!   plain-Instant pattern as the existing `binary_distance.rs` bench.
-//! - The CPU baseline is a naive scalar loop. A SIMD/AVX2 baseline
-//!   would close the GPU gap but is out of scope for the kernel-layer
-//!   bench; the production CPU path lives in
-//!   `vendor/tantivy-local/src/postings/` (Phase 2 C-3) and will be
-//!   benched against the warm-path GPU number in C-5.
+//! - vec4<u32> SIMD widening is **not** in this wave (scalar already saturates VRAM bandwidth). If
+//!   a future bench shows the kernel is ALU-bound on a particular GPU, a `_vec4` variant can be
+//!   slotted in without changing the binding layout — we'd just compile a fourth pipeline and
+//!   select on dispatch.
+//! - This bench measures the kernel layer only. End-to-end Roaring posting list AND with
+//!   `ferro-compress` Bitcomp decompress and Tantivy posting wire-up is Phase 2 C-2 / C-3 / C-4.
+//! - The bench is **not** a criterion harness — `criterion` would add a heavyweight statistics
+//!   layer that masks the GPU dispatch tail distribution, and we need to print clear human-readable
+//!   shape × speedup tables for the Phase 2 C R&D record. We use the same plain-Instant pattern as
+//!   the existing `binary_distance.rs` bench.
+//! - The CPU baseline is a naive scalar loop. A SIMD/AVX2 baseline would close the GPU gap but is
+//!   out of scope for the kernel-layer bench; the production CPU path lives in
+//!   `vendor/tantivy-local/src/postings/` (Phase 2 C-3) and will be benched against the warm-path
+//!   GPU number in C-5.
 //!
 //! Run with:
 //!     cargo bench -p tantivy-gpu --bench bitmap_op
@@ -77,9 +67,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use tantivy_gpu::device::GpuContext;
-use tantivy_gpu::posting::{
-    bitmap_op_cpu, BitmapOp, BitmapOpKernel, BITMAP_CONTAINER_WORDS,
-};
+use tantivy_gpu::posting::{bitmap_op_cpu, BitmapOp, BitmapOpKernel, BITMAP_CONTAINER_WORDS};
 
 /// Container counts swept in the warm-up + verification table. These
 /// span ~4 orders of magnitude, from "single light query" up to
@@ -234,8 +222,8 @@ fn main() {
                 .expect("gpu compute (cold warm-up)");
             if gpu_first != cpu_ref {
                 panic!(
-                    "GPU cold output diverges from CPU oracle for {} at \
-                     N={num_containers} containers",
+                    "GPU cold output diverges from CPU oracle for {} at N={num_containers} \
+                     containers",
                     op.label()
                 );
             }
@@ -252,8 +240,8 @@ fn main() {
             let warm_first = kernel.download(&out_buf).expect("download warm");
             if warm_first != cpu_ref {
                 panic!(
-                    "GPU warm output diverges from CPU oracle for {} at \
-                     N={num_containers} containers",
+                    "GPU warm output diverges from CPU oracle for {} at N={num_containers} \
+                     containers",
                     op.label()
                 );
             }
@@ -307,12 +295,9 @@ fn main() {
                 // for the next op in the query plan.
             });
 
-            let cold_speedup =
-                cpu_time.as_nanos() as f64 / cold_time.as_nanos().max(1) as f64;
-            let warm_speedup =
-                cpu_time.as_nanos() as f64 / warm_time.as_nanos().max(1) as f64;
-            let shape_label =
-                format!("N={num_containers:<6} ({})", fmt_size(num_containers));
+            let cold_speedup = cpu_time.as_nanos() as f64 / cold_time.as_nanos().max(1) as f64;
+            let warm_speedup = cpu_time.as_nanos() as f64 / warm_time.as_nanos().max(1) as f64;
+            let shape_label = format!("N={num_containers:<6} ({})", fmt_size(num_containers));
             println!(
                 "{:<6}  {:<22}  {:>10}  {:>10}  {:>10}  {:>8.2}x  {:>8.2}x",
                 op.label(),
@@ -325,10 +310,7 @@ fn main() {
             );
 
             if num_containers == HEADLINE_CONTAINERS {
-                let slot = headline
-                    .iter_mut()
-                    .find(|r| r.0 == op)
-                    .expect("op slot");
+                let slot = headline.iter_mut().find(|r| r.0 == op).expect("op slot");
                 slot.1 = ShapeTimings {
                     cpu: cpu_time,
                     gpu_cold: cold_time,
@@ -347,8 +329,8 @@ fn main() {
 
     if !ctx.is_hardware_gpu() {
         println!(
-            "(skipping GPU headline assert because no real GPU is available — \
-             CPU-fallback path would just re-execute the CPU loop)"
+            "(skipping GPU headline assert because no real GPU is available — CPU-fallback path \
+             would just re-execute the CPU loop)"
         );
         for &(op, t) in &headline {
             let cs = t.cpu.as_nanos() as f64 / t.gpu_cold.as_nanos().max(1) as f64;
@@ -380,9 +362,9 @@ fn main() {
             if !assert_off {
                 assert!(
                     ws >= HEADLINE_REQUIRED_SPEEDUP,
-                    "headline GPU warm-path speedup for {} ({:.2}x) below required \
-                     {:.1}x at N={HEADLINE_CONTAINERS} containers ({} per operand). \
-                     Set BITMAP_OP_BENCH_NO_ASSERT=1 to skip.",
+                    "headline GPU warm-path speedup for {} ({:.2}x) below required {:.1}x at \
+                     N={HEADLINE_CONTAINERS} containers ({} per operand). Set \
+                     BITMAP_OP_BENCH_NO_ASSERT=1 to skip.",
                     op.label(),
                     ws,
                     HEADLINE_REQUIRED_SPEEDUP,
@@ -403,8 +385,8 @@ fn main() {
     if !ctx.is_hardware_gpu() {
         println!();
         println!(
-            "NOTE: ran on CPU fallback. For real GPU numbers re-run on \
-             a host with a discrete GPU (e.g. RTX 4070 Ti SUPER)."
+            "NOTE: ran on CPU fallback. For real GPU numbers re-run on a host with a discrete GPU \
+             (e.g. RTX 4070 Ti SUPER)."
         );
     }
     println!("\n=== Done ===");

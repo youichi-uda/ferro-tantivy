@@ -3,15 +3,14 @@
 //! ES Lucene exposes a wrapper that picks the cheaper of two execution paths
 //! at scoring time:
 //!
-//! - **Inverted-index path** (`InvertedIndexRangeWeight`): walks the term
-//!   dictionary in the requested byte range and unions per-term posting
-//!   lists into a `BitSet`. Cost ≈ `O(num_terms_in_range + num_matching_docs)`.
-//!   Wins when the range is **selective** (small fraction of distinct values).
-//! - **Doc-values path** (`FastFieldRangeWeight`): scans the columnar fast
-//!   field over all docs and emits docids whose value falls in the range.
-//!   Cost ≈ `O(num_docs)`. Wins when the range is **non-selective** because
-//!   we'd otherwise pay for many posting-list opens and a bitset of matching
-//!   docs that approaches `num_docs` anyway.
+//! - **Inverted-index path** (`InvertedIndexRangeWeight`): walks the term dictionary in the
+//!   requested byte range and unions per-term posting lists into a `BitSet`. Cost ≈
+//!   `O(num_terms_in_range + num_matching_docs)`. Wins when the range is **selective** (small
+//!   fraction of distinct values).
+//! - **Doc-values path** (`FastFieldRangeWeight`): scans the columnar fast field over all docs and
+//!   emits docids whose value falls in the range. Cost ≈ `O(num_docs)`. Wins when the range is
+//!   **non-selective** because we'd otherwise pay for many posting-list opens and a bitset of
+//!   matching docs that approaches `num_docs` anyway.
 //!
 //! Without dispatch, FerroSearch's previous behaviour (always doc-values via
 //! `FastFieldRangeQuery`) loses to ES on selective numeric ranges where ES

@@ -9,20 +9,16 @@
 //!
 //! # Module map
 //!
-//! - [`container`]: the three Roaring container forms
-//!   ([`container::ArrayContainer`], [`container::BitmapContainer`],
-//!   [`container::RunContainer`]) plus the [`container::Container`]
+//! - [`container`]: the three Roaring container forms ([`container::ArrayContainer`],
+//!   [`container::BitmapContainer`], [`container::RunContainer`]) plus the [`container::Container`]
 //!   dispatch enum and self-describing wire encoding.
-//! - [`encoder`]: [`encoder::RoaringEncoder`] (`u32` doc-id stream →
-//!   per-bucket containers) and [`encoder::RoaringPostings`]
-//!   (finalised, sorted-by-`high16`, byte-serialisable form).
-//! - [`decoder`]: [`decoder::RoaringDecoder`] — `advance` / `seek`
-//!   over a [`encoder::RoaringPostings`] (`O(log n + log m)` seek).
-//! - [`ferro_compress_bridge`]: the
-//!   [`ferro_compress_bridge::BitcompCodec`] trait, the always-on
-//!   [`ferro_compress_bridge::IdentityBitcompCodec`] passthrough, and
-//!   the (currently short-circuiting)
-//!   [`ferro_compress_bridge::FerroBitcompCodec`] wired in by the
+//! - [`encoder`]: [`encoder::RoaringEncoder`] (`u32` doc-id stream → per-bucket containers) and
+//!   [`encoder::RoaringPostings`] (finalised, sorted-by-`high16`, byte-serialisable form).
+//! - [`decoder`]: [`decoder::RoaringDecoder`] — `advance` / `seek` over a
+//!   [`encoder::RoaringPostings`] (`O(log n + log m)` seek).
+//! - [`ferro_compress_bridge`]: the [`ferro_compress_bridge::BitcompCodec`] trait, the always-on
+//!   [`ferro_compress_bridge::IdentityBitcompCodec`] passthrough, and the (currently
+//!   short-circuiting) [`ferro_compress_bridge::FerroBitcompCodec`] wired in by the
 //!   `ferro-compress` Cargo feature.
 //!
 //! # Wire format
@@ -45,15 +41,13 @@
 //!
 //! # What this wave (C-3) does NOT do
 //!
-//! - Make Roaring the default posting format. Existing segments and
-//!   newly-written segments **continue to use BitPacker4x** until
-//!   Wave 6 lands the dispatch threshold.
-//! - Wire Roaring through `BlockSegmentPostings` / `SegmentPostings`
-//!   read paths. Those continue to read BitPacker4x exclusively.
-//! - Pull `ferro-compress` in as a hard dep. The trait abstraction
-//!   keeps the Tantivy fork buildable standalone.
-//! - Add bench harnesses. End-to-end Roaring vs BitPacker4x bench is
-//!   Phase 2 C-5.
+//! - Make Roaring the default posting format. Existing segments and newly-written segments
+//!   **continue to use BitPacker4x** until Wave 6 lands the dispatch threshold.
+//! - Wire Roaring through `BlockSegmentPostings` / `SegmentPostings` read paths. Those continue to
+//!   read BitPacker4x exclusively.
+//! - Pull `ferro-compress` in as a hard dep. The trait abstraction keeps the Tantivy fork buildable
+//!   standalone.
+//! - Add bench harnesses. End-to-end Roaring vs BitPacker4x bench is Phase 2 C-5.
 
 pub mod container;
 #[cfg(all(feature = "gpu", feature = "ferro-compress"))]
@@ -359,13 +353,12 @@ impl Default for PostingFormat {
 ///
 /// # Backward-compat contract
 ///
-/// - Segments without a format tag (= every existing index on disk)
-///   read as [`PostingFormat::BitPacker4x`] — never as Roaring.
-/// - Segments tagged `0x01` are Roaring and *must* fail-fast in
-///   readers that don't understand them, never silently fall back.
-///   The default reader path will keep working on `0x00` segments
-///   identically to today; a Roaring-aware reader will check the
-///   tag *before* attempting to parse the body.
+/// - Segments without a format tag (= every existing index on disk) read as
+///   [`PostingFormat::BitPacker4x`] — never as Roaring.
+/// - Segments tagged `0x01` are Roaring and *must* fail-fast in readers that don't understand them,
+///   never silently fall back. The default reader path will keep working on `0x00` segments
+///   identically to today; a Roaring-aware reader will check the tag *before* attempting to parse
+///   the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PostingFormatDispatch {
     /// Format selected at segment-write time.

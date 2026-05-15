@@ -45,6 +45,22 @@ pub struct ManagedDirectory {
 #[derive(Debug, Default)]
 struct MetaInformation {
     managed_paths: HashSet<PathBuf>,
+    /// Files written but not yet referenced by a committed `SegmentMeta`.
+    ///
+    /// **FerroSearch Wave 15 Phase H-6 GC fix.** Bridges the publication
+    /// gap between `open_write` (which puts the path in
+    /// `managed_paths`) and the `schedule_add_segment` task that
+    /// advertises it via `list_files`.  Without this set, a
+    /// `schedule_garbage_collect` task that was enqueued ahead of the
+    /// owning `schedule_add_segment` task on the segment-updater pool
+    /// would delete the cursor file before the segment landed.
+    ///
+    /// Not persisted to `.managed.json` — these are transient,
+    /// process-local protections.  On crash/restart, paths simply
+    /// fall back to managed-only state and the next GC will treat
+    /// them as orphans (which they are, if the owning SegmentMeta
+    /// was never durably published).
+    pending_paths: HashSet<PathBuf>,
 }
 
 /// Saves the file containing the list of existing files
@@ -76,6 +92,7 @@ impl ManagedDirectory {
                     directory,
                     meta_informations: Arc::new(RwLock::new(MetaInformation {
                         managed_paths: managed_files,
+                        pending_paths: HashSet::new(),
                     })),
                 })
             }
@@ -138,8 +155,16 @@ impl ManagedDirectory {
             match self.acquire_lock(&META_LOCK) {
                 Ok(_meta_lock) => {
                     let living_files = get_living_files();
+                    // FerroSearch Wave 15 Phase H-6: pending paths are
+                    // protected during the publication gap between a
+                    // worker's `open_write` and the
+                    // `schedule_add_segment` task that advertises the
+                    // owning SegmentMeta via `list_files`.
+                    let pending_paths = &meta_informations_rlock.pending_paths;
                     for managed_path in &meta_informations_rlock.managed_paths {
-                        if !living_files.contains(managed_path) {
+                        if !living_files.contains(managed_path)
+                            && !pending_paths.contains(managed_path)
+                        {
                             files_to_delete.push(managed_path.clone());
                         }
                     }
@@ -323,6 +348,25 @@ impl Directory for ManagedDirectory {
         self.directory.sync_directory()?;
         Ok(())
     }
+
+    fn mark_pending(&self, path: &Path) {
+        if !is_managed(path) {
+            return;
+        }
+        let mut meta_wlock = self
+            .meta_informations
+            .write()
+            .expect("Managed directory wlock poisoned in mark_pending.");
+        meta_wlock.pending_paths.insert(path.to_owned());
+    }
+
+    fn release_pending(&self, path: &Path) {
+        let mut meta_wlock = self
+            .meta_informations
+            .write()
+            .expect("Managed directory wlock poisoned in release_pending.");
+        meta_wlock.pending_paths.remove(path);
+    }
 }
 
 impl Clone for ManagedDirectory {
@@ -409,5 +453,105 @@ mod tests_mmap_specific {
             assert!(managed_directory.garbage_collect(|| living_files).is_ok());
         }
         assert!(!managed_directory.exists(test_path1).unwrap());
+    }
+
+    /// **FerroSearch Wave 15 Phase H-6 GC fix.**  Files marked pending
+    /// via `Directory::mark_pending` must survive a GC pass even when
+    /// the living-files callback excludes them — this is the central
+    /// invariant that bridges the publication gap between
+    /// `open_sort_cursor_write` and the segment-updater task that
+    /// advertises the cursor via `list_files`.
+    #[test]
+    fn test_pending_paths_protect_from_gc() {
+        let tempdir = TempDir::new().unwrap();
+        let mmap_directory = MmapDirectory::open(tempdir.path()).unwrap();
+        let mut managed_directory = ManagedDirectory::wrap(Box::new(mmap_directory)).unwrap();
+
+        let path: &Path = Path::new("pending.sortcursor");
+        managed_directory.mark_pending(path);
+        let mut writer = managed_directory.open_write(path).unwrap();
+        writer.write_all(b"cursor bytes").unwrap();
+        writer.terminate().unwrap();
+        assert!(managed_directory.exists(path).unwrap());
+
+        // living_files deliberately empty — the segment manager has not
+        // yet picked up the owning SegmentMeta, mirroring the H-4 race.
+        let living_files: HashSet<PathBuf> = HashSet::new();
+        assert!(managed_directory
+            .garbage_collect(|| living_files.clone())
+            .is_ok());
+        assert!(
+            managed_directory.exists(path).unwrap(),
+            "GC must keep pending-publication files even when living_files is empty"
+        );
+    }
+
+    /// After `release_pending`, a path with no living-files coverage
+    /// falls through to the standard orphan-cleanup path.  This is the
+    /// counterpart to `test_pending_paths_protect_from_gc` and proves
+    /// the pending set is not a permanent retention bucket.
+    #[test]
+    fn test_release_pending_allows_gc() {
+        let tempdir = TempDir::new().unwrap();
+        let mmap_directory = MmapDirectory::open(tempdir.path()).unwrap();
+        let mut managed_directory = ManagedDirectory::wrap(Box::new(mmap_directory)).unwrap();
+
+        let path: &Path = Path::new("released.sortcursor");
+        managed_directory.mark_pending(path);
+        let mut writer = managed_directory.open_write(path).unwrap();
+        writer.write_all(b"cursor bytes").unwrap();
+        writer.terminate().unwrap();
+        managed_directory.release_pending(path);
+
+        let living_files: HashSet<PathBuf> = HashSet::new();
+        assert!(managed_directory.garbage_collect(|| living_files).is_ok());
+        assert!(
+            !managed_directory.exists(path).unwrap(),
+            "GC must reclaim a path once it is released from pending and has no living coverage"
+        );
+    }
+
+    /// `mark_pending` / `release_pending` are idempotent (repeated
+    /// calls collapse to the same set state).  Lets the call sites
+    /// be simple — e.g. backfill paths can release per-segment
+    /// without tracking which paths were originally marked.
+    #[test]
+    fn test_pending_marks_idempotent() {
+        let tempdir = TempDir::new().unwrap();
+        let mmap_directory = MmapDirectory::open(tempdir.path()).unwrap();
+        let mut managed_directory = ManagedDirectory::wrap(Box::new(mmap_directory)).unwrap();
+
+        let path: &Path = Path::new("idempotent.sortcursor");
+        managed_directory.mark_pending(path);
+        managed_directory.mark_pending(path); // re-mark — no-op
+        let mut writer = managed_directory.open_write(path).unwrap();
+        writer.write_all(b"x").unwrap();
+        writer.terminate().unwrap();
+
+        let living_files: HashSet<PathBuf> = HashSet::new();
+        assert!(managed_directory
+            .garbage_collect(|| living_files.clone())
+            .is_ok());
+        assert!(managed_directory.exists(path).unwrap());
+
+        managed_directory.release_pending(path);
+        managed_directory.release_pending(path); // re-release — no-op
+        assert!(managed_directory.garbage_collect(|| living_files).is_ok());
+        assert!(!managed_directory.exists(path).unwrap());
+    }
+
+    /// Files starting with `.` are not managed (locks), so
+    /// `mark_pending` must skip them too — consistent with the
+    /// `is_managed` filter applied by `open_write`.
+    #[test]
+    fn test_pending_skips_unmanaged_paths() {
+        let tempdir = TempDir::new().unwrap();
+        let mmap_directory = MmapDirectory::open(tempdir.path()).unwrap();
+        let managed_directory = ManagedDirectory::wrap(Box::new(mmap_directory)).unwrap();
+        let lock_path: &Path = Path::new(".my_lock");
+        managed_directory.mark_pending(lock_path);
+        // Internal sanity check: pending_paths should remain empty.
+        let meta = managed_directory.meta_informations.read().expect("rlock");
+        assert!(meta.pending_paths.is_empty());
     }
 }

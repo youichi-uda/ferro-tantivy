@@ -7,9 +7,8 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::DocId;
-use crate::Score;
 use crate::index::SegmentId;
+use crate::{DocId, Score};
 
 const MAX_ENTRIES: usize = 1024;
 

@@ -22,20 +22,17 @@ use crate::{DocId, Score, SegmentReader};
 /// Two complementary throughput levers landed in Wave 8 to close the
 /// `desc_sort_timestamp_*` / `sort_status_*` regressions vs ES 9.3.2:
 ///
-/// 1. **Warm cache** for small-medium segments (≤[`WARM_FIRST_VALS_MAX_DOCS`]
-///    docs, [`ColumnIndex::Full`](columnar::ColumnIndex::Full) cardinality).
-///    The per-segment computer pre-decodes single-valued columns into a
-///    contiguous `Box<[u64]>` (Lucene "doc-values warm"), so subsequent
-///    `first(doc)` reads are O(1) Vec indexing instead of bit-unpacking.
+/// 1. **Warm cache** for small-medium segments (≤[`WARM_FIRST_VALS_MAX_DOCS`] docs,
+///    [`ColumnIndex::Full`](columnar::ColumnIndex::Full) cardinality). The per-segment computer
+///    pre-decodes single-valued columns into a contiguous `Box<[u64]>` (Lucene "doc-values warm"),
+///    so subsequent `first(doc)` reads are O(1) Vec indexing instead of bit-unpacking.
 ///
-/// 2. **Block-mode read** in [`Self::compute_block_sort_keys_and_collect`].
-///    When the no-score iterator (`Weight::for_each_no_score`) hands us a
-///    block of [`DocId`]s, we resolve all 64 sort keys in a single
-///    `Column::first_vals` call.  This is the equivalent of Lucene's
-///    `NumericComparator`'s block iteration over `LongValues` and pays the
-///    bit-unpack overhead once per block instead of once per doc.  Critically
-///    this also benefits **large** segments above the warm-cache cap (the
-///    Rally http_logs / geonames tracks).
+/// 2. **Block-mode read** in [`Self::compute_block_sort_keys_and_collect`]. When the no-score
+///    iterator (`Weight::for_each_no_score`) hands us a block of [`DocId`]s, we resolve all 64 sort
+///    keys in a single `Column::first_vals` call.  This is the equivalent of Lucene's
+///    `NumericComparator`'s block iteration over `LongValues` and pays the bit-unpack overhead once
+///    per block instead of once per doc.  Critically this also benefits **large** segments above
+///    the warm-cache cap (the Rally http_logs / geonames tracks).
 ///
 /// The `cursor_u64` filter (search_after) is applied inline in both the
 /// per-doc and block paths; null values are dropped (null sorts last).
@@ -107,15 +104,23 @@ impl<T: FastValue> SortKeyComputer for SortByStaticFastValue<T> {
             sort_column_opt.ok_or_else(|| FastFieldNotAvailableError {
                 field_name: self.field.clone(),
             })?;
-        // Pre-decode the column into a dense `Vec<u64>` once per segment when
-        // the cardinality is `Full` (single-valued, dense — the common case
-        // for date/numeric/keyword sort).  All subsequent `first(doc)` calls
-        // become O(1) Vec indexing instead of bit-unpacking.
+        // **Wave 19.** Share the segment-level warm cache populated on
+        // first access by [`SegmentReader::warm_fast_field_dense_u64`].
+        // The previous per-collector decode (the `warm_first_values`
+        // helper below) capped at `WARM_FIRST_VALS_MAX_DOCS = 256 K`
+        // because each Rally iteration paid the alloc cost; the
+        // segment-level cache eliminates that and lets the SIMD top-K
+        // filter (see `compute_block_sort_keys_and_collect`) fire at
+        // any segment size — the lever that closes the Rally
+        // http_logs `sort_size_*` / `sort_status_*` gap vs ES 9.3.x.
         //
-        // When the column is multivalued or sparse, we keep the streaming
-        // path: the precomputed Vec doesn't apply because doc→row mapping
-        // requires the optional/multivalued index.
-        let warm_first_vals = warm_first_values(&sort_column);
+        // Falls back to the deprecated per-collector decode for
+        // segments below the legacy cap when the field is sparse
+        // (cache hit returns `None` for `Optional` / `Multivalued`),
+        // preserving the existing behaviour for non-dense workloads.
+        let warm_first_vals = segment_reader
+            .warm_fast_field_dense_u64(&self.field, &sort_column)
+            .or_else(|| warm_first_values(&sort_column).map(|b| std::sync::Arc::new(b)));
         Ok(SortByFastValueSegmentSortKeyComputer {
             sort_column,
             warm_first_vals,
@@ -176,12 +181,13 @@ pub(crate) fn warm_first_values(column: &Column<u64>) -> Option<Box<[u64]>> {
 
 pub struct SortByFastValueSegmentSortKeyComputer<T> {
     sort_column: Column<u64>,
-    /// Pre-decoded `first(doc)` cache when the column is dense single-valued
-    /// and the segment is small enough to amortise the alloc.  See
-    /// [`warm_first_values`] for the eligibility rules.  `Full` cardinality
-    /// guarantees every doc has a value, so the cache is `Box<[u64]>`
-    /// without an `Option` discriminant.
-    warm_first_vals: Option<Box<[u64]>>,
+    /// **Wave 19.** Shared segment-lifetime warm cache populated lazily
+    /// by [`SegmentReader::warm_fast_field_dense_u64`].  `Full`
+    /// cardinality guarantees every doc has a value, so the cache is
+    /// `Box<[u64]>` without an `Option` discriminant.  Wrapped in `Arc`
+    /// so every concurrent collector against the same segment+field
+    /// shares one decoded buffer (no per-Rally-iteration realloc).
+    warm_first_vals: Option<std::sync::Arc<Box<[u64]>>>,
     typ: PhantomData<T>,
     cursor_u64: Option<u64>,
     cursor_is_asc: bool,
@@ -411,10 +417,12 @@ impl<T: FastValue> SegmentSortKeyComputer for SortByFastValueSegmentSortKeyCompu
 
 #[cfg(test)]
 mod tests {
-    use super::{warm_first_values, WARM_FIRST_VALS_MAX_DOCS};
+    use std::sync::Arc;
+
     use columnar::column_values::VecColumn;
     use columnar::{Column, ColumnIndex};
-    use std::sync::Arc;
+
+    use super::{warm_first_values, WARM_FIRST_VALS_MAX_DOCS};
 
     #[test]
     fn warm_first_values_full_column() {

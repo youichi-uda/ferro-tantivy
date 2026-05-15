@@ -2,6 +2,11 @@ use std::cell::UnsafeCell;
 
 use columnar::StrColumn;
 
+use crate::collector::sort_key::simd_top_k::{
+    detect_order, is_contiguous_block, simd_filter_block_gt_u64, simd_filter_block_lt_u64,
+    unwrap_threshold, DetectedOrder,
+};
+use crate::collector::sort_key::sort_by_static_fast_value::warm_first_values;
 use crate::collector::sort_key::NaturalComparator;
 use crate::collector::sort_key::simd_top_k::{
     DetectedOrder, detect_order, is_contiguous_block, simd_filter_block_gt_u64,
@@ -41,16 +46,14 @@ use crate::{DocId, Score};
 /// slower than ES 9.3.2 even after Wave 5 #D's term-ordinal warm cache.  ES
 /// Lucene's `SortedDocValuesWriter`-fed comparator wins because:
 ///
-/// 1. **Branchless threshold filter**: per-doc compare is just
-///    `ord > bottom_ord` (Desc) / `ord < bottom_ord` (Asc), all in u64
-///    space.  No `Option<u64>` discriminant, no generic Comparator dispatch.
-/// 2. **Block-level SIMD greater-than/less-than**: 64-doc blocks are
-///    filtered against the heap threshold in 8–16 vector ops per block,
-///    so the 99%+ of docs that fail threshold never enter the heap push
-///    function.
-/// 3. **Lazy term materialization**: only the final top-K hits resolve
-///    their term ordinal back to a UTF-8 string; the per-segment hot
-///    loop is pure u64.
+/// 1. **Branchless threshold filter**: per-doc compare is just `ord > bottom_ord` (Desc) / `ord <
+///    bottom_ord` (Asc), all in u64 space.  No `Option<u64>` discriminant, no generic Comparator
+///    dispatch.
+/// 2. **Block-level SIMD greater-than/less-than**: 64-doc blocks are filtered against the heap
+///    threshold in 8–16 vector ops per block, so the 99%+ of docs that fail threshold never enter
+///    the heap push function.
+/// 3. **Lazy term materialization**: only the final top-K hits resolve their term ordinal back to a
+///    UTF-8 string; the per-segment hot loop is pure u64.
 ///
 /// All three lever points apply identically to keyword sort because the
 /// term ordinal column **is** a `Column<u64>` (`StrColumn::ords()`).  The
@@ -118,11 +121,11 @@ pub struct ByStringColumnSegmentSortKeyComputer {
     /// (`ErasedSegmentSortKeyComputer` for `SortByErasedType`) requires
     /// `Sync`.  Access discipline:
     ///   - `convert_segment_sort_key` is the only consumer.
-    ///   - It is called from `harvest()` after the segment's collect-loop
-    ///     has finished, by the single rayon worker that owned this
-    ///     segment.  No concurrent `&Self` exists during conversion.
-    ///   - The dictionary lookup is read-only and does not re-enter
-    ///     `convert_segment_sort_key`, so reentrancy is impossible.
+    ///   - It is called from `harvest()` after the segment's collect-loop has finished, by the
+    ///     single rayon worker that owned this segment.  No concurrent `&Self` exists during
+    ///     conversion.
+    ///   - The dictionary lookup is read-only and does not re-enter `convert_segment_sort_key`, so
+    ///     reentrancy is impossible.
     /// These constraints make the access serialised in practice; the
     /// `&mut Vec<u8>` we materialise is unique for the duration of each
     /// call.

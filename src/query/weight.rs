@@ -157,11 +157,7 @@ pub trait Weight: Send + Sync + 'static {
 
     /// Recursively collects all underlying TermScorers from this weight.
     /// Returns an empty vec by default.
-    fn collect_term_scorers(
-        &self,
-        _reader: &SegmentReader,
-        _boost: Score,
-    ) -> Vec<Box<dyn Scorer>> {
+    fn collect_term_scorers(&self, _reader: &SegmentReader, _boost: Score) -> Vec<Box<dyn Scorer>> {
         vec![]
     }
 }

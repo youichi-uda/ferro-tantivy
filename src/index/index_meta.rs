@@ -36,6 +36,7 @@ impl SegmentMetaInventory {
             segment_id,
             max_doc,
             deletes: None,
+            sort_cursor_fields: Vec::new(),
         };
         SegmentMeta::from(self.inventory.track(inner))
     }
@@ -99,9 +100,31 @@ impl SegmentMeta {
     /// is by removing all files that have been created by tantivy
     /// and are not used by any segment anymore.
     pub fn list_files(&self) -> HashSet<PathBuf> {
-        SegmentComponent::iterator()
+        let mut files: HashSet<PathBuf> = SegmentComponent::iterator()
             .map(|component| self.relative_path(*component))
-            .collect::<HashSet<PathBuf>>()
+            .collect();
+        for field in &self.tracked.sort_cursor_fields {
+            files.insert(self.sort_cursor_path(field));
+        }
+        files
+    }
+
+    /// Returns the relative path of the auxiliary sort cursor file for `field`.
+    ///
+    /// **FerroSearch extension (Wave 15).** The path is
+    /// `{segment_uuid}.{field}.sortcursor`.
+    pub fn sort_cursor_path(&self, field: &str) -> PathBuf {
+        let mut path = self.id().uuid_string();
+        path.push('.');
+        path.push_str(field);
+        path.push_str(".sortcursor");
+        PathBuf::from(path)
+    }
+
+    /// Returns the list of fields for which a sort cursor was built at commit
+    /// time and persisted alongside the segment.
+    pub fn sort_cursor_fields(&self) -> &[String] {
+        &self.tracked.sort_cursor_fields
     }
 
     /// Returns the relative path of a component of our segment.
@@ -159,6 +182,54 @@ impl SegmentMeta {
             segment_id: inner_meta.segment_id,
             max_doc,
             deletes: None,
+            sort_cursor_fields: inner_meta.sort_cursor_fields.clone(),
+        });
+        SegmentMeta { tracked }
+    }
+
+    /// Records that an auxiliary sort cursor file was built for each of
+    /// `fields` at the time this segment was finalized.
+    ///
+    /// **FerroSearch extension (Wave 15).** Used by `SegmentWriter::finalize`
+    /// to advertise the cursor files via `SegmentMeta::list_files`, so the
+    /// directory GC retains them across writer cycles.
+    ///
+    /// `fields` is the **complete** list of cursor fields the new
+    /// SegmentMeta should advertise — callers wishing to append to an
+    /// existing list (Wave 17-2 backfill) must read
+    /// [`Self::sort_cursor_fields`] first and pass the union.  This
+    /// method does not merge automatically because the segment-meta
+    /// inventory is intern-style and silently swallowing a "second"
+    /// call would mask a class of bugs we hit in Wave 15 H-1 (a fresh
+    /// SegmentMeta should have an empty cursor field list; if it
+    /// doesn't, the caller has confused themselves about which meta
+    /// is which).
+    #[must_use]
+    pub fn with_sort_cursor_fields(self, fields: Vec<String>) -> SegmentMeta {
+        assert!(
+            self.tracked.sort_cursor_fields.is_empty()
+                || (self.tracked.sort_cursor_fields.len() <= fields.len()
+                    && self
+                        .tracked
+                        .sort_cursor_fields
+                        .iter()
+                        .all(|existing| fields.iter().any(|f| f == existing))),
+            "with_sort_cursor_fields second call must be a strict superset of the previous call's \
+             fields (existing={:?}, new={:?})",
+            self.tracked.sort_cursor_fields,
+            fields,
+        );
+        log::debug!(
+            "Wave 15 H-trace: with_sort_cursor_fields applied segment={} fields={:?} max_doc={}",
+            self.tracked.segment_id.uuid_string(),
+            fields,
+            self.tracked.max_doc,
+        );
+        let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
+            segment_id: inner_meta.segment_id,
+            max_doc: inner_meta.max_doc,
+            deletes: inner_meta.deletes.clone(),
+            sort_cursor_fields: fields.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -177,7 +248,8 @@ impl SegmentMeta {
         let tracked = self.tracked.map(move |inner_meta| InnerSegmentMeta {
             segment_id: inner_meta.segment_id,
             max_doc: inner_meta.max_doc,
-            deletes: Some(delete_meta),
+            deletes: Some(delete_meta.clone()),
+            sort_cursor_fields: inner_meta.sort_cursor_fields.clone(),
         });
         SegmentMeta { tracked }
     }
@@ -188,6 +260,12 @@ struct InnerSegmentMeta {
     segment_id: SegmentId,
     max_doc: u32,
     pub deletes: Option<DeleteMeta>,
+    /// **FerroSearch extension (Wave 15).** Fields for which an auxiliary
+    /// sort cursor file `<segment_id>.<field>.sortcursor` was written at
+    /// commit time. Defaults to empty for backward compatibility with
+    /// segments produced before this extension existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sort_cursor_fields: Vec<String>,
 }
 
 impl InnerSegmentMeta {
@@ -224,6 +302,83 @@ pub struct IndexSettings {
     #[serde(default = "default_docstore_blocksize")]
     /// The size of each block that will be compressed and written to disk
     pub docstore_blocksize: usize,
+    /// Optional index-time sort.
+    ///
+    /// **FerroSearch extension (Wave 15).** When set, a `SortCursorIndex`
+    /// auxiliary file is built per segment at commit time, allowing top-K
+    /// sort queries that match the configured sort field/order to terminate
+    /// early after K hits. Equivalent in spirit to Elasticsearch's
+    /// `index.sort.field` setting, but implemented as a lazily-applied
+    /// auxiliary cursor rather than a physical doc-layout sort.
+    ///
+    /// Skipped at serialization when `None` to keep `meta.json` of indices
+    /// that do not opt in byte-identical to the upstream tantivy format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by_field: Option<IndexSortByField>,
+
+    /// Optional multi-field index-time sort.
+    ///
+    /// **FerroSearch Wave 18-1.** When set, a `SortCursorIndexV2` auxiliary
+    /// file (multi-field, v2 wire format) is built per segment at commit
+    /// time. Mutually exclusive with [`Self::sort_by_field`] (single-field
+    /// v1) — at most one of the two may be set. Order matters: `[ts DESC,
+    /// _id ASC]` builds a cursor that lex-sorts by `ts` first, then by
+    /// `_id` to break ties (matching ES's `index.sort.field=[ts, _id]`,
+    /// `index.sort.order=[desc, asc]` semantics).
+    ///
+    /// Skipped at serialization when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_by_fields: Option<Vec<IndexSortByField>>,
+}
+
+impl IndexSettings {
+    /// Returns `Err(InvalidArgument)` when both [`Self::sort_by_field`]
+    /// (single-field v1) and [`Self::sort_by_fields`] (multi-field v2)
+    /// are set, since they configure incompatible cursor formats. The
+    /// builder calls this from `IndexBuilder::settings()` so misuse is
+    /// caught at index-create time rather than at commit / search time.
+    ///
+    /// Wave 18-1: also enforces the `≤ 8` cap on multi-field sort.
+    pub fn validate_sort_settings(&self) -> crate::Result<()> {
+        if self.sort_by_field.is_some() && self.sort_by_fields.is_some() {
+            return Err(crate::TantivyError::InvalidArgument(
+                "IndexSettings: sort_by_field and sort_by_fields are mutually exclusive; set \
+                 exactly one or neither"
+                    .to_string(),
+            ));
+        }
+        if let Some(fields) = &self.sort_by_fields {
+            if fields.is_empty() {
+                return Err(crate::TantivyError::InvalidArgument(
+                    "IndexSettings::sort_by_fields cannot be empty when set; use `None` instead, \
+                     or supply at least one field"
+                        .to_string(),
+                ));
+            }
+            if fields.len() > crate::index::SORT_CURSOR_MAX_FIELDS {
+                return Err(crate::TantivyError::InvalidArgument(format!(
+                    "IndexSettings::sort_by_fields supports at most {} fields, got {}",
+                    crate::index::SORT_CURSOR_MAX_FIELDS,
+                    fields.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Index-time sort configuration (FerroSearch Wave 15).
+///
+/// Identifies a single fast field whose values are used to build a
+/// `SortCursorIndex` per segment. Subsequent top-K queries with a matching
+/// sort can be served via the cursor and terminate after K hits without
+/// scanning the whole segment.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct IndexSortByField {
+    /// Name of the fast field to sort by.
+    pub field: String,
+    /// Sort order.
+    pub order: Order,
 }
 
 /// Must be a function to be compatible with serde defaults
@@ -237,6 +392,8 @@ impl Default for IndexSettings {
             docstore_compression: Compressor::default(),
             docstore_blocksize: default_docstore_blocksize(),
             docstore_compress_dedicated_thread: true,
+            sort_by_field: None,
+            sort_by_fields: None,
         }
     }
 }
@@ -406,6 +563,8 @@ mod tests {
                 }),
                 docstore_blocksize: 1_000_000,
                 docstore_compress_dedicated_thread: true,
+                sort_by_field: None,
+                sort_by_fields: None,
             },
             segments: Vec::new(),
             schema,
@@ -430,12 +589,17 @@ mod tests {
         let json = r#"{"index_settings":{"docstore_compression":"zsstd","docstore_blocksize":1000000},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#;
 
         let err = serde_json::from_str::<UntrackedIndexMeta>(json).unwrap_err();
-        assert_eq!(
-            err.to_string(),
+        // `snappy` only appears in the expected variant list when the
+        // `snappy-compression` feature is enabled. Keep the assertion conditional
+        // so the test passes in every supported feature matrix.
+        let expected = if cfg!(feature = "snappy-compression") {
+            "unknown variant `zsstd`, expected one of `none`, `lz4`, `snappy`, `zstd`, \
+             `zstd(compression_level=5)` at line 1 column 49"
+        } else {
             "unknown variant `zsstd`, expected one of `none`, `lz4`, `zstd`, \
              `zstd(compression_level=5)` at line 1 column 49"
-                .to_string()
-        );
+        };
+        assert_eq!(err.to_string(), expected.to_string());
 
         let json = r#"{"index_settings":{"docstore_compression":"zstd(bla=10)","docstore_blocksize":1000000},"segments":[],"schema":[{"name":"text","type":"text","options":{"indexing":{"record":"position","fieldnorms":true,"tokenizer":"default"},"stored":false,"fast":false}}],"opstamp":0}"#;
 
@@ -471,7 +635,9 @@ mod tests {
             IndexSettings {
                 docstore_compression: Compressor::default(),
                 docstore_compress_dedicated_thread: true,
-                docstore_blocksize: 16_384
+                docstore_blocksize: 16_384,
+                sort_by_field: None,
+                sort_by_fields: None,
             }
         );
         {

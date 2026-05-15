@@ -25,8 +25,7 @@ pub trait GpuKernel {
 
     /// Create and compile this kernel's pipeline.
     fn compile(ctx: &GpuContext) -> GpuResult<Self>
-    where
-        Self: Sized;
+    where Self: Sized;
 }
 
 /// Aggregation kernel — umbrella for stats + histogram.

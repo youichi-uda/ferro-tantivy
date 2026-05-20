@@ -78,16 +78,18 @@ tantivy-gpu = { version = "0.1.0", path = "./gpu", optional = true }
 # containers through `ferro_compress::Backend` (CPU snappy/lz4/zstd default,
 # GPU nvCOMP Bitcomp under `nvcomp` feature).
 #
-# Path resolution: this relative path resolves correctly both for the
-# standalone tantivy build (`/home/y1/git/tantivy-gpu-compress`, where
-# `..` is the parent dir holding both forks) AND for ferrosearch's
-# consumption via `vendor/tantivy-local`, where the matching
-# `vendor/ferroSearchProjects → ../..` symlink (Wave 7 Plan 1) makes the
-# literal `vendor/ferroSearchProjects/ferrosearch-gpu-compress/crates/
-# ferro-compress` path resolve to the same physical crate. All three
-# consumers (this dep, ferrosearch's workspace dep, ferro-vector-id-
-# compress) thus share a single `path+file://` source ID.
-ferro-compress = { version = "0.1.0", path = "../ferroSearchProjects/ferrosearch-gpu-compress/crates/ferro-compress", default-features = false, features = ["snappy"], optional = true }
+# Path resolution: this fork is consumed as `vendor/tantivy-local` inside
+# ferrosearch (and `/build/vendor/tantivy-local` in the Marketplace Docker
+# image), so `../../crates/ferro-compress` lands on
+# `<ferrosearch-root>/crates/ferro-compress` — the workspace member —
+# yielding one source ID with no symlink-chain canonicalization required
+# (cargo ≥1.95 stopped canonicalizing through multi-symlink chains, so the
+# old `../ferroSearchProjects/ferrosearch-gpu-compress/...` literal path
+# now collides with the workspace member as two distinct packages).
+# Standalone tantivy clones with `--features ferro-compress` need to wire
+# the path themselves (the feature is `optional = true`, default OFF, so
+# unactivated builds tolerate the missing path).
+ferro-compress = { version = "0.1.0", path = "../../crates/ferro-compress", default-features = false, features = ["snappy"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
